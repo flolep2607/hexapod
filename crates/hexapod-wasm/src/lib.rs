@@ -3,7 +3,9 @@
 //! No `wasm-bindgen`: the module exports plain `extern "C"` functions and a
 //! pointer to a flat `f32` buffer that JavaScript reads through a typed array
 //! view over the wasm linear memory. That keeps the toolchain to a plain
-//! `cargo build --target wasm32-unknown-unknown` and the artefact under 50 kB.
+//! `cargo build --target wasm32-unknown-unknown`. Rapier makes the artefact
+//! larger than the old ~158 kB centroidal-only module; the live robot is 18
+//! revolute joints, not a custom engine.
 //!
 //! All state is a single process-global. wasm32 here is single-threaded and
 //! JavaScript calls in one at a time, so there is no aliasing to worry about.
@@ -17,7 +19,8 @@ use hexapod_core::dynamics::Physics;
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
 use hexapod_core::math::{squash, unsquash};
-use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
+use hexapod_core::plant::{foot_in_body, ArticulatedPlant};
+use hexapod_core::policy::{act_body_dh, n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
 use hexapod_core::sim::{
     Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX,
     JUMP_CRUISE_MIN,
@@ -47,6 +50,9 @@ struct App {
 
     live: Sim,
     live_gait: Gait,
+    /// Rapier articulated plant. The live view is 18 revolute joints plus
+    /// ground friction; ARS still trains on the centroidal step.
+    plant: Option<ArticulatedPlant>,
     mode: u32,
     since_fall: f64,
 
@@ -110,6 +116,7 @@ fn make(seed: u64) -> App {
         trained: false,
         live: Sim::default(),
         live_gait,
+        plant: None,
         mode: MODE_BASELINE,
         since_fall: 0.0,
         build,
@@ -526,6 +533,12 @@ impl App {
     fn reset_live(&mut self) {
         self.live_gait = self.active_gait();
         self.live.reset(&self.terrain, &self.live_gait, &self.phys);
+        self.plant = Some(ArticulatedPlant::standing(
+            self.frame,
+            &self.live_gait,
+            &self.phys,
+            &self.terrain,
+        ));
         self.since_fall = 0.0;
     }
 
@@ -582,6 +595,28 @@ impl App {
         for _ in 0..n {
             self.live
                 .step(&self.terrain, policy, &self.live_gait, h, cmd);
+            if let Some(plant) = self.plant.as_mut() {
+                let mut q_cmd = self.live.q_cmd;
+                let body_h = self.live_gait.body_h
+                    + 0.20 * self.live.act[act_body_dh(self.frame)];
+                for i in 0..self.frame.legs() {
+                    let target = foot_in_body(
+                        self.frame,
+                        &self.live_gait,
+                        i,
+                        self.live.phase,
+                        self.live.stride_now,
+                        self.live.duty_now,
+                        body_h,
+                        self.live.feet[i].step_h,
+                    );
+                    q_cmd[i] = hexapod_core::robot::solve_ik(self.frame, i, target).q;
+                    self.live.q_cmd[i] = q_cmd[i];
+                }
+                plant.drive(&q_cmd, &self.phys);
+                plant.step(h);
+                plant.apply_visual(&mut self.live);
+            }
         }
     }
 
@@ -727,6 +762,8 @@ impl App {
         t[T_JUMPS] = s.jumps as f32;
         t[T_TASK] = if s.jump_clock > 0.0 { 1.0 } else { 0.0 };
         t[T_CLEARANCE] = s.clearance as f32;
+        t[T_PLANT] = if self.plant.is_some() { 1.0 } else { 0.0 };
+        t[T_N_HINGES] = (self.frame.legs() * 3) as f32;
     }
 }
 

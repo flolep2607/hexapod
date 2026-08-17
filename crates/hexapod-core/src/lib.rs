@@ -2,9 +2,11 @@
 //! servo dynamics and leg inertia, plus a policy-search trainer and a hardware
 //! sizer. The frame is parametric in leg count — four legs to ten.
 //!
-//! The crate has no dependencies and no I/O, so the identical code runs
-//! natively (for the CLI trainer and the test suite) and on
-//! `wasm32-unknown-unknown` (for the browser dashboard).
+//! With the `rapier` feature the live dashboard also runs an articulated plant:
+//! one chassis, three revolute joints per leg, and Rapier's contact solver.
+//! Gait, analytic IK and the servo torque cap are still this crate; Rapier is
+//! the engine they drive. ARS keeps the centroidal step so training stays cheap
+//! enough to run in the page.
 //!
 //! ```no_run
 //! use hexapod_core::*;
@@ -29,6 +31,8 @@ pub mod power;
 pub mod robot;
 pub mod sim;
 pub mod terrain;
+#[cfg(feature = "rapier")]
+pub mod plant;
 
 pub use ars::{ArsConfig, Trainer};
 pub use dynamics::{Actuator, LegMass, Physics};

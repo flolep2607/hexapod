@@ -11,4 +11,4 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-hexapod-core = { path = "../hexapod-core" }
+hexapod-core = { path = "../hexapod-core", features = ["rapier"] }

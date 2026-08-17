@@ -108,6 +108,9 @@ pub const T_IMPACT: usize = 382; // peak landing demand, g
 pub const T_JUMPS: usize = 383;
 pub const T_TASK: usize = 384; // 1 while a hop is in progress
 pub const T_CLEARANCE: usize = 385;
+/// 1 while the live view is the Rapier articulated plant.
+pub const T_PLANT: usize = 386;
+pub const T_N_HINGES: usize = 387;
 
 pub const T_LEN: usize = 392;
 

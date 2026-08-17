@@ -1170,6 +1170,9 @@ function updateReadouts(t) {
   const secs = t[L.T_TIME];
   $("hClock").textContent = `${String(Math.floor(secs / 60)).padStart(2, "0")}:${fmt(secs % 60, 1).padStart(4, "0")}`;
   $("hCourse").textContent = courseName(state.courseKind);
+  const hinges = Math.round(t[L.T_N_HINGES] || state.legs * 3);
+  $("hSolver").textContent =
+    t[L.T_PLANT] > 0.5 ? `RAPIER ${hinges}-REV` : "CENTROIDAL IK";
 
   const fallen = t[L.T_FALLEN] > 0.5;
   const broken = t[L.T_BROKEN] > 0.5;
