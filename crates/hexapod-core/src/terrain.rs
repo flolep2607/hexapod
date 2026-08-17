@@ -42,10 +42,11 @@ pub enum Course {
     Slalom = 6,
     Slick = 7,
     Gauntlet = 8,
+    Jump = 9,
 }
 
 /// Every course, in the order the dashboard lists them.
-pub const COURSES: [Course; 9] = [
+pub const COURSES: [Course; 10] = [
     Course::Flat,
     Course::Steps,
     Course::Rubble,
@@ -55,6 +56,7 @@ pub const COURSES: [Course; 9] = [
     Course::Slalom,
     Course::Slick,
     Course::Gauntlet,
+    Course::Jump,
 ];
 
 impl Course {
@@ -73,7 +75,16 @@ impl Course {
             Course::Slalom => "SLALOM",
             Course::Slick => "SLICK",
             Course::Gauntlet => "GAUNTLET",
+            Course::Jump => "JUMP",
         }
+    }
+
+    /// Walking courses share a reward; jump is a different task on the same
+    /// machine, so a policy trained to walk is not scored as if it were
+    /// jumping, and the other way around.
+    #[inline]
+    pub fn is_jump(self) -> bool {
+        matches!(self, Course::Jump)
     }
 }
 
@@ -326,6 +337,7 @@ impl Terrain {
                 self.gen_gaps(&mut r, 43.0, 50.0);
                 self.gen_slick(&mut r, 51.0, Z_MAX - 4.0);
             }
+            Course::Jump => {}
         }
     }
 
@@ -597,7 +609,11 @@ mod tests {
 
     #[test]
     fn courses_actually_contain_obstacles() {
-        for c in COURSES.iter().copied().filter(|c| *c != Course::Flat) {
+        for c in COURSES
+            .iter()
+            .copied()
+            .filter(|c| *c != Course::Flat && !c.is_jump())
+        {
             let t = Terrain::new(c, 3);
             assert!(!t.obstacles.is_empty(), "{c:?} generated nothing");
         }

@@ -45,8 +45,11 @@ const COURSE_NOTES = {
     "Sheets of ice a centimetre thick and worth about a fifth of the grip of the ground around them, with a few low humps for company. Watch the traction meter, not the terrain.",
   GAUNTLET:
     "Rubble, ramps, a slalom, trenches, then ice. Everything the generator can build, in one run.",
+  JUMP:
+    "Flat pad, no route. The command is an apex, not a speed: crouch, push, leave the ground, land without stripping the servos. Extra height past the command earns nothing — that is how you break the machine.",
 };
 const courseName = (i) => (COURSES[i] || "Flat").toUpperCase();
+const isJump = () => courseName(state.courseKind) === "JUMP";
 
 const COL = {
   ink: "#141416",
@@ -729,9 +732,9 @@ function buildStaticUI() {
   const r = $("rCruise");
   r.min = lo;
   r.max = hi;
+  r.step = isJump() ? 0.01 : 0.1;
   r.value = state.cruise;
-  $("vCruise").textContent = `${state.cruise.toFixed(1)} m/s`;
-  $("cruiseNote").textContent = `trained over ${lo.toFixed(1)}–${hi.toFixed(1)} m/s`;
+  syncCruiseLabels();
 
   $("selServo").innerHTML =
     `<option value="-1">Generic 20 kg·cm digital</option>` +
@@ -1169,20 +1172,29 @@ function updateReadouts(t) {
   $("hCourse").textContent = courseName(state.courseKind);
 
   const fallen = t[L.T_FALLEN] > 0.5;
+  const broken = t[L.T_BROKEN] > 0.5;
+  const airborne = t[L.T_AIRBORNE] > 0.5;
   const blocked = t[L.T_BLOCKED] > 0.5;
   const moving = Math.abs(state.cmd.fwd) > 0.01 || Math.abs(state.cmd.turn) > 0.01;
-  $("hState").textContent = fallen
+  $("hState").textContent = broken
+    ? "BROKEN"
+    : fallen
     ? "RECOVERING"
+    : airborne
+    ? "AIRBORNE"
     : blocked
     ? "BLOCKED"
     : state.paused
     ? "HELD"
+    : isJump()
+    ? "HOPPING"
     : moving
     ? state.cmd.turn !== 0
       ? "TURNING"
       : "WALKING"
     : "STANDING";
-  $("banner").dataset.on = String(fallen);
+  $("banner").textContent = broken ? "BROKEN" : "RECOVERING";
+  $("banner").dataset.on = String(fallen || broken);
 
   $("hudGait").textContent =
     state.mode === 1 ? "LEARNED" : presetName(state.preset).toUpperCase();
@@ -1190,8 +1202,10 @@ function updateReadouts(t) {
   $("hudY").textContent = (t[L.T_POS + 1] >= 0 ? "+" : "") + fmt(t[L.T_POS + 1], 2);
   $("hudPhase").textContent = fmt(t[L.T_PHASE], 2);
   $("hudMargin").textContent = fmt(t[L.T_MARGIN], 2);
-  $("hudV").textContent = fmt(Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]), 2);
-  $("hudVc").textContent = fmt(t[L.T_CMD_SPEED] * Math.abs(state.cmd.fwd), 2);
+  $("hudV").textContent = isJump()
+    ? fmt(t[L.T_VY], 2)
+    : fmt(Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]), 2);
+  $("hudVc").textContent = fmt(t[L.T_CMD_SPEED], 2);
   $("hudW").textContent = fmt(t[L.T_STEER] * 1.1, 2);
   // Where it is being asked to go, and whether it is choosing that itself.
   const nav = t[L.T_NAV] > 0.5 && Math.abs(state.cmd.turn) < 0.02;
@@ -1223,10 +1237,19 @@ function updateReadouts(t) {
   const margin = t[L.T_MARGIN];
   drawDial($("dStab"), Math.max(0, margin), 0.7, margin.toFixed(2), margin < 0.08, "m", 0.08 / 0.7);
 
-  const target = t[L.T_CMD_SPEED] || 4;
-  const v = Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]);
-  $("mSpeed").textContent = `${fmt(v, 2)} / ${fmt(target, 1)} m/s`;
-  $("fSpeed").style.width = `${Math.min(100, (v / target) * 100)}%`;
+  if (isJump()) {
+    const target = t[L.T_CMD_SPEED] || 0.22;
+    const apex = t[L.T_APEX];
+    $("mSpeedLabel").textContent = "Apex / commanded";
+    $("mSpeed").textContent = `${fmt(apex, 2)} / ${fmt(target, 2)} m`;
+    $("fSpeed").style.width = `${Math.min(100, (apex / Math.max(target, 1e-3)) * 100)}%`;
+  } else {
+    const target = t[L.T_CMD_SPEED] || 4;
+    const v = Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]);
+    $("mSpeedLabel").textContent = "Speed / commanded";
+    $("mSpeed").textContent = `${fmt(v, 2)} / ${fmt(target, 1)} m/s`;
+    $("fSpeed").style.width = `${Math.min(100, (v / target) * 100)}%`;
+  }
 
   // How much of the friction budget the gait is spending. 100% means the feet
   // are on the point of letting go; above it they are skidding.
@@ -1427,8 +1450,8 @@ function wire() {
 
   $("rCruise").addEventListener("input", () => {
     state.cruise = +$("rCruise").value;
-    $("vCruise").textContent = `${state.cruise.toFixed(1)} m/s`;
     api.hx_set_cruise(state.cruise);
+    syncCruiseLabels();
   });
 
   $("selServo").addEventListener("change", () => {
@@ -1505,11 +1528,42 @@ function applyCourse() {
   $("tSummary").textContent =
     `${name} · seed ${state.seed} · ${api.hx_course_len()} obstacles · ${api.hx_route_len()} waypoints`;
   $("tNote").textContent = COURSE_NOTES[name] || "";
+  // The command dial is a speed on walking courses and a height on JUMP.
+  const lo = api.hx_cruise_lo();
+  const hi = api.hx_cruise_hi();
+  const r = $("rCruise");
+  r.min = lo;
+  r.max = hi;
+  r.step = isJump() ? 0.01 : 0.1;
+  state.cruise = isJump() ? (lo + hi) / 2 : 4.0;
+  r.value = state.cruise;
+  api.hx_set_cruise(state.cruise);
+  syncCruiseLabels();
   drawProfile();
   drawCurve();
   updateTrainingPanel();
   updateHardware();
   log(`course.set("${name.toLowerCase()}", seed=${state.seed})`);
+}
+
+function syncCruiseLabels() {
+  const lo = api.hx_cruise_lo();
+  const hi = api.hx_cruise_hi();
+  if (isJump()) {
+    $("cruiseTitle").textContent = "Commanded jump";
+    $("cruiseHold").textContent = "Hit this apex";
+    $("vCruise").textContent = `${state.cruise.toFixed(2)} m`;
+    $("cruiseNote").textContent = `trained over ${lo.toFixed(2)}–${hi.toFixed(2)} m`;
+    $("cruiseHelp").textContent =
+      "The reward is apex tracking, not max height, and the command is an input. Extra height past it earns nothing; a landing the servos cannot absorb ends the run. The seed hop is a small one — Train is how it gets higher.";
+  } else {
+    $("cruiseTitle").textContent = "Commanded speed";
+    $("cruiseHold").textContent = "Hold this cruise";
+    $("vCruise").textContent = `${state.cruise.toFixed(1)} m/s`;
+    $("cruiseNote").textContent = `trained over ${lo.toFixed(1)}–${hi.toFixed(1)} m/s`;
+    $("cruiseHelp").textContent =
+      "The reward is speed tracking, not distance, and the command is an input to the policy. Move it and watch the learned gait change its cycle time, stride and duty factor to keep up — the hand-tuned one cannot, because it has no feedback layer.";
+  }
 }
 
 /* ------------------------------------------------------------------ boot */

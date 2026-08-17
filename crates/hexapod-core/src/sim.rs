@@ -38,9 +38,9 @@ use crate::dynamics::{
 };
 use crate::math::{ang_diff, clamp, frac, hypot2, polygon_margin, rot_y, V3};
 use crate::policy::{
-    act_body_dh, act_cycle, act_duty, act_pitch, act_steer, act_stride, n_obs, obs_bearing,
-    obs_cmd_speed, obs_corridor, obs_range, obs_scan, Gait, Policy, MAX_ACT, MAX_OBS,
-    N_FIXED_OBS, N_SCAN,
+    act_body_dh, act_cycle, act_duty, act_jump, act_pitch, act_steer, act_stride, n_obs,
+    obs_airborne, obs_bearing, obs_cmd_speed, obs_corridor, obs_range, obs_scan, obs_vy, Gait,
+    Policy, MAX_ACT, MAX_OBS, N_FIXED_OBS, N_SCAN,
 };
 use crate::robot::{
     clamp_joints, fk_body, fk_world, solve_ik, to_body, Frame, BODY_H, FEMUR, MAX_LEGS,
@@ -68,6 +68,18 @@ pub const CRUISE_DEFAULT: f64 = 4.0;
 /// Speeds the evaluation rollout averages over. Slow, middling and fast: a
 /// policy has to be able to do all three to score.
 pub const EVAL_SPEEDS: [f64; 3] = [2.0, 4.0, 5.5];
+
+/// Jump heights the robot can be commanded to hit, metres of extra clearance
+/// above a standing body. Training samples uniformly from this range, the
+/// same way walking samples speed, so there is no single hop to specialise on.
+pub const JUMP_MIN: f64 = 0.06;
+pub const JUMP_MAX: f64 = 0.40;
+/// What the dashboard's height dial starts at.
+pub const JUMP_DEFAULT: f64 = 0.22;
+/// Heights the jump evaluation averages over. A small hop, a middling one,
+/// and one that needs a real crouch-and-extend. A policy that only does one
+/// of them cannot score.
+pub const EVAL_HEIGHTS: [f64; 3] = [0.10, 0.22, 0.36];
 
 /// Body-velocity controller bandwidth, 1/s. The gait asks for a speed; this is
 /// how hard it asks. Anything traction cannot deliver becomes slip.
@@ -139,6 +151,31 @@ const ALIVE: f64 = 0.4;
 /// clean rollout, which is about what it costs on a real machine.
 const FALL_PENALTY: f64 = 40.0;
 
+// Jump task. The command is an apex, not a speed, but the same discipline
+// applies: there is no raw-height term, because that is how you train a
+// machine to jump until the servos strip. Matching the command is the job;
+// going over it earns nothing; breaking the robot costs more than a fall.
+/// Per metre of extra clearance closed on the command, capped at the command.
+const W_HEIGHT: f64 = 40.0;
+/// Gaussian on (hop apex − command) at each landing.
+const W_MATCH: f64 = 6.0;
+/// Breaking the machine — a landing the servos cannot absorb — is worse than
+/// going over. A real hexapod that does this is a pile of horns and gears.
+const BREAK_PENALTY: f64 = 60.0;
+/// Instantaneous landing demand, in g, at which plastic gears strip. The
+/// integrator will not apply this acceleration; the *demand* is the failure.
+const BREAK_G: f64 = 8.0;
+/// Fastest the body may be pushed upward while the feet are down, m/s. Past
+/// this the joints cannot extend any faster, however stiff the height spring.
+const VY_TAKEOFF_MAX: f64 = 2.8;
+/// Ceiling on upward acceleration while pushing, m/s^2.
+const A_JUMP_MAX: f64 = 28.0;
+/// Ceiling on downward deceleration at landing, m/s^2. A crouch has to have
+/// time to work; a rigid landing against this cap still breaks on demand.
+const A_LAND_MAX: f64 = 25.0;
+/// Lift action above this gathers no feet — takeoff.
+const JUMP_LIFT: f64 = 0.25;
+
 /// Width of the speed-tracking Gaussian: a fixed floor plus a share of the
 /// command, so a 2 m/s request and a 6 m/s request are graded comparably
 /// rather than the fast one being forgiven for the same absolute error.
@@ -151,18 +188,55 @@ fn track_width(target: f64) -> f64 {
     0.18 + 0.12 * target.abs()
 }
 
+/// Width of the apex-matching Gaussian. Tight for the same reason the speed
+/// one is: make it generous and holding the command becomes free.
+#[inline]
+fn jump_width(target: f64) -> f64 {
+    0.04 + 0.18 * target.abs()
+}
+
+/// Open-loop hop clock. Iteration 0 of jump training *is* this: a small
+/// crouch, a push, a lift, the same way iteration 0 of walking is the tripod.
+/// The policy adds to it, which is how a hop gets higher — or gets cancelled.
+fn hop_feedforward(phase: f64) -> (f64, f64) {
+    let p = frac(phase);
+    let bump = |a: f64, b: f64| {
+        if p <= a || p >= b {
+            0.0
+        } else {
+            let u = (p - a) / (b - a);
+            (core::f64::consts::PI * u).sin()
+        }
+    };
+    let crouch = bump(0.00, 0.22);
+    let push = bump(0.16, 0.42);
+    let lift = if (0.38..0.70).contains(&p) { 1.0 } else { 0.0 };
+    (-0.55 * crouch + 0.85 * push, lift)
+}
+
+/// What a rollout is being asked to do. Walking and jumping share a machine
+/// and a learner; they do not share a reward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Task {
+    #[default]
+    Walk,
+    Jump,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Cmd {
     /// Forward throttle in [-1, 1].
     pub fwd: f64,
     /// Yaw command in [-1, 1]. Ignored while `nav` is set.
     pub turn: f64,
-    /// Cruise speed at full throttle, m/s.
+    /// Cruise speed at full throttle, m/s — or commanded jump height, metres,
+    /// when [`Task::Jump`] is set.
     pub cruise: f64,
     /// Let the policy steer itself along the course's route. Training always
     /// does; the dashboard hands control back the moment someone touches the
     /// turn keys.
     pub nav: bool,
+    pub task: Task,
 }
 
 impl Default for Cmd {
@@ -172,6 +246,7 @@ impl Default for Cmd {
             turn: 0.0,
             cruise: CRUISE_DEFAULT,
             nav: true,
+            task: Task::Walk,
         }
     }
 }
@@ -193,10 +268,33 @@ impl Cmd {
         }
     }
 
-    /// Commanded ground speed, m/s, signed.
+    /// Stand and jump to `height` metres of extra clearance. Speed is not a
+    /// thing this command asks for, and the route is not either.
+    pub fn jump(height: f64) -> Cmd {
+        Cmd {
+            fwd: 0.0,
+            turn: 0.0,
+            cruise: height.clamp(JUMP_MIN, JUMP_MAX),
+            nav: false,
+            task: Task::Jump,
+        }
+    }
+
+    /// Commanded ground speed, m/s, signed. Zero on the jump task, so the
+    /// walking controller holds station while the hop clock runs.
     #[inline]
     pub fn speed(&self) -> f64 {
-        self.cruise * self.fwd
+        match self.task {
+            Task::Jump => 0.0,
+            Task::Walk => self.cruise * self.fwd,
+        }
+    }
+
+    /// Commanded extra clearance, metres. Meaningful on the jump task; on a
+    /// walk it is not a number anybody asked for.
+    #[inline]
+    pub fn height(&self) -> f64 {
+        self.cruise
     }
 }
 
@@ -271,6 +369,9 @@ pub struct Sim {
     /// Last tick's leg centres of mass and joint rates, for the finite
     /// differences the leg-inertia model runs on.
     legs: LegState,
+    /// Height already credited toward the command on the current hop, so a
+    /// second hop through the same metres can score too.
+    hop_credited: f64,
 
     pub fallen: bool,
     pub blocked: bool,
@@ -321,6 +422,21 @@ pub struct Sim {
     pub duty_now: f64,
     pub cmd_speed: f64,
 
+    /// Extra clearance above a standing body, metres. The jump task's apex.
+    pub clearance: f64,
+    /// Best extra clearance this episode.
+    pub apex: f64,
+    /// Best extra clearance of the hop currently in the air, or the last one.
+    pub hop_apex: f64,
+    pub airborne: bool,
+    /// A landing whose servo demand exceeded [`BREAK_G`]. The machine is
+    /// still in the world; it is not a machine any more.
+    pub broken: bool,
+    /// Peak landing demand this episode, in g.
+    pub impact_g: f64,
+    /// Successful takeoffs — feet left the ground with upward velocity.
+    pub jumps: usize,
+
     pub stub_total: f64,
     pub collisions: f64,
 
@@ -358,6 +474,7 @@ impl Default for Sim {
             unstable_for: 0.0,
             prev_track_err: [0.0; 3],
             legs: LegState::default(),
+            hop_credited: 0.0,
             fallen: false,
             blocked: false,
             advance_frac: 1.0,
@@ -384,6 +501,13 @@ impl Default for Sim {
             stride_now: 1.0,
             duty_now: 0.5,
             cmd_speed: 0.0,
+            clearance: 0.0,
+            apex: 0.0,
+            hop_apex: 0.0,
+            airborne: false,
+            broken: false,
+            impact_g: 0.0,
+            jumps: 0,
             stub_total: 0.0,
             collisions: 0.0,
             obs: [0.0; MAX_OBS],
@@ -457,14 +581,23 @@ impl Sim {
         dt: f64,
         cmd: Cmd,
     ) -> f64 {
-        if self.fallen {
+        if self.fallen || self.broken {
             return 0.0;
         }
         let n = self.frame.legs();
+        let jumping = cmd.task == Task::Jump;
+        let was_airborne = self.airborne;
 
         self.build_obs(terrain, gait, cmd);
         let mut act = [0.0; MAX_ACT];
         policy.act(&self.obs, &mut act);
+        if jumping {
+            let (hop_body, hop_lift) = hop_feedforward(self.phase);
+            let i_dh = act_body_dh(self.frame);
+            let i_j = act_jump(self.frame);
+            act[i_dh] = clamp(act[i_dh] + hop_body, -1.5, 1.5);
+            act[i_j] = clamp(act[i_j] + hop_lift, -1.0, 1.5);
+        }
         self.act = act;
 
         // --- the policy modulates frequency and step length -----------------
@@ -526,6 +659,30 @@ impl Sim {
             self.feet[i].stance = now;
         }
 
+        // Jump task: the gait clock still runs, so the hop feedforward has a
+        // phase to hang off, but stance is no longer a walking schedule. A
+        // positive lift raises every foot at once; anything else gathers them
+        // all, which is the crouch and the landing.
+        if jumping {
+            let now = act[act_jump(self.frame)] < JUMP_LIFT;
+            for i in 0..n {
+                let was = self.feet[i].stance;
+                if was && !now {
+                    self.feet[i].lift_from = self.feet[i].world;
+                } else if !was && now {
+                    let wx = self.feet[i].world[0];
+                    let wz = self.feet[i].world[2];
+                    let p = [wx, terrain.height(wx, wz), wz];
+                    let (gx, gz) = terrain.slope(wx, wz);
+                    self.feet[i].plant = p;
+                    self.feet[i].world = p;
+                    self.feet[i].grip = terrain.grip(wx, wz);
+                    self.feet[i].slope = [gx, gz];
+                }
+                self.feet[i].stance = now;
+            }
+        }
+
         self.fit_plane();
 
         // --- what the ground can give ---------------------------------------
@@ -539,6 +696,14 @@ impl Sim {
         // few ticks, and reading traction off it makes the whole machine
         // briefly frictionless every time the feet change over.
         let n_stance = self.feet.iter().filter(|f| f.stance).count();
+        self.airborne = n_stance == 0;
+        let takeoff = !was_airborne && self.airborne && self.vy > 0.05;
+        let landing = was_airborne && !self.airborne;
+        if takeoff {
+            self.jumps += 1;
+            self.hop_apex = 0.0;
+            self.hop_credited = 0.0;
+        }
         let mut mu_n = 0.0;
         if n_stance > 0 {
             let share = 1.0 / n_stance as f64;
@@ -690,8 +855,24 @@ impl Sim {
             + BODY_H * 0.6)
             .min(support_y + MAX_FOOTHOLD);
         let y_target = support_y.max(clear_y);
+        let a_pd = KP_Y * (y_target - self.pos[1]) - KD_Y * self.vy;
         let ay = if n_stance > 0 {
-            KP_Y * (y_target - self.pos[1]) - KD_Y * self.vy
+            if jumping {
+                // The demand the legs cannot meet is what breaks them. The
+                // integrator will not apply eight g; asking for it still
+                // strips the gearbox.
+                if was_airborne {
+                    let demand_g = a_pd.max(0.0) / G;
+                    self.impact_g = self.impact_g.max(demand_g);
+                    if demand_g > BREAK_G {
+                        self.broken = true;
+                    }
+                }
+                let a_up = A_JUMP_MAX.min((VY_TAKEOFF_MAX - self.vy) / dt);
+                clamp(a_pd, -A_LAND_MAX, a_up.max(0.0))
+            } else {
+                a_pd
+            }
         } else {
             -G
         };
@@ -751,6 +932,24 @@ impl Sim {
             self.feet[i].stub = stub;
             step_stub += stub;
             want[i] = [x, y, z];
+        }
+
+        // On a hop the feet stay under the hips. A walking swing arc while
+        // every leg is in the air is a somersault, not a jump.
+        if jumping {
+            for i in 0..n {
+                let d = self.frame.dir(i);
+                let out = gait.stance_w * 0.5 + gait.trim(i);
+                let x = self.pos[0] + d[0] * out;
+                let z = self.pos[2] + d[2] * out;
+                if self.feet[i].stance {
+                    want[i] = self.feet[i].plant;
+                } else {
+                    let y = self.pos[1] - gait.body_h * 0.82;
+                    want[i] = [x, y, z];
+                    self.feet[i].td = [x, terrain.height(x, z), z];
+                }
+            }
         }
 
         // --- the servos ----------------------------------------------------------
@@ -975,20 +1174,32 @@ impl Sim {
             self.com_drift[1] *= 0.982;
         }
 
-        if self.margin < 0.0 {
-            self.unstable_for += dt;
+        if jumping && self.airborne {
+            // An empty support polygon is the point of being in the air, not
+            // a fall. Tumble or hit the ground with the chassis and it is.
+            self.unstable_for = 0.0;
+            if self.pitch.abs() > 0.75
+                || self.roll.abs() > 0.75
+                || self.pos[1] < self.plane_y(self.pos[0], self.pos[2]) - 0.15
+            {
+                self.fallen = true;
+            }
         } else {
-            self.unstable_for = (self.unstable_for - dt * 2.0).max(0.0);
-        }
+            if self.margin < 0.0 {
+                self.unstable_for += dt;
+            } else {
+                self.unstable_for = (self.unstable_for - dt * 2.0).max(0.0);
+            }
 
-        let drift_mag = hypot2(self.com_drift[0], self.com_drift[1]);
-        if self.unstable_for > 0.28
-            || drift_mag > 0.95
-            || self.pitch.abs() > 0.75
-            || self.roll.abs() > 0.75
-            || self.pos[1] < self.plane_y(self.pos[0], self.pos[2]) - 0.15
-        {
-            self.fallen = true;
+            let drift_mag = hypot2(self.com_drift[0], self.com_drift[1]);
+            if self.unstable_for > 0.28
+                || drift_mag > 0.95
+                || self.pitch.abs() > 0.75
+                || self.roll.abs() > 0.75
+                || self.pos[1] < self.plane_y(self.pos[0], self.pos[2]) - 0.15
+            {
+                self.fallen = true;
+            }
         }
 
         // --- bookkeeping -------------------------------------------------------
@@ -996,6 +1207,14 @@ impl Sim {
         self.dist = self.pos[2] - self.start_z;
         let ground_speed = hypot2(self.vel[0], self.vel[1]);
         self.speed += (ground_speed - self.speed) * 0.08;
+        self.clearance =
+            self.pos[1] - self.plane_y(self.pos[0], self.pos[2]) - gait.body_h;
+        if self.clearance > self.hop_apex {
+            self.hop_apex = self.clearance;
+        }
+        if self.hop_apex > self.apex {
+            self.apex = self.hop_apex;
+        }
 
         // How much ground was closed on the waypoint being chased, measured
         // against the same waypoint at both ends so advancing to the next one
@@ -1009,28 +1228,59 @@ impl Sim {
         let arrivals = (self.reached - before) as f64;
 
         // --- reward -------------------------------------------------------------
-        let target = cmd.speed();
-        let along = fwd[0] * self.vel[0] + fwd[2] * self.vel[1];
-        let lateral = -fwd[2] * self.vel[0] + fwd[0] * self.vel[1];
-        let err_v = (along - target) / track_width(target);
-        let track = (-err_v * err_v).exp();
-
-        let mut r = dt
-            * (W_TRACK * track - W_LAT * lateral.abs()
+        let mut r = if jumping {
+            self.jump_reward(dt, cmd.height(), landing, work_step, overload)
+        } else {
+            let target = cmd.speed();
+            let along = fwd[0] * self.vel[0] + fwd[2] * self.vel[1];
+            let lateral = -fwd[2] * self.vel[0] + fwd[0] * self.vel[1];
+            let err_v = (along - target) / track_width(target);
+            let track = (-err_v * err_v).exp();
+            dt * (W_TRACK * track - W_LAT * lateral.abs()
                 - W_YAW * (self.yaw_rate - w_cmd).abs()
                 - W_HEADING * self.bearing.abs()
                 + W_MARGIN * clamp(self.margin, 0.0, 0.25)
                 - W_COLL * collision
                 + ALIVE)
-            + W_PROGRESS * progress
-            + W_WAYPOINT * arrivals
-            - W_WORK * work_step
-            - W_SLIP * self.slip
-            - W_STUB * step_stub
-            - W_OVERLOAD * overload;
+                + W_PROGRESS * progress
+                + W_WAYPOINT * arrivals
+                - W_WORK * work_step
+                - W_SLIP * self.slip
+                - W_STUB * step_stub
+                - W_OVERLOAD * overload
+        };
 
         if self.fallen {
             r -= FALL_PENALTY;
+        }
+        if self.broken {
+            r -= BREAK_PENALTY;
+        }
+        r
+    }
+
+    /// Jump-task reward. The command is an apex; extra height past it is
+    /// worth nothing, and a landing the servos cannot take is worth less than
+    /// nothing. Each hop can score, so a machine that jumps once and then
+    /// stands still does not win by accident.
+    fn jump_reward(
+        &mut self,
+        dt: f64,
+        target: f64,
+        landing: bool,
+        work_step: f64,
+        overload: f64,
+    ) -> f64 {
+        let mut r = dt * ALIVE - W_WORK * work_step - W_OVERLOAD * overload;
+        if self.airborne {
+            let toward = self.clearance.min(target).max(0.0);
+            let gained = (toward - self.hop_credited).max(0.0);
+            self.hop_credited = toward.max(self.hop_credited);
+            r += W_HEIGHT * gained;
+        }
+        if landing {
+            let err = (self.hop_apex - target) / jump_width(target);
+            r += W_MATCH * (-err * err).exp();
         }
         r
     }
@@ -1284,8 +1534,15 @@ impl Sim {
 
         let fwd = rot_y([0.0, 0.0, 1.0], self.yaw);
         let along = fwd[0] * self.vel[0] + fwd[2] * self.vel[1];
-        let target = cmd.speed();
-        self.obs[6] = (along - target) / track_width(target);
+        if cmd.task == Task::Jump {
+            let target = cmd.height();
+            self.obs[6] = (self.clearance - target) / jump_width(target);
+            self.obs[obs_cmd_speed(self.frame)] = target / JUMP_MAX;
+        } else {
+            let target = cmd.speed();
+            self.obs[6] = (along - target) / track_width(target);
+            self.obs[obs_cmd_speed(self.frame)] = target / CRUISE_MAX;
+        }
 
         for i in 0..n {
             let lp = self.feet[i].leg_phase;
@@ -1307,10 +1564,6 @@ impl Sim {
             );
             self.obs[N_FIXED_OBS + i] = p[1] - self.plane_y(p[0], p[2]);
         }
-
-        // The commanded speed itself, so one policy can serve every command
-        // instead of memorising one.
-        self.obs[obs_cmd_speed(self.frame)] = target / CRUISE_MAX;
 
         // --- navigation --------------------------------------------------------
         //
@@ -1336,6 +1589,9 @@ impl Sim {
             }
         }
         debug_assert_eq!(SCAN_AHEAD.len() * SCAN_SIDE.len(), N_SCAN);
+
+        self.obs[obs_vy(self.frame)] = clamp(self.vy / 4.0, -2.0, 2.0);
+        self.obs[obs_airborne(self.frame)] = if self.airborne { 1.0 } else { 0.0 };
     }
 }
 
@@ -1365,6 +1621,13 @@ pub struct Rollout {
     pub mean_cycle: f64,
     pub mean_stride: f64,
     pub mean_duty: f64,
+    /// Best extra clearance of any hop, metres. Zero on a walking rollout.
+    pub apex: f64,
+    /// Takeoffs with upward velocity.
+    pub jumps: usize,
+    pub broken: bool,
+    /// Peak landing demand, in g.
+    pub impact_g: f64,
 }
 
 /// Run a policy on a course for `secs` seconds of simulated time.
@@ -1405,7 +1668,7 @@ pub fn rollout(
         s_sum += sim.stride_now;
         d_sum += sim.duty_now;
         steps += 1;
-        if sim.fallen {
+        if sim.fallen || sim.broken {
             break;
         }
     }
@@ -1430,6 +1693,10 @@ pub fn rollout(
         mean_cycle: mean(c_sum, steps),
         mean_stride: mean(s_sum, steps),
         mean_duty: mean(d_sum, steps),
+        apex: sim.apex,
+        jumps: sim.jumps,
+        broken: sim.broken,
+        impact_g: sim.impact_g,
     }
 }
 
@@ -1442,9 +1709,23 @@ fn mean(sum: f64, n: usize) -> f64 {
     }
 }
 
-/// Score a policy the way training does: the same course at several commanded
-/// speeds, averaged. A policy that can only do one speed cannot win here.
+/// Score a policy the way training does. Walking averages commanded speeds;
+/// jumping averages commanded heights. Mixing the two would score a walker
+/// as if it were a jumper.
 pub fn evaluate(
+    terrain: &Terrain,
+    policy: &Policy,
+    phys: &Physics,
+    secs: f64,
+) -> Rollout {
+    if terrain.course.is_jump() {
+        evaluate_jump(terrain, policy, phys, secs)
+    } else {
+        evaluate_walk(terrain, policy, phys, secs)
+    }
+}
+
+fn evaluate_walk(
     terrain: &Terrain,
     policy: &Policy,
     phys: &Physics,
@@ -1469,6 +1750,43 @@ pub fn evaluate(
         acc.mean_cycle += r.mean_cycle / n;
         acc.mean_stride += r.mean_stride / n;
         acc.mean_duty += r.mean_duty / n;
+        acc.apex = acc.apex.max(r.apex);
+        acc.jumps += r.jumps;
+        acc.broken |= r.broken;
+        acc.impact_g = acc.impact_g.max(r.impact_g);
+    }
+    acc
+}
+
+fn evaluate_jump(
+    terrain: &Terrain,
+    policy: &Policy,
+    phys: &Physics,
+    secs: f64,
+) -> Rollout {
+    let mut acc = Rollout::default();
+    let n = EVAL_HEIGHTS.len() as f64;
+    for &h in EVAL_HEIGHTS.iter() {
+        let r = rollout(terrain, policy, phys, secs, Cmd::jump(h), None);
+        acc.reward += r.reward / n;
+        acc.distance += r.distance / n;
+        acc.steps += r.steps;
+        acc.fell |= r.fell;
+        acc.stub_total += r.stub_total / n;
+        acc.work += r.work / n;
+        acc.slip += r.slip / n;
+        acc.cot += r.cot / n;
+        acc.speed_error += (r.apex - h).abs() / n;
+        acc.peak_servo_load = acc.peak_servo_load.max(r.peak_servo_load);
+        acc.reached += r.reached;
+        acc.collisions += r.collisions / n;
+        acc.mean_cycle += r.mean_cycle / n;
+        acc.mean_stride += r.mean_stride / n;
+        acc.mean_duty += r.mean_duty / n;
+        acc.apex += r.apex / n;
+        acc.jumps += r.jumps;
+        acc.broken |= r.broken;
+        acc.impact_g = acc.impact_g.max(r.impact_g);
     }
     acc
 }
@@ -2294,5 +2612,124 @@ mod tests {
             manual += rollout(&t, &p, &phys, 5.0, Cmd::at(s), None).reward;
         }
         assert!((e.reward - manual / EVAL_SPEEDS.len() as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_seeded_hop_leaves_the_ground_without_breaking() {
+        let t = Terrain::new(Course::Jump, 1);
+        let r = rollout(
+            &t,
+            &baseline(),
+            &Physics::default(),
+            5.0,
+            Cmd::jump(0.22),
+            None,
+        );
+        assert!(
+            r.jumps >= 1,
+            "seed hop never took off: {} jumps, apex {:.3}",
+            r.jumps,
+            r.apex
+        );
+        assert!(r.apex > 0.03, "apex only {:.3} m", r.apex);
+        assert!(!r.broken, "seed hop broke the machine at {:.1} g", r.impact_g);
+        assert!(!r.fell, "seed hop fell");
+    }
+
+    #[test]
+    fn walking_does_not_become_a_jump() {
+        let t = Terrain::new(Course::Flat, 1);
+        let r = rollout(
+            &t,
+            &baseline(),
+            &Physics::default(),
+            4.0,
+            Cmd::at(3.0),
+            None,
+        );
+        assert_eq!(r.jumps, 0, "walk took off");
+        assert!(!r.broken);
+        assert!(r.distance > 4.0, "only travelled {:.2} m", r.distance);
+    }
+
+    #[test]
+    fn jump_reward_tracks_the_command_not_raw_height() {
+        // The seed hop is a small one. Matching a low command has to beat
+        // missing a high one, or the optimiser will always jump as hard as
+        // it can — which is how you strip the servos.
+        let t = Terrain::new(Course::Jump, 1);
+        let p = baseline();
+        let phys = Physics::default();
+        let low = rollout(&t, &p, &phys, 5.0, Cmd::jump(JUMP_MIN + 0.02), None);
+        let high = rollout(&t, &p, &phys, 5.0, Cmd::jump(JUMP_MAX), None);
+        assert!(
+            low.reward > high.reward,
+            "low command {:.2} vs high {:.2} (apex {:.3})",
+            low.reward,
+            high.reward,
+            low.apex
+        );
+    }
+
+    #[test]
+    fn jump_evaluation_averages_commanded_heights() {
+        let t = Terrain::new(Course::Jump, 1);
+        let p = baseline();
+        let phys = Physics::default();
+        let e = evaluate(&t, &p, &phys, 4.0);
+        let mut manual = 0.0;
+        for &h in EVAL_HEIGHTS.iter() {
+            manual += rollout(&t, &p, &phys, 4.0, Cmd::jump(h), None).reward;
+        }
+        assert!((e.reward - manual / EVAL_HEIGHTS.len() as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn airborne_is_not_a_fall() {
+        let t = Terrain::new(Course::Jump, 1);
+        let p = baseline();
+        let g = p.gait();
+        let mut s = Sim::default();
+        s.reset(&t, &g, &Physics::default());
+        let mut saw_air = false;
+        for _ in 0..400 {
+            s.step(&t, &p, &g, DT, Cmd::jump(0.22));
+            if s.airborne {
+                saw_air = true;
+                assert!(!s.fallen, "fell the moment the feet left the ground");
+            }
+            if s.fallen || s.broken {
+                break;
+            }
+        }
+        assert!(saw_air, "never left the ground");
+    }
+
+    #[test]
+    fn a_slam_landing_breaks_the_machine() {
+        // The seed hop lands softly. A body arriving at eight metres a second
+        // with the legs still at standing height is the case the break
+        // penalty exists for: the demand strips the gearbox even though the
+        // integrator will not apply that acceleration.
+        let t = Terrain::new(Course::Jump, 1);
+        let p = baseline();
+        let g = p.gait();
+        let mut s = Sim::default();
+        s.reset(&t, &g, &Physics::default());
+        let mut air = false;
+        for _ in 0..250 {
+            s.step(&t, &p, &g, DT, Cmd::jump(0.22));
+            if s.airborne {
+                air = true;
+                break;
+            }
+        }
+        assert!(air, "never took off");
+        s.phase = 0.75; // hop clock: gather, not lift
+        s.vy = -8.0;
+        s.pos[1] = s.plane_y(s.pos[0], s.pos[2]) + g.body_h + 0.04;
+        s.airborne = true;
+        s.step(&t, &p, &g, DT, Cmd::jump(0.22));
+        assert!(s.broken, "slam landing did not break: impact {:.1} g", s.impact_g);
     }
 }

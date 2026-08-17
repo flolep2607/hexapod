@@ -48,7 +48,7 @@
       </div>
 
       <div class="meter">
-        <div class="hd"><span class="k">Speed / commanded</span><b id="mSpeed">0.00</b></div>
+        <div class="hd"><span class="k" id="mSpeedLabel">Speed / commanded</span><b id="mSpeed">0.00</b></div>
         <div class="track"><div class="fill" id="fSpeed"></div></div>
       </div>
       <div class="meter">
@@ -108,10 +108,10 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         <p class="lede">The learner starts as an exact copy of the hand-tuned gait on the right, then searches
         for something better on <b id="trCourse">MIXED</b>. Each iteration samples random directions in
         parameter space, runs the gait forward and backward along each, and steps toward the directions that
-        scored best. There is no gradient and no neural network — <b id="trTheta">428 parameters</b>: six gait
-        scalars, one phase offset per leg, two stance trims, and a <b id="trShape">18×23</b> linear feedback
-        matrix mapping what the machine senses onto what it does with its legs, its gait clock and its
-        steering.</p>
+        scored best. There is no gradient and no neural network — <b id="trTheta">489 parameters</b>: six gait
+        scalars, one phase offset per leg, two stance trims, and a <b id="trShape">19×25</b> linear feedback
+        matrix mapping what the machine senses onto what it does with its legs, its gait clock, its
+        jump, and its steering.</p>
 
         <div class="statrow">
           <div class="stat mute"><span class="k">Hand-tuned</span><b id="sBase">—</b><span class="k">reward</span></div>
@@ -366,6 +366,10 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             behaviour shows up: given a range of commands to serve, the policy learns to raise its duty
             factor when walking slowly and drop it when running — the walk-to-run transition, which nobody
             put in the reward.</p>
+            <p class="note">A seventh action is <b>jump</b>, ignored while walking. On the JUMP course the
+            command is an apex, not a speed: the same sampling discipline, a small seeded hop as iteration 0,
+            and a landing the servos cannot absorb costs more than a fall. Extra height past the command
+            earns nothing. That is how you train a hexapod to jump higher without breaking it.</p>
           </div>
         </div>
 
@@ -436,10 +440,10 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
       </div>
 
       <div class="sec">
-        <div class="sec-bar"><h2>Commanded speed</h2><span class="k" id="cruiseNote"></span></div>
-        <label class="slider"><span class="hd"><span class="k">Hold this cruise</span><b id="vCruise">4.0 m/s</b></span>
+        <div class="sec-bar"><h2 id="cruiseTitle">Commanded speed</h2><span class="k" id="cruiseNote"></span></div>
+        <label class="slider"><span class="hd"><span class="k" id="cruiseHold">Hold this cruise</span><b id="vCruise">4.0 m/s</b></span>
           <input type="range" id="rCruise" min="1.5" max="6" step="0.1" value="4"></label>
-        <p class="note">The reward is speed tracking, not distance, and the command is an input to the
+        <p class="note" id="cruiseHelp">The reward is speed tracking, not distance, and the command is an input to the
         policy. Move it and watch the learned gait change its cycle time, stride and duty factor to keep up
         — the hand-tuned one cannot, because it has no feedback layer.</p>
       </div>

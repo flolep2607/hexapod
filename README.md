@@ -191,7 +191,7 @@ already had only ever see the next footfall, which is far too late to turn on.
 The scan sees the invisible walls too — they are invisible, not undetectable,
 and a policy that cannot sense a fence cannot avoid one.
 
-Nine courses, all generated from a seed:
+Nine courses plus a jump pad, all generated from a seed:
 
 | course | what is in it |
 | --- | --- |
@@ -204,6 +204,7 @@ Nine courses, all generated from a seed:
 | `SLALOM` | Walls with a 3.5 m gate in each, staggered left and right |
 | `SLICK` | Ice at a fifth of the grip of the ground around it |
 | `GAUNTLET` | All of the above in one run |
+| `JUMP` | Flat pad. The command is an apex, not a speed |
 
 `RAMPS` is a different problem from `STEPS`: a staircase is a sequence of
 shocks, a ramp is a sustained tilt, and a banked one rolls the support plane and
@@ -267,12 +268,53 @@ learned policy runs, and running at a staircase gets it 18.5 m and a fall where
 walking got 29.1 m and none. Reward is not distance, and here it is nearly a
 wash.
 
+## Jumping
+
+Walking is holding a speed. Jumping is holding an **apex**. The same rule
+applies: there is no raw-height term, because that is how you train a machine
+to jump until the servos strip. The command is sampled from 0.06–0.40 m of
+extra clearance, shared between both sides of each finite difference, and
+handed to the policy as an observation. Evaluation averages three heights. A
+gait that only hops one height cannot score.
+
+Iteration 0 is a small seeded hop — crouch, push, lift, land — the same way
+iteration 0 of walking is the tripod. The jump action is ignored on every
+other course, so a walking rollout of the seeded policy is bit-identical to
+what it was. On `JUMP` the hop clock gathers every foot, then raises them all
+at once, which is the only way this machine leaves the ground: the walking
+duty factor cannot go below 0.45.
+
+A landing whose servo demand exceeds 8 g **breaks** the robot. The integrator
+will not apply that acceleration; asking for it still ends the run, priced
+higher than a fall. Extra height past the command earns nothing, so the
+search that jumps as hard as it can, and the search that lands stiff, both
+lose.
+
+80 iterations, horizon 5 s (`hexapod jump --iters 80 --horizon 5`):
+
+| commanded | seed hop | learned | error |
+| --------: | -------: | ------: | ----: |
+|  0.08 m |    0.122 |   0.155 | 0.075 |
+|  0.14 m |    0.122 |   0.187 | 0.047 |
+|  0.22 m |    0.122 |   0.234 | 0.014 |
+|  0.28 m |    0.122 |   0.272 | 0.008 |
+|  0.36 m |    0.122 |   0.337 | 0.023 |
+
+The seed hop is 12 cm whatever you ask for, because it is open-loop. The
+learned policy tracks the command: mean apex error **0.111 → 0.033 m**. Reward
+goes 73 → 644. At 36 cm the landing demand is 2.3 g — well under the 8 g that
+strips the gearbox — and it never broke.
+
+That is the walk-to-run result, pointed up. Nobody put crouch depth or flight
+time in the reward. The command is an input, breaking is expensive, and the
+search finds a hop that scales.
+
 ## How many legs
 
 The frame is a value, not a constant. Any even count from four to ten: the
 chassis grows, the leg mounts spread evenly front to back, the presets are
 closed forms in the pair index, and the policy is reshaped around the new
-observation and action counts — `17 + n` observations, `2n + 6` actions. At
+observation and action counts — `19 + n` observations, `2n + 7` actions. At
 three pairs every formula reproduces the original hand-built hexapod exactly,
 down to the phase offsets, which is what the tests check.
 
@@ -360,24 +402,27 @@ estimates along random directions, scaled by the spread of the returns, using
 only the best-scoring directions, over a linear policy with normalised
 observations. Derivative-free, so the simulator never has to be differentiable.
 
-428 parameters on six legs, and `8 + n + n_act * n_obs` in general:
+489 parameters on six legs, and `8 + n + n_act * n_obs` in general:
 
 - 6 gait scalars (cycle time, stride, step height, body height, stance width, duty)
 - one phase offset per leg — so the coordination pattern itself is learned
 - 2 lateral stance trims, on the outermost pairs
-- an 18×23 linear feedback matrix (18 actions, 23 observations)
+- a 19×25 linear feedback matrix (19 actions, 25 observations)
 
-Observations, `17 + n` of them: body height error, pitch, roll, stability
-margin, gait phase (sin/cos), speed error against the command, a terrain-height
-lookahead under each leg's predicted touchdown, the commanded speed, bearing and
-range to the next waypoint, position between the two walls, and a six-point
-forward terrain scan. Actions, `2n + 6`: per-leg step height and touchdown
-offset, body height and pitch trim, the three gait modulations, and steering.
+Observations, `19 + n` of them: body height error, pitch, roll, stability
+margin, gait phase (sin/cos), speed (or height) error against the command, a
+terrain-height lookahead under each leg's predicted touchdown, the commanded
+speed or apex, bearing and range to the next waypoint, position between the
+two walls, a six-point forward terrain scan, vertical velocity, and whether
+the machine is airborne. Actions, `2n + 7`: per-leg step height and touchdown
+offset, body height and pitch trim, the three gait modulations, jump, and
+steering.
 
 The feedback block starts at zero, so **iteration 0 is exactly the hand-tuned
-gait** — including the modulation actions, which sit at their nominal values
-until something is learned. The comparison in the UI is honest by construction,
-and there is a test for it.
+gait** on a walking course — including the modulation actions, which sit at
+their nominal values until something is learned. On `JUMP`, iteration 0 is
+the seeded hop. The comparison in the UI is honest by construction, and there
+is a test for it.
 
 The default population is **16 directions**, up from 8. ARS estimates its
 update from the spread of returns across sampled directions, so the sample it
@@ -499,9 +544,9 @@ continuous torque is far lower, which is what the safety factor is for.
 ## Layout
 
 ```
-crates/hexapod-core    simulator, dynamics, ARS trainer, hardware. 108 tests.
-crates/hexapod-cli     train, bench, sweep, speed, servo, bom, system, courses
-crates/hexapod-wasm    C-ABI bridge; no wasm-bindgen, ~158 kB of wasm
+crates/hexapod-core    simulator, dynamics, ARS trainer, hardware. 115 tests.
+crates/hexapod-cli     train, bench, sweep, speed, jump, servo, bom, system, courses
+crates/hexapod-wasm    C-ABI bridge; no wasm-bindgen, ~167 kB of wasm
 web/                   dashboard: renderer, panels, styling
 build.sh               inlines wasm as base64 into one HTML file
 test/smoke.mjs         Playwright end-to-end check of the built page
@@ -522,10 +567,10 @@ test/smoke.mjs         Playwright end-to-end check of the built page
 
 Drag to orbit, scroll to zoom, `WASD`/`QE` to drive, `X` to stop, `space` to
 pause. The **Frame** slider sets the leg count, the **Commanded speed** dial is
-the number the reward tracks, and the **Machine** selector picks the servo the
-joints are driven with. Changing any of them is a different robot, so anything
-learned for the old one is discarded. **Follow route** hands steering to the
-policy; the turn keys take it back for as long as you hold them.
+the number the reward tracks (an apex, on `JUMP`), and the **Machine** selector
+picks the servo the joints are driven with. Changing any of them is a different
+robot, so anything learned for the old one is discarded. **Follow route** hands
+steering to the policy; the turn keys take it back for as long as you hold them.
 
 ### The gait pattern panel is a measurement
 
@@ -550,7 +595,7 @@ before anybody looked for it.
 
 ## Tests
 
-`cargo test` — 108 tests.
+`cargo test` — 115 tests.
 
 Geometry, on every frame from four legs to ten: IK round-trips against forward
 kinematics, hips that never collide however many legs there are, mirrored pairs
@@ -577,7 +622,10 @@ over and a crawling one does not, cost of transport lands in the range legged
 machines actually occupy, the body holds the speed it is commanded regardless of
 what its stride is set to, the three gait modulations are wired to the command,
 and the baseline gait is untouched by them so iteration 0 really is the
-hand-tuned gait.
+hand-tuned gait. Jumping: the seeded hop leaves the ground without breaking,
+walking does not become a jump, airborne is not a fall, a slam landing strips
+the gearbox, the reward tracks the commanded apex rather than raw height, and
+a short ARS run improves on the seed hop.
 
 Terrain and navigation: every course generates something and carries a route
 that runs its whole length in order and never passes through a wall, a ramp is
@@ -596,7 +644,7 @@ current, bus servos taking an adapter instead of PWM channels, 7.4 V servos
 skipping the regulator, and an absurd runtime failing loudly instead of
 returning a plausible-looking answer.
 
-`node test/smoke.mjs` — 65 checks in Chromium: the wasm starts, the sim
+`node test/smoke.mjs` — 72 checks in Chromium: the wasm starts, the sim
 advances, the stage paints, training improves the reward, the learned policy
 becomes selectable, courses switch, the torque requirement responds to mass, the
 commanded-speed dial actually changes how fast the robot goes, contact and
@@ -607,5 +655,6 @@ repaints the stage and still walks. Then: every canvas's backing store matches
 the box CSS lays it out in, so nothing on the page is drawn stretched; the
 footfall recorder holds real samples and its measured cycle, duty and pattern
 agree with the gait actually running; every course the simulator knows has a
-button; the slalom loads with a route that leaves the centreline; and the
-autopilot can be switched off and hands steering back.
+button; the slalom loads with a route that leaves the centreline; the jump pad
+loads with an apex dial and the seed hop leaves the ground; and the autopilot
+can be switched off and hands steering back.
