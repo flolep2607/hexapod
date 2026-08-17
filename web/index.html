@@ -108,15 +108,16 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
 
         <p class="lede">The learner starts as an exact copy of the hand-tuned gait on the right, then searches
         for something better on <b id="trCourse">MIXED</b>. Each iteration samples random directions in
-        parameter space, runs the gait forward and backward along each, and steps toward the directions that
+        parameter space, runs the gait forward and backward along each on the <b>centroidal</b> plant
+        (not the Rapier robot on screen), and steps toward the directions that
         scored best. There is no gradient and no neural network — <b id="trTheta">489 parameters</b>: six gait
         scalars, one phase offset per leg, two stance trims, and a <b id="trShape">19×25</b> linear feedback
         matrix mapping what the machine senses onto what it does with its legs, its gait clock, its
         jump, and its steering.</p>
 
         <div class="statrow">
-          <div class="stat mute"><span class="k">Hand-tuned</span><b id="sBase">—</b><span class="k">reward</span></div>
-          <div class="stat"><span class="k">Learned best</span><b id="sBest">—</b><span class="k">reward</span></div>
+          <div class="stat mute"><span class="k">Hand-tuned</span><b id="sBase">—</b><span class="k">centroidal eval</span></div>
+          <div class="stat"><span class="k">Learned best</span><b id="sBest">—</b><span class="k">centroidal eval</span></div>
           <div class="stat mute"><span class="k">Iterations</span><b id="sIter">0</b><span class="k" id="sIterMs">— ms each</span></div>
           <div class="stat mute"><span class="k">Rollouts</span><b id="sRoll">0</b><span class="k">simulated episodes</span></div>
           <div class="stat"><span class="k">Improvement</span><b id="sGain">—</b><span class="k">over baseline</span></div>

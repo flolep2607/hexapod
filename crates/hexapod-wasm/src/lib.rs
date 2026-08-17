@@ -18,7 +18,7 @@ use hexapod_core::ars::{ArsConfig, Trainer};
 use hexapod_core::dynamics::{robot_com, Physics};
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
-use hexapod_core::math::{squash, unsquash};
+use hexapod_core::math::{body_to_world, convex_hull_xz, polygon_margin, squash, unsquash};
 use hexapod_core::plant::ArticulatedPlant;
 use hexapod_core::policy::foot_on_terrain;
 use hexapod_core::policy::{act_body_dh, n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
@@ -331,6 +331,13 @@ pub extern "C" fn hx_train(iters: u32) -> f64 {
     }
     a.trained = true;
     a.learned = a.trainer.best_policy();
+    // Drive the robot on screen with the gait ARS just scored. Clamp like
+    // reset_live so the servos can track; do not respawn the plant.
+    a.live_gait = a.learned.gait();
+    a.apply_live_gait_limits();
+    if a.mode != MODE_LEARNED {
+        a.mode = MODE_LEARNED;
+    }
     // Publish here: the live view only calls `hx_step` while unpaused, and
     // the dashboard reads these fields after `hx_train`.
     a.publish();
@@ -536,8 +543,7 @@ impl App {
         }
     }
 
-    fn reset_live(&mut self) {
-        self.live_gait = self.active_gait();
+    fn apply_live_gait_limits(&mut self) {
         // The machine on screen is driven by real motors, so it does not get to
         // run a clock its servos cannot track: past their no-load speed a joint
         // has no torque left and simply stops following, which buys no speed and
@@ -570,6 +576,11 @@ impl App {
             self.phys.actuator.omega_max,
         );
         self.live_gait.cycle = g.cycle.max(floor);
+    }
+
+    fn reset_live(&mut self) {
+        self.live_gait = self.active_gait();
+        self.apply_live_gait_limits();
         self.live.reset(&self.terrain, &self.live_gait, &self.phys);
         self.plant = Some(ArticulatedPlant::standing(
             self.frame,
@@ -633,8 +644,13 @@ impl App {
         let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
         let h = dt / n as f64;
         for _ in 0..n {
-            self.live
-                .step(&self.terrain, policy, &self.live_gait, h, cmd);
+            if self.plant.is_some() {
+                self.live
+                    .tick_gait(&self.terrain, policy, &self.live_gait, h, cmd);
+            } else {
+                self.live
+                    .step(&self.terrain, policy, &self.live_gait, h, cmd);
+            }
             if let Some(plant) = self.plant.as_mut() {
                 let mut q_cmd = self.live.q_cmd;
                 let body_h = self.live_gait.body_h
@@ -674,6 +690,8 @@ impl App {
                     );
                     q_cmd[i] = hexapod_core::robot::solve_ik(self.frame, i, target).q;
                     self.live.q_cmd[i] = q_cmd[i];
+                    let w = body_to_world(target, byaw, bpitch, broll);
+                    self.live.feet[i].td = [bp[0] + w[0], bp[1] + w[1], bp[2] + w[2]];
                 }
                 plant.drive(&q_cmd, &self.phys, h);
                 let pre = plant.chassis_vel();
@@ -686,6 +704,11 @@ impl App {
                 let (p, yaw, pitch, roll) = plant.chassis_pose();
                 let v = plant.chassis_vel();
                 self.live.observe_pose(p, yaw, pitch, roll, [v[0], v[2]]);
+                let slip_v = plant.foot_slip();
+                self.live.slip = slip_v * h;
+                self.live.slip_total += self.live.slip;
+                // ponytail: traction left 0 until we read Rapier contact impulses
+                self.live.traction = 0.0;
                 if plant.chassis_dead(pre) {
                     self.live.fallen = true;
                 }
@@ -740,24 +763,47 @@ impl App {
             t[T_STEPH + leg] = s.feet[leg].step_h as f32;
             t[T_LEG_LOAD + leg] = s.feet[leg].load_frac as f32;
             for c in 0..3 {
-                t[T_TD + leg * 3 + c] = s.feet[leg].td[c] as f32;
+                let td = match plant_draw.as_ref() {
+                    Some((_, _, _, _, _, j)) if s.feet[leg].stance => j[leg][3],
+                    _ => s.feet[leg].td,
+                };
+                t[T_TD + leg * 3 + c] = td[c] as f32;
                 t[T_Q + leg * 3 + c] = q_draw[c] as f32;
                 t[T_QCMD + leg * 3 + c] = s.q_cmd[leg][c] as f32;
             }
         }
 
-        // Hull, touchdown targets and CoM are already in the drawn body's frame:
-        // the planner is fed Rapier's pose every tick.
-        for i in 0..MAX_LEGS {
-            t[T_HULL + i * 2] = s.hull[i][0] as f32;
-            t[T_HULL + i * 2 + 1] = s.hull[i][1] as f32;
+        // Hull of planted Rapier feet when the plant is live; centroidal
+        // otherwise. Grey TD rings for stance sit on the actual foot.
+        if plant_draw.is_some() {
+            let mut pts = [[0.0f64; 2]; MAX_LEGS];
+            let mut np = 0usize;
+            for i in 0..n {
+                if s.feet[i].stance {
+                    pts[np] = [world_j[i][3][0], world_j[i][3][2]];
+                    np += 1;
+                }
+            }
+            let mut hull = [[0.0f64; 2]; MAX_LEGS];
+            let hull_n = convex_hull_xz(&pts[..np], &mut hull);
+            for i in 0..MAX_LEGS {
+                t[T_HULL + i * 2] = hull[i][0] as f32;
+                t[T_HULL + i * 2 + 1] = hull[i][1] as f32;
+            }
+            t[T_HULL_N] = hull_n as f32;
+            t[T_MARGIN] = polygon_margin(&hull[..hull_n], [pos[0], pos[2]]) as f32;
+        } else {
+            for i in 0..MAX_LEGS {
+                t[T_HULL + i * 2] = s.hull[i][0] as f32;
+                t[T_HULL + i * 2 + 1] = s.hull[i][1] as f32;
+            }
+            t[T_HULL_N] = s.hull_n as f32;
+            t[T_MARGIN] = s.margin as f32;
         }
-        t[T_HULL_N] = s.hull_n as f32;
         t[T_LEGS] = n as f32;
         t[T_BODY_R] = self.frame.body_r() as f32;
 
         t[T_PHASE] = s.phase as f32;
-        t[T_MARGIN] = s.margin as f32;
         t[T_DIST] = s.dist as f32;
         t[T_SPEED] = s.speed as f32;
         t[T_POWER] = s.power as f32;
@@ -771,6 +817,10 @@ impl App {
         t[T_COM3] = com[0] as f32;
         t[T_COM3 + 1] = com[1] as f32;
         t[T_COM3 + 2] = com[2] as f32;
+        if plant_draw.is_some() {
+            t[T_COM] = (com[0] - pos[0]) as f32;
+            t[T_COM + 1] = (com[2] - pos[2]) as f32;
+        }
         t[T_STUB] = s.stub_total as f32;
         t[T_COLLISIONS] = s.collisions as f32;
         for i in 0..3 {
@@ -1030,6 +1080,7 @@ mod tests {
         let t = tel();
         assert!(t[T_TRAINED] > 0.5, "T_TRAINED={}", t[T_TRAINED]);
         assert!(t[T_ITER] >= 1.0, "T_ITER={}", t[T_ITER]);
+        assert_eq!(t[T_MODE], MODE_LEARNED as f32);
         assert!(t[T_BASE_R].is_finite());
         assert!(t[T_BEST_R].is_finite());
 
@@ -1037,5 +1088,16 @@ mod tests {
         let t = tel();
         assert!(t[T_TRAINED] < 0.5, "T_TRAINED={}", t[T_TRAINED]);
         assert_eq!(t[T_ITER], 0.0);
+    }
+
+    #[test]
+    fn a_second_train_keeps_learned_mode() {
+        hx_init(1);
+        hx_set_train_cfg(2, 1, 0.025, 0.04, 2.0);
+        hx_train(1);
+        assert_eq!(tel()[T_MODE], MODE_LEARNED as f32);
+        hx_train(1);
+        assert_eq!(tel()[T_MODE], MODE_LEARNED as f32);
+        assert!(tel()[T_TRAINED] > 0.5);
     }
 }

@@ -1139,18 +1139,24 @@ function frame(now) {
     state.iterMs = performance.now() - t0;
     drawCurve();
     updateTrainingPanel();
+    const trained = telemetry();
+    if (trained[L.T_TRAINED] > 0.5 && state.mode !== 1) setMode(1);
   }
 
   const t = telemetry();
   stage.draw(t, L);
-  falls.push(t[L.T_TIME], t, L, Math.round(t[L.T_LEGS]) || 6);
+  if (!state.paused) {
+    falls.push(t[L.T_TIME], t, L, Math.round(t[L.T_LEGS]) || 6);
+  }
   drawGaitDiagram(t);
 
   slowAcc += dt;
   if (slowAcc > 0.06) {
     slowAcc = 0;
-    traceTorque.push([t[L.T_Q + 1], t[L.T_Q + 2]]);
-    traceFoot.push([t[L.T_JOINTS + 10]]);
+    if (!state.paused) {
+      traceTorque.push([t[L.T_Q + 1], t[L.T_Q + 2]]);
+      traceFoot.push([t[L.T_JOINTS + 10]]);
+    }
     traceTorque.draw();
     traceFoot.draw();
     updateReadouts(t);
@@ -1673,9 +1679,8 @@ async function boot() {
     const t = telemetry();
     return { duty: t[L.T_DUTY_NOW], cycle: t[L.T_CYCLE_NOW] };
   };
-  // Furthest support-polygon vertex from the drawn chassis: the overlays come
-  // out of the centroidal Sim, the body on screen is the Rapier one, so this
-  // catches the two frames parting company again.
+  // Furthest support-polygon vertex from the drawn chassis: hull is Rapier
+  // feet when the plant is live, so this is a same-frame span check.
   window.__hxHullSpan = () => {
     const t = telemetry();
     const n = Math.round(t[L.T_HULL_N]);

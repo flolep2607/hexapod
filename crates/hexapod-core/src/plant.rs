@@ -23,7 +23,7 @@ use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 /// scale instead of having to be retuned alongside it.
 const STIFF_PER_STALL: f32 = 6.1;
 const DAMP_PER_STALL: f32 = 0.82;
-const FOOT_R: f32 = 0.05;
+const FOOT_R: f32 = 0.08;
 /// Collider `user_data`: the walkable plane. Any chassis contact is fatal.
 const HIT_FLOOR: u128 = 1;
 /// Collider `user_data`: a block or corridor wall. Fatal only on a hard hit.
@@ -168,8 +168,15 @@ impl ArticulatedPlant {
         }
 
         // 1 = terrain, 2 = chassis, 3 = feet, 4 = links. Adjacent parent/child
-        // still skip via contacts_enabled(false) on the hinge.
-        let groups_ground = InteractionGroups::new(
+        // still skip via contacts_enabled(false) on the hinge. Floor hits
+        // chassis and feet only — tibia capsules on the plane skate. Solids
+        // (crates, walls) still hit links so a tibia cannot occupy a block.
+        let groups_floor = InteractionGroups::new(
+            Group::GROUP_1,
+            Group::GROUP_2 | Group::GROUP_3,
+            InteractionTestMode::And,
+        );
+        let groups_solid = InteractionGroups::new(
             Group::GROUP_1,
             Group::GROUP_2 | Group::GROUP_3 | Group::GROUP_4,
             InteractionTestMode::And,
@@ -208,7 +215,7 @@ impl ArticulatedPlant {
             ColliderBuilder::cuboid(x1 - x0 + 4.0, floor_h, 0.5 * (z1 - z0) + 4.0)
                 .friction(phys.mu as f32)
                 .restitution(0.0)
-                .collision_groups(groups_ground)
+                .collision_groups(groups_floor)
                 .user_data(HIT_FLOOR),
             floor,
             &mut bodies,
@@ -232,7 +239,7 @@ impl ArticulatedPlant {
                 ColliderBuilder::cuboid(hx, hy, hz)
                     .friction((phys.mu * ob.grip) as f32)
                     .restitution(0.0)
-                    .collision_groups(groups_ground)
+                    .collision_groups(groups_solid)
                     .user_data(HIT_SOLID),
                 block,
                 &mut bodies,
@@ -250,7 +257,7 @@ impl ArticulatedPlant {
             colliders.insert_with_parent(
                 ColliderBuilder::cuboid(wall_t, wall_h, 0.5 * (z1 - z0))
                     .friction(phys.mu as f32)
-                    .collision_groups(groups_ground)
+                    .collision_groups(groups_solid)
                     .user_data(HIT_SOLID),
                 wb,
                 &mut bodies,
@@ -379,7 +386,8 @@ impl ArticulatedPlant {
                     .friction(phys.mu as f32)
                     .restitution(0.0)
                     .collision_groups(groups_foot)
-                    .translation(Vector::new(0.0, tibia_len + FOOT_R * s * 0.35, 0.0)),
+                    // Distal surface of the ball at the kinematic foot.
+                    .translation(Vector::new(0.0, tibia_len - FOOT_R * s, 0.0)),
                 tibia,
                 &mut bodies,
             );
@@ -441,8 +449,8 @@ impl ArticulatedPlant {
 
         let integration = IntegrationParameters {
             dt: crate::sim::DT as f32,
-            num_solver_iterations: 12,
-            num_internal_pgs_iterations: 2,
+            num_solver_iterations: 16,
+            num_internal_pgs_iterations: 4,
             length_unit: 1.0,
             ..Default::default()
         };
@@ -628,6 +636,34 @@ impl ArticulatedPlant {
         self.bodies[self.chassis].translation().z as f64 / self.scale as f64
     }
 
+    /// Sum of horizontal foot speed for feet touching the walkable plane, m/s.
+    pub fn foot_slip(&self) -> f64 {
+        // ponytail: tibia linvel at the ball, not Rapier friction impulses.
+        let mut slip = 0.0f64;
+        for i in 0..self.n {
+            let Some(leg) = self.legs[i].as_ref() else {
+                continue;
+            };
+            let touching = self.narrow_phase.contact_pairs_with(leg.foot).any(|pair| {
+                if !pair.has_any_active_contact() {
+                    return false;
+                }
+                let other = if pair.collider1 == leg.foot {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                self.colliders[other].user_data == HIT_FLOOR
+            });
+            if !touching {
+                continue;
+            }
+            let v = self.bodies[leg.tibia].linvel();
+            slip += (v.x * v.x + v.z * v.z).sqrt() as f64;
+        }
+        slip
+    }
+
     pub fn pitch_abs(&self) -> f64 {
         let fwd = *self.bodies[self.chassis].rotation() * Vector::Z;
         (fwd.y as f64).abs()
@@ -772,13 +808,16 @@ mod tests {
             plant.step(crate::sim::DT);
         }
         let dz = plant.chassis_z() - z0;
-        // Forward, upright, and under its own feet. How *fast* is a traction
-        // question — a two-metre chassis weighing two kilos on 5 cm feet skates
-        // long before the servos run out — so this asserts the direction and the
-        // stability, not a speed the physics parameters do not support.
+        // Body-frame stance advances one stride per stance window. 0.5 m in
+        // 12 s on a ~2 m machine is a slide; a body-length is a walk.
+        let want = 2.0;
         assert!(
-            dz > 0.5,
-            "tripod did not walk forward: dz={dz:.3} (want > 0.5 sim-m in 12 s)"
+            dz > want,
+            "tripod did not walk forward: dz={dz:.3} (want > {want:.3} sim-m in 12 s; \
+             cycle={:.3} stride={:.3} v_kin={:.3})",
+            gait.cycle,
+            gait.stride,
+            gait.nominal_speed()
         );
         assert!(plant.pitch_abs() < 0.55, "fell while walking");
     }

@@ -593,6 +593,31 @@ impl Sim {
         dt: f64,
         cmd: Cmd,
     ) -> f64 {
+        self.step_gait(terrain, policy, gait, dt, cmd, true)
+    }
+
+    /// Gait clock and policy only. Pose and velocity stay whatever
+    /// [`observe_pose`] last wrote — no `ACCEL_GAIN`, no world-anchored plants.
+    pub fn tick_gait(
+        &mut self,
+        terrain: &Terrain,
+        policy: &Policy,
+        gait: &Gait,
+        dt: f64,
+        cmd: Cmd,
+    ) {
+        let _ = self.step_gait(terrain, policy, gait, dt, cmd, false);
+    }
+
+    fn step_gait(
+        &mut self,
+        terrain: &Terrain,
+        policy: &Policy,
+        gait: &Gait,
+        dt: f64,
+        cmd: Cmd,
+        integrate: bool,
+    ) -> f64 {
         if self.fallen || self.broken {
             return 0.0;
         }
@@ -748,6 +773,29 @@ impl Sim {
                 }
                 self.feet[i].stance = down;
             }
+        }
+
+        if !integrate {
+            // Live Rapier path: clock, stance flags, and the policy's gait
+            // levers. Leave pos/vel/yaw alone so the plant has something to push.
+            for i in 0..n {
+                self.feet[i].step_h = clamp(gait.step_h * (1.0 + 0.9 * act[i]), 0.05, 0.90);
+            }
+            let n_stance = self.feet.iter().filter(|f| f.stance).count();
+            let share = if n_stance > 0 { 1.0 / n_stance as f64 } else { 0.0 };
+            for f in self.feet.iter_mut() {
+                let target = if f.stance { share } else { 0.0 };
+                f.load += (target - f.load) * 0.25;
+            }
+            self.yaw_rate = w_cmd;
+            self.slip = 0.0;
+            self.traction = 0.0;
+            self.t += dt;
+            self.dist = self.pos[2] - self.start_z;
+            let ground_speed = hypot2(self.vel[0], self.vel[1]);
+            self.speed += (ground_speed - self.speed) * 0.08;
+            self.update_route(terrain);
+            return 0.0;
         }
 
         self.fit_plane();
@@ -1969,6 +2017,23 @@ mod tests {
             let avg = r.distance / (r.steps as f64 * DT);
             assert!((avg - 3.0).abs() < 0.6, "averaged {avg:.2} for 3.0 m/s");
         }
+    }
+
+    #[test]
+    fn tick_gait_advances_the_clock_without_translating() {
+        let t = Terrain::new(Course::Flat, 1);
+        let p = baseline();
+        let g = p.gait();
+        let phys = Physics::default();
+        let mut s = Sim::default();
+        s.reset(&t, &g, &phys);
+        let pos0 = s.pos;
+        let vel0 = s.vel;
+        s.tick_gait(&t, &p, &g, DT, Cmd::at(4.0));
+        assert_eq!(s.pos, pos0);
+        assert_eq!(s.vel, vel0);
+        assert!(s.phase > 0.0, "gait clock did not move");
+        assert!((s.t - DT).abs() < 1e-12);
     }
 
     #[test]
