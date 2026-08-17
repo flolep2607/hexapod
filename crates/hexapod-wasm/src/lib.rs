@@ -615,12 +615,24 @@ impl App {
                 }
                 plant.drive(&q_cmd, &self.phys);
                 plant.step(h);
-                plant.apply_visual(&mut self.live);
+                // Do not write Rapier q/pose back into `live`: a missed
+                // motor track would rewind the centroidal gait clock.
             }
         }
     }
 
     fn publish(&mut self) {
+        let n = self.frame.legs();
+        // Rapier hinge angles for the canvas only. The live `Sim` stays
+        // centroidal so a missed motor track cannot rewind gait-clock state.
+        let plant_q = self.plant.as_ref().map(|plant| {
+            let mut q = [[0.0f64; 3]; MAX_LEGS];
+            for i in 0..n {
+                q[i] = plant.leg_q(i);
+            }
+            q
+        });
+
         let t = &mut self.telemetry;
         let s = &self.live;
 
@@ -631,11 +643,20 @@ impl App {
         t[T_PITCH] = s.pitch as f32;
         t[T_ROLL] = s.roll as f32;
 
-        let n = self.frame.legs();
         for leg in 0..n {
+            let (q_draw, joints) = match plant_q.as_ref() {
+                Some(pq) => {
+                    let q = pq[leg];
+                    let j = hexapod_core::robot::fk_world(
+                        s.frame, leg, q, s.pos, s.yaw, s.pitch, s.roll,
+                    );
+                    (q, j)
+                }
+                None => (s.q[leg], s.joints[leg]),
+            };
             for p in 0..4 {
                 for c in 0..3 {
-                    t[T_JOINTS + leg * 12 + p * 3 + c] = s.joints[leg][p][c] as f32;
+                    t[T_JOINTS + leg * 12 + p * 3 + c] = joints[p][c] as f32;
                 }
             }
             t[T_STANCE + leg] = if s.feet[leg].stance { 1.0 } else { 0.0 };
@@ -645,7 +666,7 @@ impl App {
             t[T_LEG_LOAD + leg] = s.feet[leg].load_frac as f32;
             for c in 0..3 {
                 t[T_TD + leg * 3 + c] = s.feet[leg].td[c] as f32;
-                t[T_Q + leg * 3 + c] = s.q[leg][c] as f32;
+                t[T_Q + leg * 3 + c] = q_draw[c] as f32;
                 t[T_QCMD + leg * 3 + c] = s.q_cmd[leg][c] as f32;
             }
         }

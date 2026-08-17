@@ -15,7 +15,6 @@ use crate::policy::Gait;
 use crate::robot::{
     clamp_joints, fk_world, solve_ik, Frame, BODY_H, COXA, FEMUR, MAX_LEGS, Q_LIMIT, TIBIA,
 };
-use crate::sim::Sim;
 use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 
 const STIFF: f32 = 120.0;
@@ -493,35 +492,19 @@ impl ArticulatedPlant {
         h.q0 + a
     }
 
-    /// Overlay Rapier hinge angles onto the centroidal `Sim` for drawing.
-    ///
-    /// Body pose, speed, gait-clock stance and the hop flag stay on the
-    /// centroidal plant: those are the HUD / ARS / smoke-test numbers, and a
-    /// Rapier tick is not a drop-in replacement for them. Writing the Rapier
-    /// chassis pose back into `Sim` used to rewind the integrator every
-    /// substep, so waypoints and jumps never landed.
-    pub fn apply_visual(&self, sim: &mut Sim) {
-        let mut lag2 = 0.0f64;
-        let mut nq = 0.0f64;
-        for i in 0..self.n {
-            let Some(leg) = self.legs[i].as_ref() else {
-                continue;
-            };
-            for j in 0..3 {
-                sim.q[i][j] = self.joint_angle(leg.hinges[j]) as f64;
-                let e = sim.q_cmd[i][j] - sim.q[i][j];
-                lag2 += e * e;
-                nq += 1.0;
-            }
-            sim.joints[i] = fk_world(
-                sim.frame, i, sim.q[i], sim.pos, sim.yaw, sim.pitch, sim.roll,
-            );
-            sim.feet[i].world = sim.joints[i][3];
-        }
-        if nq > 0.0 {
-            sim.servo_lag = (lag2 / nq).sqrt();
-        }
-        sim.droop = (sim.q_cmd[0][1] - sim.q[0][1]).abs() * FEMUR * 0.5;
+    /// Rapier hinge angles for one leg, in the same coxa/femur/tibia order as
+    /// the centroidal plant. The dashboard overlays these on the gait-clock
+    /// body pose; it must not write them back into `Sim` or a missed motor
+    /// track (high speed, a quadruped tip) rewinds the integrator.
+    pub fn leg_q(&self, i: usize) -> [f64; 3] {
+        let Some(leg) = self.legs.get(i).and_then(|l| l.as_ref()) else {
+            return [0.0; 3];
+        };
+        [
+            self.joint_angle(leg.hinges[0]) as f64,
+            self.joint_angle(leg.hinges[1]) as f64,
+            self.joint_angle(leg.hinges[2]) as f64,
+        ]
     }
 
     /// Chassis height in simulator units.
