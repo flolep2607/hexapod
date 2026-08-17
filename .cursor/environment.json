@@ -8,5 +8,10 @@
       "command": "test -f dist/hexapod-simulator.html || npm run build; npm run serve"
     }
   ],
-  "ports": [8000]
+  "ports": [
+    {
+      "name": "dashboard",
+      "port": 8000
+    }
+  ]
 }
