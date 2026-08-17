@@ -13,9 +13,9 @@ CARGO_FLAGS="--release --offline"
 WASM=target/wasm32-unknown-unknown/release/hexapod_wasm.wasm
 
 echo "==> cargo test"
-cargo test $CARGO_FLAGS --offline -q 2>&1 | tail -5 || cargo test --offline -q
+cargo test $CARGO_FLAGS -q 2>&1 | tail -5 || cargo test --offline -q
 echo "==> cargo test (rapier plant)"
-cargo test $CARGO_FLAGS --offline -q -p hexapod-core --features rapier -- --test-threads=1 2>&1 | tail -8 \
+cargo test $CARGO_FLAGS -q -p hexapod-core --features rapier -- --test-threads=1 2>&1 | tail -8 \
   || cargo test --offline -q -p hexapod-core --features rapier -- --test-threads=1
 
 echo "==> building wasm"

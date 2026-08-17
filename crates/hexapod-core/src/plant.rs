@@ -493,31 +493,14 @@ impl ArticulatedPlant {
         h.q0 + a
     }
 
-    fn foot_down(&self, foot: ColliderHandle) -> bool {
-        self.narrow_phase
-            .contact_pairs_with(foot)
-            .any(|p| p.has_any_active_contact())
-    }
-
-    /// Copy Rapier pose, joints and contacts onto the kinematic `Sim` so the
-    /// dashboard draws the articulated robot.
+    /// Overlay Rapier hinge angles onto the centroidal `Sim` for drawing.
+    ///
+    /// Body pose, speed, gait-clock stance and the hop flag stay on the
+    /// centroidal plant: those are the HUD / ARS / smoke-test numbers, and a
+    /// Rapier tick is not a drop-in replacement for them. Writing the Rapier
+    /// chassis pose back into `Sim` used to rewind the integrator every
+    /// substep, so waypoints and jumps never landed.
     pub fn apply_visual(&self, sim: &mut Sim) {
-        let s = self.scale as f64;
-        let inv = 1.0 / s;
-        let ch = &self.bodies[self.chassis];
-        let t = ch.translation();
-        sim.pos = [t.x as f64 * inv, t.y as f64 * inv, t.z as f64 * inv];
-        let q = *ch.rotation();
-        let fwd = q * Vector::Z;
-        sim.yaw = (fwd.x as f64).atan2(fwd.z as f64);
-        sim.pitch = (-fwd.y as f64).asin().clamp(-1.2, 1.2);
-        let right = q * Vector::X;
-        sim.roll = (right.y as f64).asin().clamp(-1.2, 1.2);
-        let lv = ch.linvel();
-        sim.vel = [lv.x as f64 * inv, lv.z as f64 * inv];
-        sim.vy = lv.y as f64 * inv;
-        sim.yaw_rate = ch.angvel().y as f64;
-
         let mut lag2 = 0.0f64;
         let mut nq = 0.0f64;
         for i in 0..self.n {
@@ -533,27 +516,12 @@ impl ArticulatedPlant {
             sim.joints[i] = fk_world(
                 sim.frame, i, sim.q[i], sim.pos, sim.yaw, sim.pitch, sim.roll,
             );
-            let down = self.foot_down(leg.foot);
             sim.feet[i].world = sim.joints[i][3];
-            if down {
-                sim.feet[i].plant = sim.feet[i].world;
-            }
-            // Scheduled stance still comes from the gait clock; contact is the
-            // measurement the load rings should follow when they disagree.
-            if down {
-                sim.feet[i].load = sim.feet[i].load * 0.7 + 0.3;
-            } else {
-                sim.feet[i].load *= 0.7;
-            }
         }
         if nq > 0.0 {
             sim.servo_lag = (lag2 / nq).sqrt();
         }
-        sim.speed = crate::math::hypot2(sim.vel[0], sim.vel[1]);
         sim.droop = (sim.q_cmd[0][1] - sim.q[0][1]).abs() * FEMUR * 0.5;
-        if sim.pitch.abs() > 0.85 || sim.roll.abs() > 0.85 {
-            sim.fallen = true;
-        }
     }
 
     /// Chassis height in simulator units.
