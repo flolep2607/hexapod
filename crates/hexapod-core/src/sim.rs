@@ -164,8 +164,11 @@ const A_JUMP_MAX: f64 = 28.0;
 /// Ceiling on downward deceleration at landing, m/s^2. A crouch has to have
 /// time to work; a rigid landing against this cap still breaks on demand.
 const A_LAND_MAX: f64 = 25.0;
-/// Lift action above this gathers no feet — takeoff.
-const JUMP_LIFT: f64 = 0.25;
+/// Lift action above this starts a hop. High enough that ARS exploration
+/// noise on a walking course does not take off (which used to pin MIXED
+/// training at the seed), low enough that JUMP's seed — scan-trench plus
+/// a 0.90 bias — still fires.
+const JUMP_LIFT: f64 = 0.55;
 /// Depth below the support plane at which a foot is refused. Planting in a
 /// trench is how a walker ends a run; a jumper has to wait for the far side.
 const PIT_PLANT: f64 = -0.20;

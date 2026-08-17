@@ -281,6 +281,37 @@ mod tests {
     }
 
     #[test]
+    fn mixed_training_beats_the_seed_with_the_dashboard_config() {
+        // The in-page trainer uses MIXED seed 1, horizon 12, seed ^ 0xA5A5.
+        // A hop trigger that fires on ARS noise pins best_theta at the seed
+        // and the dashboard reports +0% forever.
+        let terrain = Terrain::new(Course::Mixed, 1);
+        let mut t = Trainer::new(
+            Policy::seeded(Preset::Tripod, crate::robot::Frame::default()),
+            ArsConfig {
+                horizon: 12.0,
+                ..ArsConfig::default()
+            },
+            Physics::default(),
+            1u64 ^ 0xA5A5,
+        );
+        t.record_baseline(&terrain);
+        for _ in 0..40 {
+            t.iterate(&terrain);
+        }
+        assert!(
+            t.best_reward > t.baseline_reward,
+            "dashboard-config MIXED never beat the seed: {:.2} -> {:.2}",
+            t.baseline_reward,
+            t.best_reward
+        );
+        assert!(
+            t.best_policy().feedback_norm() > 1e-6,
+            "best policy still open-loop"
+        );
+    }
+
+    #[test]
     fn best_theta_actually_reproduces_best_reward() {
         let terrain = Terrain::new(Course::Rubble, 3);
         let mut t = trainer(7);
