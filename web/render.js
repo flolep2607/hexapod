@@ -17,6 +17,18 @@ const COL = {
   blockTop: [0.95, 0.95, 0.94],
   pit: [0.62, 0.62, 0.61],
   pitFloor: [0.42, 0.42, 0.42],
+  wall: [0.78, 0.48, 0.38],
+  wallTop: [0.90, 0.64, 0.52],
+  step: [0.70, 0.74, 0.80],
+  stepTop: [0.84, 0.87, 0.91],
+  ramp: [0.62, 0.74, 0.64],
+  rampTop: [0.76, 0.86, 0.78],
+  rubble: [0.84, 0.76, 0.58],
+  rubbleTop: [0.93, 0.87, 0.70],
+  ice: [0.70, 0.84, 0.88],
+  iceTop: [0.86, 0.93, 0.95],
+  hit: [0.90, 0.22, 0.11],
+  hitTop: [0.96, 0.48, 0.34],
 };
 
 const LIGHT = norm([-0.35, -1.0, -0.28]);
@@ -55,6 +67,10 @@ class Stage {
     this.showSupport = true;
     this.showTargets = true;
     this.showRoute = true;
+    this.view = "orbit";
+    this.orbit = { az: -0.62, el: 0.38, dist: 8.0 };
+    this.onView = null;
+    this.contact = { blocked: false, chassis: false, legs: 0, obstacles: 0 };
     this._bindInput();
   }
 
@@ -76,6 +92,7 @@ class Stage {
     });
     cv.addEventListener("pointermove", (e) => {
       if (!dragging) return;
+      if (this.view !== "orbit") this.setView("orbit");
       this.az -= (e.clientX - px) * 0.008;
       this.el = Math.max(-0.15, Math.min(1.35, this.el + (e.clientY - py) * 0.006));
       px = e.clientX;
@@ -110,9 +127,38 @@ class Stage {
     this.route = route || new Float32Array(0);
   }
 
+  /** `orbit` is free; `top` and `side` lock the camera until drag or a button. */
+  setView(mode) {
+    if (mode !== "orbit" && mode !== "top" && mode !== "side") return;
+    const from = this.view;
+    if (from === "orbit" && mode !== "orbit") {
+      this.orbit = { az: this.az, el: this.el, dist: this.dist };
+    }
+    this.view = mode;
+    if (mode === "orbit") {
+      if (from !== "orbit") {
+        this.az = this.orbit.az;
+        this.el = this.orbit.el;
+        this.dist = this.orbit.dist;
+      }
+    } else if (mode === "top") {
+      this.dist = Math.max(this.dist, 16);
+    } else {
+      this.dist = Math.max(this.dist, 13);
+    }
+    if (this.onView) this.onView(mode);
+  }
+
   /* ---------------------------------------------------------- camera */
 
   _camera() {
+    if (this.view === "top") {
+      this.el = 1.52;
+      this.az = 0;
+    } else if (this.view === "side") {
+      this.el = 0.06;
+      this.az = Math.PI / 2;
+    }
     const ce = Math.cos(this.el);
     const dir = [ce * Math.sin(this.az), Math.sin(this.el), ce * Math.cos(this.az)];
     this.eye = [
@@ -193,19 +239,49 @@ class Stage {
     this._segment(p(t0), p(t1), r, color);
   }
 
-  /** Walls plus one horizontal face: the lid of a block, the floor of a pit. */
+  /** Walls plus one horizontal face: the lid of a block, the floor of a pit.
+   * Large faces are split so back-to-front sorting does not let a femur that
+   * is *in front* of the near edge of a six-metre wall paint on top of it. */
   _box(x0, x1, y0, y1, z0, z1, side, cap, pit) {
     const P = (x, y, z) => [x, y, z];
     const capY = pit ? y0 : y1;
-    this._quad(P(x0, capY, z0), P(x1, capY, z0), P(x1, capY, z1), P(x0, capY, z1), cap);
-    this._quad(P(x0, y0, z0), P(x0, y1, z0), P(x0, y1, z1), P(x0, y0, z1), side);
-    this._quad(P(x1, y0, z1), P(x1, y1, z1), P(x1, y1, z0), P(x1, y0, z0), side);
-    this._quad(P(x1, y0, z0), P(x1, y1, z0), P(x0, y1, z0), P(x0, y0, z0), side);
-    this._quad(P(x0, y0, z1), P(x0, y1, z1), P(x1, y1, z1), P(x1, y0, z1), side);
+    this._faceGrid(P(x0, capY, z0), P(x1, capY, z0), P(x1, capY, z1), P(x0, capY, z1), cap);
+    this._faceGrid(P(x0, y0, z0), P(x0, y1, z0), P(x0, y1, z1), P(x0, y0, z1), side);
+    this._faceGrid(P(x1, y0, z1), P(x1, y1, z1), P(x1, y1, z0), P(x1, y0, z0), side);
+    this._faceGrid(P(x1, y0, z0), P(x1, y1, z0), P(x0, y1, z0), P(x0, y0, z0), side);
+    this._faceGrid(P(x0, y0, z1), P(x0, y1, z1), P(x1, y1, z1), P(x1, y0, z1), side);
+  }
+
+  /** Split an axis-aligned quad into tiles so painter's algorithm can order
+   * them against nearby legs. */
+  _faceGrid(a, b, _c, d, color) {
+    const TILE = 0.7;
+    const w = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    const h = Math.hypot(d[0] - a[0], d[1] - a[1], d[2] - a[2]);
+    const nw = Math.max(1, Math.ceil(w / TILE));
+    const nh = Math.max(1, Math.ceil(h / TILE));
+    if (nw === 1 && nh === 1) {
+      this._quad(a, b, _c, d, color);
+      return;
+    }
+    const pt = (u, v) => [
+      a[0] + (b[0] - a[0]) * u + (d[0] - a[0]) * v,
+      a[1] + (b[1] - a[1]) * u + (d[1] - a[1]) * v,
+      a[2] + (b[2] - a[2]) * u + (d[2] - a[2]) * v,
+    ];
+    for (let i = 0; i < nw; i++) {
+      for (let j = 0; j < nh; j++) {
+        const u0 = i / nw;
+        const u1 = (i + 1) / nw;
+        const v0 = j / nh;
+        const v1 = (j + 1) / nh;
+        this._quad(pt(u0, v0), pt(u1, v0), pt(u1, v1), pt(u0, v1), color);
+      }
+    }
   }
 
   /** Chassis: an octagonal prism with a bevelled deck. */
-  _chassis(pos, yaw, pitch, roll, R) {
+  _chassis(pos, yaw, pitch, roll, R, hit) {
     const H = 0.30;
     const sy = Math.sin(yaw);
     const cyw = Math.cos(yaw);
@@ -231,35 +307,38 @@ class Stage {
       return out;
     };
 
+    const shell = hit ? COL.hitTop : COL.shell;
+    const dark = hit ? COL.hit : COL.shellDark;
     const bot = ring(R * 0.9, -H * 0.5);
     const mid = ring(R, H * 0.12);
     const top = ring(R * 0.78, H * 0.5);
 
     for (let i = 0; i < 8; i++) {
       const j = (i + 1) % 8;
-      this._quad(bot[i], mid[i], mid[j], bot[j], COL.shellDark);
-      this._quad(mid[i], top[i], top[j], mid[j], COL.shell);
+      this._quad(bot[i], mid[i], mid[j], bot[j], dark);
+      this._quad(mid[i], top[i], top[j], mid[j], shell);
     }
-    this.faces.push({ p: top, c: COL.shell });
-    this.faces.push({ p: bot.slice().reverse(), c: COL.shellDark });
+    this.faces.push({ p: top, c: shell });
+    this.faces.push({ p: bot.slice().reverse(), c: dark });
   }
 
-  _legs(J, stance, legs) {
+  _legs(J, stance, legs, hitLegs) {
     for (let leg = 0; leg < legs; leg++) {
       const o = leg * 12;
       const hip = [J[o], J[o + 1], J[o + 2]];
       const knee = [J[o + 3], J[o + 4], J[o + 5]];
       const ankle = [J[o + 6], J[o + 7], J[o + 8]];
       const foot = [J[o + 9], J[o + 10], J[o + 11]];
+      const shell = hitLegs && hitLegs[leg] ? COL.hit : COL.shell;
 
-      this._segment(hip, knee, 0.075, COL.shell);
+      this._segment(hip, knee, 0.075, shell);
       this._collar(hip, knee, 0.0, 0.34, 0.098, COL.accent);
 
-      this._segment(knee, ankle, 0.062, COL.shell);
+      this._segment(knee, ankle, 0.062, shell);
       this._collar(knee, ankle, 0.0, 0.17, 0.088, COL.accent);
       this._collar(knee, ankle, 0.8, 0.94, 0.072, COL.accent);
 
-      this._segment(ankle, foot, 0.046, COL.shell);
+      this._segment(ankle, foot, 0.046, shell);
       this._collar(ankle, foot, 0.0, 0.14, 0.07, COL.accent);
       this._collar(ankle, foot, 0.84, 1.0, 0.052, COL.accent);
 
@@ -269,17 +348,92 @@ class Stage {
     }
   }
 
-  _terrain(zc) {
+  _kind(x0, x1, z0, z1, top) {
+    if (top < 0) return "pit";
+    if (top <= 0.02) return "ice";
+    const spanX = x1 - x0;
+    const spanZ = z1 - z0;
+    // Ramp slabs are 30 cm deep. Classify them before the wall-height cut so a
+    // banked crown taller than a metre stays a ramp, not a slalom wall.
+    if (spanZ < 0.36 && spanX > 1.2) return "ramp";
+    if (top > 1.55) return "wall";
+    if (spanX > 8) return "step";
+    return "rubble";
+  }
+
+  _palette(kind, hit) {
+    if (hit && kind !== "pit" && kind !== "ice") return [COL.hit, COL.hitTop];
+    switch (kind) {
+      case "wall":
+        return [COL.wall, COL.wallTop];
+      case "step":
+        return [COL.step, COL.stepTop];
+      case "ramp":
+        return [COL.ramp, COL.rampTop];
+      case "rubble":
+        return [COL.rubble, COL.rubbleTop];
+      case "ice":
+        return [COL.ice, COL.iceTop];
+      default:
+        return [COL.pit, COL.pitFloor];
+    }
+  }
+
+  /** Which obstacles the chassis disc or a joint is inside. */
+  _hits(pos, bodyR, joints, legs) {
+    const ob = this.obstacles;
+    const n = Math.floor(ob.length / 5);
+    const hitOb = new Uint8Array(n);
+    const hitLegs = new Uint8Array(legs);
+    const r = bodyR || 0.95;
+    let chassis = false;
+    for (let i = 0; i < n; i++) {
+      const x0 = ob[i * 5];
+      const x1 = ob[i * 5 + 1];
+      const z0 = ob[i * 5 + 2];
+      const z1 = ob[i * 5 + 3];
+      const top = ob[i * 5 + 4];
+      if (top <= 0.02) continue;
+      const qx = Math.max(x0, Math.min(x1, pos[0]));
+      const qz = Math.max(z0, Math.min(z1, pos[2]));
+      const dx = pos[0] - qx;
+      const dz = pos[2] - qz;
+      if (dx * dx + dz * dz <= r * r && pos[1] - 0.18 < top) {
+        hitOb[i] = 1;
+        chassis = true;
+      }
+      for (let leg = 0; leg < legs; leg++) {
+        const o = leg * 12;
+        for (let k = 0; k < 4; k++) {
+          const x = joints[o + k * 3];
+          const y = joints[o + k * 3 + 1];
+          const z = joints[o + k * 3 + 2];
+          if (x >= x0 && x <= x1 && z >= z0 && z <= z1 && y > 0.02 && y < top - 0.02) {
+            hitOb[i] = 1;
+            hitLegs[leg] = 1;
+          }
+        }
+      }
+    }
+    return { hitOb, hitLegs, chassis };
+  }
+
+  _terrain(zc, hitOb) {
     const ob = this.obstacles;
     for (let i = 0; i + 4 < ob.length; i += 5) {
       const z0 = ob[i + 2];
       const z1 = ob[i + 3];
       if (z1 < zc - 14 || z0 > zc + 30) continue;
+      const x0 = ob[i];
+      const x1 = ob[i + 1];
       const top = ob[i + 4];
+      const kind = this._kind(x0, x1, z0, z1, top);
+      const hit = hitOb && hitOb[i / 5];
+      const [side, cap] = this._palette(kind, hit);
       if (top >= 0) {
-        this._box(ob[i], ob[i + 1], 0, top, z0, z1, COL.block, COL.blockTop, false);
+        this._box(x0, x1, 0, top, z0, z1, side, cap, false);
       } else {
-        this._box(ob[i], ob[i + 1], top, 0, z0, z1, COL.pit, COL.pitFloor, true);
+        this._box(x0, x1, top, 0, z0, z1, COL.pit, COL.pitFloor, true);
       }
     }
   }
@@ -510,19 +664,27 @@ class Stage {
     if (this.showRoute) this._routeMarks(pos[2], Math.round(t[L.T_WP_I]));
 
     this.faces.length = 0;
-    this._terrain(pos[2]);
-    const robotFrom = this.faces.length;
-    // Leg count and chassis size are simulator state, not constants: the
-    // frame is parametric from four legs to ten.
     const legs = Math.round(t[L.T_LEGS]) || 6;
-    this._chassis(pos, t[L.T_YAW], t[L.T_PITCH], t[L.T_ROLL], t[L.T_BODY_R] || 0.95);
-    this._legs(
-      t.subarray(L.T_JOINTS, L.T_JOINTS + legs * 12),
-      t.subarray(L.T_STANCE, L.T_STANCE + legs),
-      legs
-    );
+    const bodyR = t[L.T_BODY_R] || 0.95;
+    const joints = t.subarray(L.T_JOINTS, L.T_JOINTS + legs * 12);
+    const hits = this._hits(pos, bodyR, joints, legs);
+    const blocked = t[L.T_BLOCKED] > 0.5;
+    let nLegsHit = 0;
+    for (let i = 0; i < hits.hitLegs.length; i++) if (hits.hitLegs[i]) nLegsHit++;
+    let nOb = 0;
+    for (let i = 0; i < hits.hitOb.length; i++) if (hits.hitOb[i]) nOb++;
+    this.contact = {
+      blocked,
+      chassis: hits.chassis,
+      legs: nLegsHit,
+      obstacles: nOb,
+    };
+    this._terrain(pos[2], hits.hitOb);
+    const robotFrom = this.faces.length;
+    this._chassis(pos, t[L.T_YAW], t[L.T_PITCH], t[L.T_ROLL], bodyR, blocked || hits.chassis);
+    this._legs(joints, t.subarray(L.T_STANCE, L.T_STANCE + legs), legs, hits.hitLegs);
 
-    this._paintShadows(robotFrom);
+    if (this.view !== "top") this._paintShadows(robotFrom);
     this._paintFaces();
 
     // Support polygon and centre of mass.
@@ -567,6 +729,24 @@ class Stage {
           [2, 4]
         );
       }
+      if (hits.hitLegs[leg]) {
+        this._ringXZ(fx, fz, t[o + 1] + 0.04, 0.22, "#e5391d", 2.2);
+      }
+    }
+
+    // Ground footprint of every obstacle the chassis or a link is inside.
+    const ob = this.obstacles;
+    for (let i = 0; i < hits.hitOb.length; i++) {
+      if (!hits.hitOb[i]) continue;
+      const x0 = ob[i * 5];
+      const x1 = ob[i * 5 + 1];
+      const z0 = ob[i * 5 + 2];
+      const z1 = ob[i * 5 + 3];
+      const y = Math.max(0.04, ob[i * 5 + 4] + 0.02);
+      this._line([x0, y, z0], [x1, y, z0], "#e5391d", 2);
+      this._line([x1, y, z0], [x1, y, z1], "#e5391d", 2);
+      this._line([x1, y, z1], [x0, y, z1], "#e5391d", 2);
+      this._line([x0, y, z1], [x0, y, z0], "#e5391d", 2);
     }
   }
 }

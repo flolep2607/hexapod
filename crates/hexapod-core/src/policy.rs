@@ -9,7 +9,9 @@
 //!   [8+n ..  ]       the n_act x n_obs feedback matrix, row-major
 //! ```
 //! Starting the feedback block at zero makes the initial policy exactly the
-//! hand-tuned gait, so iteration 0 of training *is* the baseline.
+//! hand-tuned gait, so iteration 0 of training *is* the baseline. Yaw toward
+//! the next waypoint lives in the plant, not in this matrix: a zero steer row
+//! still weaves a slalom.
 //!
 //! The gait scalars are the *nominal* gait. Three of the actions — cycle time,
 //! stride and duty factor — scale them online every tick. Those three are how
@@ -599,9 +601,7 @@ mod tests {
                     GAIT_LABELS[i]
                 );
             }
-            assert!(g.offsets[..f.legs()]
-                .iter()
-                .all(|o| (0.0..1.0).contains(o)));
+            assert!(g.offsets[..f.legs()].iter().all(|o| (0.0..1.0).contains(o)));
         }
     }
 
