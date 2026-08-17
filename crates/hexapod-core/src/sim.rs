@@ -61,6 +61,13 @@ const FOOT_CLEAR: f64 = 0.03;
 const COMPLIANCE: f64 = 0.55;
 /// Peak yaw rate at full turn command, rad/s.
 pub const TURN_RATE: f64 = 1.1;
+/// Radians of bearing error that command full yaw under open-loop pursuit.
+/// Smaller is more aggressive. Negative bearing (waypoint to the right) must
+/// produce a negative steer, matching the sign the geometry actually uses.
+const PURSUIT_BEARING: f64 = 0.55;
+/// Ease off this fraction of commanded speed when the waypoint is a right
+/// angle off the nose, so a 4 m/s gait can still make a 3.5 m gate.
+const PURSUIT_BRAKE: f64 = 0.40;
 
 /// Speeds the robot can be commanded to hold, m/s. Training samples uniformly
 /// from this range, so there is no single speed to specialise on.
@@ -162,9 +169,9 @@ pub struct Cmd {
     pub turn: f64,
     /// Cruise speed at full throttle, m/s.
     pub cruise: f64,
-    /// Let the policy steer itself along the course's route. Training always
-    /// does; the dashboard hands control back the moment someone touches the
-    /// turn keys.
+    /// Follow the course's route: yaw toward the next waypoint, with the
+    /// policy's steer action as a residual. Training always does; the
+    /// dashboard hands control back the moment someone touches the turn keys.
     pub nav: bool,
 }
 
@@ -505,10 +512,14 @@ impl Sim {
         self.duty_now = duty;
         self.cmd_speed = cmd.speed();
 
-        // Who is steering. Under `nav` the policy is, which is the only way a
-        // route means anything; otherwise the turn command comes from outside.
+        // Who is steering. Under `nav` the machine yaws toward the next
+        // waypoint on its own — otherwise a zero feedback matrix walks into
+        // the first slalom wall and parks. The policy's steer action is a
+        // residual on top of that, so training can still tighten the line.
+        // The turn keys clear `nav` and take over.
         self.steer = if cmd.nav {
-            clamp(act[act_steer(self.frame)], -1.0, 1.0)
+            let pursuit = clamp(-self.bearing / PURSUIT_BEARING, -1.0, 1.0);
+            clamp(pursuit + act[act_steer(self.frame)], -1.0, 1.0)
         } else {
             cmd.turn
         };
@@ -591,7 +602,18 @@ impl Sim {
 
         // --- translation ------------------------------------------------------
         let fwd = rot_y([0.0, 0.0, 1.0], self.yaw);
-        let v_cmd = cmd.speed();
+        let mut v_cmd = cmd.speed();
+        if cmd.nav {
+            // A 4 m/s gait cannot yaw through a 3.5 m gate if it arrives
+            // square. Ease off while the waypoint is off to one side, and
+            // stop shoving into a face so the along-wall component can take
+            // over once the nose has come round.
+            let heading = (self.bearing.abs() / 0.90).min(1.0);
+            v_cmd *= 1.0 - PURSUIT_BRAKE * heading;
+            if self.blocked {
+                v_cmd *= 0.15;
+            }
+        }
         let mut a_leg = if k < 1.0 {
             // A leg at the end of its envelope is a strut: it asks for whatever
             // deceleration would stop the body this tick, and friction decides
@@ -2213,18 +2235,6 @@ mod tests {
         );
     }
 
-    /// A hand-wired steering policy: bearing to the next waypoint straight
-    /// into the steer action, with the sign the geometry actually calls for.
-    /// This is the plumbing test — that the machine *can* be steered by what it
-    /// observes. Whether the learner finds the same wiring is a separate
-    /// question, and one the trainer answers.
-    fn autopilot(gain: f64) -> Policy {
-        let f = Frame::default();
-        let mut p = baseline();
-        p.theta[n_gait(f) + act_steer(f) * n_obs(f) + obs_bearing(f)] = gain;
-        p
-    }
-
     #[test]
     fn the_corridor_is_fenced_on_both_sides() {
         // Drive hard into one wall, then the other. The machine may lean on
@@ -2310,30 +2320,64 @@ mod tests {
     #[test]
     fn steering_gets_a_machine_through_a_slalom_that_walking_straight_does_not() {
         // The point of the whole exercise: a course where the way forward is
-        // not forward. The straight walker parks against the first wall; the
-        // one that steers toward its waypoints goes round.
+        // not forward. Walking with the autopilot off parks against the first
+        // wall; following the route yaws toward each gate and goes round.
         let t = Terrain::new(Course::Slalom, 3);
         let phys = Physics::default();
-        let straight = rollout(&t, &baseline(), &phys, 22.0, Cmd::at(3.0), None);
-
-        let mut best = straight;
-        for gain in [-2.0, -3.5, -5.0] {
-            let r = rollout(&t, &autopilot(gain), &phys, 22.0, Cmd::at(3.0), None);
-            if r.reached > best.reached {
-                best = r;
-            }
-        }
+        let p = baseline();
+        let straight = rollout(
+            &t,
+            &p,
+            &phys,
+            22.0,
+            Cmd {
+                nav: false,
+                ..Cmd::at(3.0)
+            },
+            None,
+        );
+        let around = rollout(&t, &p, &phys, 22.0, Cmd::at(3.0), None);
         assert!(
-            best.reached > straight.reached,
-            "steering reached {} waypoints, straight ahead reached {}",
-            best.reached,
+            around.reached > straight.reached,
+            "route following reached {} waypoints, straight ahead reached {}",
+            around.reached,
             straight.reached
         );
         assert!(
-            best.distance > straight.distance + 3.0,
-            "steering got {:.1} m, straight ahead got {:.1} m",
-            best.distance,
+            around.distance > straight.distance + 3.0,
+            "route following got {:.1} m, straight ahead got {:.1} m",
+            around.distance,
             straight.distance
+        );
+        assert!(
+            around.reached >= 4,
+            "only reached {} waypoints on the slalom",
+            around.reached
+        );
+    }
+
+    #[test]
+    fn an_eight_legged_machine_also_weaves_the_slalom() {
+        let t = Terrain::new(Course::Slalom, 3);
+        let p = Policy::seeded(Preset::Tripod, Frame::new(8));
+        let phys = Physics::default();
+        let straight = rollout(
+            &t,
+            &p,
+            &phys,
+            22.0,
+            Cmd {
+                nav: false,
+                ..Cmd::at(3.0)
+            },
+            None,
+        );
+        let around = rollout(&t, &p, &phys, 22.0, Cmd::at(3.0), None);
+        assert!(
+            around.reached > straight.reached,
+            "octopod route following reached {} waypoints, straight ahead reached {}",
+            around.reached,
+            straight.reached
         );
     }
 
@@ -2343,7 +2387,7 @@ mod tests {
         // step is what keeps the support plane from being fitted through a
         // foot two metres in the air.
         let t = Terrain::new(Course::Slalom, 3);
-        let p = autopilot(-3.5);
+        let p = baseline();
         let g = p.gait();
         let mut s = Sim::default();
         s.reset(&t, &g, &Physics::default());
@@ -2383,8 +2427,12 @@ mod tests {
         s.reset(&t, &g, &Physics::default());
         let mut saw_wall = false;
         let r = Frame::default().body_r();
+        let drive = Cmd {
+            nav: false,
+            ..Cmd::at(3.0)
+        };
         for _ in 0..1800 {
-            s.step(&t, &p, &g, DT, Cmd::at(3.0));
+            s.step(&t, &p, &g, DT, drive);
             let floor = s.plane_y(s.pos[0], s.pos[2]);
             assert!(
                 !t.obstructed(

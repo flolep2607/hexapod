@@ -39,8 +39,8 @@ const COURSE_NOTES = {
     "Rubble, then stairs, then trenches, then rubble again. The default training course.",
   RAMPS:
     "Grades up to 1.3 m over three to six metres, and about half of them banked across the corridor. A staircase is a sequence of shocks; a ramp is a sustained tilt, and a banked one slides you sideways the whole way up.",
-  SLALOM:
-    "Walls with a 3.5 m gate in each, staggered left and right. Nothing here can be climbed — the only way past a wall is round it, which is what the route and the steering action are for.",
+    SLALOM:
+        "Walls with a 3.5 m gate in each, staggered left and right. Nothing here can be climbed or jumped — a wall is 1.8 m, as tall as a fully stretched leg, and the gait cannot take off. The only way past is round it: Follow route yaws toward each gate.",
   SLICK:
     "Sheets of ice a centimetre thick and worth about a fifth of the grip of the ground around them, with a few low humps for company. Watch the traction meter, not the terrain.",
   GAUNTLET:

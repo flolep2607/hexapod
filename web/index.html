@@ -362,8 +362,10 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             policy sees the bearing and range to the next waypoint, where it sits between the two walls, and
             a six-point forward scan of the ground one to three metres ahead — which is the only thing it
             knows about terrain it has not reached, and far enough ahead to turn on. On the open courses the
-            route runs straight down the middle and none of it matters. On the slalom it is the difference
-            between finishing and stopping at the first wall.</p>
+            route runs straight down the middle and none of it matters. On the slalom, Follow route yaws
+            toward each gate so the open-loop gait weaves instead of walking into the first wall; the
+            policy's steer action is a residual on top of that. The walls themselves cannot be stepped or
+            jumped: they are 1.8 m, as tall as a fully stretched leg.</p>
             <p class="note">Three of the actions scale cycle time, stride and duty factor online,
             every tick. That is how any legged controller changes speed, and it is where the interesting
             behaviour shows up: given a range of commands to serve, the policy learns to raise its duty
@@ -474,10 +476,10 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnCamSide">Side</button>
         </div>
         <p class="note">Every course carries a route, and the corridor is fenced by two
-        invisible walls. With the autopilot on, the policy's own steering action drives the
-        yaw and the machine works its way to each waypoint in turn — on the slalom that is the
-        only way past, because the walls are taller than a leg can reach. Touch the turn keys
-        and steering hands back to you until you let go. Orbit, Top and Side lock the camera
+        invisible walls. With the autopilot on, the machine yaws toward the next waypoint
+        and the policy's steering action is a residual on top of that — on the slalom that
+        is the only way past, because the walls are taller than a leg can reach and cannot
+        be jumped. Touch the turn keys and steering hands back to you until you let go. Orbit, Top and Side lock the camera
         (keys 1 / 2 / 3); drag the stage to take orbit back. Obstacles are coloured by kind,
         and a solid the chassis or a link is inside turns red.</p>
       </div>
