@@ -18,7 +18,10 @@ use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
 use hexapod_core::math::{squash, unsquash};
 use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
-use hexapod_core::sim::{Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN};
+use hexapod_core::sim::{
+    Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX,
+    JUMP_CRUISE_MIN,
+};
 use hexapod_core::terrain::{Course, Terrain, Z_MAX};
 use hexapod_core::{Frame, MAX_LEGS, MIN_LEGS};
 
@@ -144,6 +147,11 @@ pub extern "C" fn hx_set_course(kind: u32, seed: u32) {
     a.terrain = Terrain::new(a.course, a.course_seed);
     a.course_buf = a.terrain.export();
     a.route_buf = a.terrain.export_route();
+    a.cruise = if a.course.is_jump() {
+        JUMP_CRUISE_DEFAULT
+    } else {
+        CRUISE_DEFAULT
+    };
     a.reset_training();
     a.reset_live();
 }
@@ -358,20 +366,34 @@ pub extern "C" fn hx_set_servo(index: u32) -> u32 {
     1
 }
 
-/// Commanded cruise speed, m/s, clamped to the range training samples from.
+/// Commanded cruise speed, clamped to the range training samples from on
+/// the current course.
 #[no_mangle]
 pub extern "C" fn hx_set_cruise(v: f64) {
-    app().cruise = v.clamp(CRUISE_MIN, CRUISE_MAX);
+    let a = app();
+    a.cruise = if a.course.is_jump() {
+        v.clamp(JUMP_CRUISE_MIN, JUMP_CRUISE_MAX)
+    } else {
+        v.clamp(CRUISE_MIN, CRUISE_MAX)
+    };
 }
 
 #[no_mangle]
 pub extern "C" fn hx_cruise_lo() -> f64 {
-    CRUISE_MIN
+    if app().course.is_jump() {
+        JUMP_CRUISE_MIN
+    } else {
+        CRUISE_MIN
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn hx_cruise_hi() -> f64 {
-    CRUISE_MAX
+    if app().course.is_jump() {
+        JUMP_CRUISE_MAX
+    } else {
+        CRUISE_MAX
+    }
 }
 
 /// Measure peak joint torques over one full gait cycle of the active policy.
@@ -532,7 +554,7 @@ impl App {
 
     fn step(&mut self, dt: f64, fwd: f64, turn: f64) {
         // Auto-recover so the viewport never gets stuck on a fallen robot.
-        if self.live.fallen || self.live.pos[2] > Z_MAX - 8.0 {
+        if self.live.fallen || self.live.broken || self.live.pos[2] > Z_MAX - 8.0 {
             self.since_fall += dt;
             if self.since_fall > 1.2 {
                 self.reset_live();
@@ -695,6 +717,16 @@ impl App {
         for i in 0..hexapod_core::policy::N_SCAN {
             t[T_SCAN + i] = s.obs[scan + i] as f32;
         }
+
+        t[T_VY] = s.vy as f32;
+        t[T_AIRBORNE] = if s.airborne { 1.0 } else { 0.0 };
+        t[T_APEX] = s.apex as f32;
+        t[T_HOP_APEX] = s.hop_apex as f32;
+        t[T_BROKEN] = if s.broken { 1.0 } else { 0.0 };
+        t[T_IMPACT] = s.impact_g as f32;
+        t[T_JUMPS] = s.jumps as f32;
+        t[T_TASK] = if s.jump_clock > 0.0 { 1.0 } else { 0.0 };
+        t[T_CLEARANCE] = s.clearance as f32;
     }
 }
 

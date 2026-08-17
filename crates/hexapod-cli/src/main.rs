@@ -6,11 +6,12 @@
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
 //! hexapod speed  [--iters 200]      commanded vs achieved speed
+//! hexapod jump   [--iters 200]      parkour: distance, waypoints, jumps
 //! hexapod servo                     the same gait on every servo
 //! ```
 //!
 //! `--course` takes any of `flat steps rubble gaps mixed ramps slalom slick
-//! gauntlet`, matched case-insensitively against the names the simulator
+//! gauntlet jump`, matched case-insensitively against the names the simulator
 //! defines; `hexapod courses` prints them as JSON for the web build.
 //!
 //! `--leg-mass G` overrides the swinging mass of one leg in grams; `0` makes
@@ -32,7 +33,10 @@ use hexapod_core::hardware::{shortlist, Build, Provenance, TorqueMeter, PRICES_C
 use hexapod_core::sim::Sim;
 use hexapod_core::power::{parts_of, solve, Kind, Sizing, TorqueTrace};
 use hexapod_core::policy::Preset;
-use hexapod_core::sim::{evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT};
+use hexapod_core::sim::{
+    evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
+    JUMP_EVAL_SPEEDS,
+};
 use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
 
 fn main() {
@@ -114,6 +118,7 @@ fn main() {
         "bom" => bom(frame, course, seed, iters, cfg, phys, build),
         "sweep" => sweep(frame, iters, cfg, phys, seed),
         "speed" => speed(frame, course, seed, iters, cfg, phys),
+        "jump" => jump(frame, seed, iters, cfg, phys),
         "servo" => servo_shootout(frame, course, seed, iters, cfg, build),
         "servos" => servos_json(),
         "parts" => parts_json(),
@@ -183,10 +188,17 @@ fn train(
         phys.swing_mass(frame) * 1000.0,
         phys.swing_mass(frame) / phys.mass_kg * 100.0
     );
-    println!(
-        "commanded speeds sampled from {CRUISE_MIN:.1} to {CRUISE_MAX:.1} m/s; \
-         scored on the mean over 2.0 / 4.0 / 5.5"
-    );
+    if course.is_jump() {
+        println!(
+            "commanded speeds sampled from {JUMP_CRUISE_MIN:.1} to {JUMP_CRUISE_MAX:.1} m/s; \
+             scored on the mean over 4.0 / 5.0 / 5.5 — a running jump, not a walk"
+        );
+    } else {
+        println!(
+            "commanded speeds sampled from {CRUISE_MIN:.1} to {CRUISE_MAX:.1} m/s; \
+             scored on the mean over 2.0 / 4.0 / 5.5"
+        );
+    }
     println!(
         "course {} seed {}  |  ARS dirs={} top={} alpha={} sigma={} horizon={}s",
         course.name(),
@@ -356,8 +368,9 @@ fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
 
     let mut plan: Vec<(Course, u64)> = hexapod_core::terrain::COURSES
         .iter()
+        .copied()
         .enumerate()
-        .map(|(i, c)| (*c, seed + 100 * i as u64))
+        .map(|(i, c)| (c, seed + 100 * i as u64))
         .collect();
     // MIXED is what it trained on, so run it on the training seed as well.
     plan.insert(4, (Course::Mixed, seed));
@@ -545,6 +558,57 @@ fn speed(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, 
     println!(
         "the learned policy also modulates cycle and stride online, which is\n\
          what lets one gait cover the range instead of one speed."
+    );
+}
+
+/// Train on JUMP, then print distance, waypoints and jumps. The analogue of
+/// `hexapod speed`, for a course you cannot walk.
+fn jump(frame: Frame, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
+    let terrain = Terrain::new(Course::Jump, seed);
+    let base = Policy::seeded(Preset::default_for(frame), frame);
+    let mut t = Trainer::new(
+        Policy::seeded(Preset::default_for(frame), frame),
+        cfg,
+        phys,
+        seed ^ 0xA5A5,
+    );
+    t.record_baseline(&terrain);
+    for _ in 0..iters {
+        t.iterate(&terrain);
+    }
+    let learned = t.best_policy();
+
+    println!(
+        "JUMP seed {}, {iters} iterations, commanded speeds sampled from {JUMP_CRUISE_MIN:.1} to {JUMP_CRUISE_MAX:.1} m/s\n",
+        seed
+    );
+    println!(
+        "{:>10} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7} {:>7}",
+        "commanded", "base m", "base wp", "got m", "got wp", "jumps", "g", "broke"
+    );
+    for &v in JUMP_EVAL_SPEEDS.iter() {
+        let a = rollout(&terrain, &base, &phys, cfg.horizon, Cmd::at(v), None);
+        let b = rollout(&terrain, &learned, &phys, cfg.horizon, Cmd::at(v), None);
+        println!(
+            "{v:>9.2}  {:>9.2} {:>9} {:>9.2} {:>9} {:>7} {:>7.1} {:>7}",
+            a.distance,
+            a.reached,
+            b.distance,
+            b.reached,
+            b.jumps,
+            b.impact_g,
+            if b.broken { "BROKE" } else { "ok" }
+        );
+    }
+    println!(
+        "\nbaseline reward {:7.2}  learned {:7.2}  ({:+.0}%)",
+        t.baseline_reward,
+        t.best_reward,
+        100.0 * (t.best_reward - t.baseline_reward) / t.baseline_reward.abs().max(1e-6)
+    );
+    println!(
+        "baseline distance {:6.2} m  learned {:6.2} m",
+        t.baseline_distance, t.best_distance
     );
 }
 

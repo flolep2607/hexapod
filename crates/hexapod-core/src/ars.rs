@@ -9,7 +9,9 @@
 use crate::dynamics::Physics;
 use crate::math::Rng;
 use crate::policy::{n_theta, Normalizer, Policy};
-use crate::sim::{evaluate, rollout, Cmd, Rollout, CRUISE_MAX, CRUISE_MIN};
+use crate::sim::{
+    evaluate, rollout, Cmd, Rollout, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
+};
 use crate::terrain::Terrain;
 
 #[derive(Clone, Copy, Debug)]
@@ -118,7 +120,7 @@ impl Trainer {
         self.baseline_reward = r.reward;
         self.baseline_distance = r.distance;
         self.best_reward = r.reward;
-        self.best_distance = r.distance;
+        self.best_distance = self.baseline_distance;
         self.best_theta.copy_from_slice(&self.policy.theta);
         self.best_norm = self.policy.norm.clone();
         self.curve.push(r.reward as f32);
@@ -148,10 +150,15 @@ impl Trainer {
         for k in 0..cfg.n_dirs {
             let base = k * n;
 
-            // One commanded speed per direction, shared by both sides of the
-            // finite difference — otherwise the difference measures the speed
-            // draw rather than the perturbation.
-            let cmd = Cmd::at(CRUISE_MIN + self.rng.unit() * (CRUISE_MAX - CRUISE_MIN));
+            // One command per direction, shared by both sides of the finite
+            // difference — otherwise the difference measures the command draw
+            // rather than the perturbation. JUMP samples a faster band: the
+            // trenches are a running jump, not a walk.
+            let cmd = if terrain.course.is_jump() {
+                Cmd::at(JUMP_CRUISE_MIN + self.rng.unit() * (JUMP_CRUISE_MAX - JUMP_CRUISE_MIN))
+            } else {
+                Cmd::at(CRUISE_MIN + self.rng.unit() * (CRUISE_MAX - CRUISE_MIN))
+            };
 
             for sign in [1.0f64, -1.0f64] {
                 for j in 0..n {
@@ -274,6 +281,37 @@ mod tests {
     }
 
     #[test]
+    fn mixed_training_beats_the_seed_with_the_dashboard_config() {
+        // The in-page trainer uses MIXED seed 1, horizon 12, seed ^ 0xA5A5.
+        // A hop trigger that fires on ARS noise pins best_theta at the seed
+        // and the dashboard reports +0% forever.
+        let terrain = Terrain::new(Course::Mixed, 1);
+        let mut t = Trainer::new(
+            Policy::seeded(Preset::Tripod, crate::robot::Frame::default()),
+            ArsConfig {
+                horizon: 12.0,
+                ..ArsConfig::default()
+            },
+            Physics::default(),
+            1u64 ^ 0xA5A5,
+        );
+        t.record_baseline(&terrain);
+        for _ in 0..40 {
+            t.iterate(&terrain);
+        }
+        assert!(
+            t.best_reward > t.baseline_reward,
+            "dashboard-config MIXED never beat the seed: {:.2} -> {:.2}",
+            t.baseline_reward,
+            t.best_reward
+        );
+        assert!(
+            t.best_policy().feedback_norm() > 1e-6,
+            "best policy still open-loop"
+        );
+    }
+
+    #[test]
     fn best_theta_actually_reproduces_best_reward() {
         let terrain = Terrain::new(Course::Rubble, 3);
         let mut t = trainer(7);
@@ -337,5 +375,25 @@ mod tests {
             hi = hi.max(v);
         }
         assert!(hi - lo > (CRUISE_MAX - CRUISE_MIN) * 0.8);
+    }
+
+    #[test]
+    fn jump_training_improves_on_falling_in_the_trench() {
+        let terrain = Terrain::new(Course::Jump, 1);
+        let mut t = trainer(0xBEEF);
+        t.cfg.horizon = 6.0;
+        t.record_baseline(&terrain);
+        for _ in 0..40 {
+            t.iterate(&terrain);
+        }
+        assert!(
+            t.best_reward > t.baseline_reward
+                || t.best_distance > t.baseline_distance + 0.5,
+            "no improvement: baseline reward {:.2} dist {:.2}, best reward {:.2} dist {:.2}",
+            t.baseline_reward,
+            t.baseline_distance,
+            t.best_reward,
+            t.best_distance
+        );
     }
 }

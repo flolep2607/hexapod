@@ -17,7 +17,11 @@
 //! stride and duty factor — scale them online every tick. Those three are how
 //! any legged controller changes speed, and without them a gait has exactly
 //! one speed it walks well at, so a commanded speed is not something a policy
-//! can be asked to hold.
+//! can be asked to hold. A seventh action, jump, is a takeoff trigger: above
+//! a threshold it crouches, pushes and lifts every foot at once, which is the
+//! only way this machine leaves the ground. The walking gait never does that,
+//! because its duty factor cannot, and the seeded feedback is zero, so a
+//! walking rollout of iteration 0 is bit-identical to what it was.
 //!
 //! Every dimension here is a function of the leg count, so the vectors are
 //! sized at `MAX_*` and the live length is carried by the [`Frame`].
@@ -34,12 +38,12 @@ pub const N_FIXED_OBS: usize = 7;
 /// without it steering round an obstacle is guesswork.
 pub const N_SCAN: usize = 6;
 /// Observations that follow the per-leg block: commanded speed, bearing and
-/// range to the next waypoint, where the machine is between the two walls, and
-/// the scan.
-pub const N_TAIL_OBS: usize = 4 + N_SCAN;
+/// range to the next waypoint, where the machine is between the two walls, the
+/// scan, vertical velocity, and whether the machine is airborne.
+pub const N_TAIL_OBS: usize = 6 + N_SCAN;
 /// Actions that do not depend on leg count: body height trim, pitch trim, the
-/// three gait modulations, and steering.
-pub const N_FIXED_ACT: usize = 6;
+/// three gait modulations, jump, and steering.
+pub const N_FIXED_ACT: usize = 7;
 /// Gait entries that do not depend on leg count: six scalars and two trims.
 pub const N_FIXED_GAIT: usize = 8;
 
@@ -97,6 +101,16 @@ pub fn obs_corridor(frame: Frame) -> usize {
 pub fn obs_scan(frame: Frame) -> usize {
     N_FIXED_OBS + frame.legs() + 4
 }
+/// Vertical velocity, normalised by a few metres per second.
+#[inline]
+pub fn obs_vy(frame: Frame) -> usize {
+    obs_scan(frame) + N_SCAN
+}
+/// 1 while no foot is in contact, 0 otherwise.
+#[inline]
+pub fn obs_airborne(frame: Frame) -> usize {
+    obs_vy(frame) + 1
+}
 
 /// Indices of the fixed actions, after the two per-leg blocks.
 #[inline]
@@ -119,6 +133,14 @@ pub fn act_stride(frame: Frame) -> usize {
 pub fn act_duty(frame: Frame) -> usize {
     2 * frame.legs() + 4
 }
+/// Takeoff trigger. Above a threshold the simulator runs a hop: crouch, push,
+/// lift every foot at once, which is the only way the machine leaves the
+/// ground. The walking gait never does that, because its duty factor cannot,
+/// and the seeded weight is zero, so a walking rollout does not jump.
+#[inline]
+pub fn act_jump(frame: Frame) -> usize {
+    2 * frame.legs() + 5
+}
 /// Yaw command, in units of [`TURN_RATE`]. This is the machine steering
 /// itself; without it a waypoint is something to be told about and not
 /// something that can be reached.
@@ -126,7 +148,7 @@ pub fn act_duty(frame: Frame) -> usize {
 /// [`TURN_RATE`]: crate::sim::TURN_RATE
 #[inline]
 pub fn act_steer(frame: Frame) -> usize {
-    2 * frame.legs() + 5
+    2 * frame.legs() + 6
 }
 
 /// `(lo, hi)` for each squashed gait scalar.
@@ -550,14 +572,17 @@ mod tests {
             // The action indices must not collide with the per-leg block.
             assert_eq!(act_body_dh(f), 2 * n);
             assert_eq!(act_steer(f), n_act(f) - 1);
-            // Nor may the tail observations, and the scan must fit inside it.
+            // Nor may the tail observations, and the scan plus the jump
+            // sensors must fit inside it.
             assert_eq!(obs_cmd_speed(f), N_FIXED_OBS + n);
-            assert_eq!(obs_scan(f) + N_SCAN, n_obs(f));
+            assert_eq!(obs_airborne(f) + 1, n_obs(f));
+            assert_eq!(act_jump(f) + 1, act_steer(f));
         }
-        // The hexapod, with the navigation tail and its steering action.
-        assert_eq!(n_obs(Frame::new(6)), 23);
-        assert_eq!(n_act(Frame::new(6)), 18);
-        assert_eq!(n_theta(Frame::new(6)), 428);
+        // The hexapod, with the navigation tail, the jump sensors, and the
+        // jump action sitting in front of steering.
+        assert_eq!(n_obs(Frame::new(6)), 25);
+        assert_eq!(n_act(Frame::new(6)), 19);
+        assert_eq!(n_theta(Frame::new(6)), 489);
     }
 
     #[test]

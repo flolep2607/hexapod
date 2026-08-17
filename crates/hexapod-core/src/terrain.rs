@@ -42,10 +42,11 @@ pub enum Course {
     Slalom = 6,
     Slick = 7,
     Gauntlet = 8,
+    Jump = 9,
 }
 
 /// Every course, in the order the dashboard lists them.
-pub const COURSES: [Course; 9] = [
+pub const COURSES: [Course; 10] = [
     Course::Flat,
     Course::Steps,
     Course::Rubble,
@@ -55,6 +56,7 @@ pub const COURSES: [Course; 9] = [
     Course::Slalom,
     Course::Slick,
     Course::Gauntlet,
+    Course::Jump,
 ];
 
 impl Course {
@@ -73,7 +75,16 @@ impl Course {
             Course::Slalom => "SLALOM",
             Course::Slick => "SLICK",
             Course::Gauntlet => "GAUNTLET",
+            Course::Jump => "JUMP",
         }
+    }
+
+    /// JUMP is a parkour walking course: trenches wider than a stride, and
+    /// platforms you can only reach by jumping the gap in front of them. The
+    /// reward is still speed tracking; the jump action is how you stay on it.
+    #[inline]
+    pub fn is_jump(self) -> bool {
+        matches!(self, Course::Jump)
     }
 }
 
@@ -182,6 +193,9 @@ impl Terrain {
         t.generate();
         t.finish_route();
         t.rebuild_buckets();
+        if t.course.is_jump() {
+            t.snap_waypoints_to_ground();
+        }
         t
     }
 
@@ -497,6 +511,56 @@ impl Terrain {
                 self.gen_gaps(&mut r, 43.0, 50.0);
                 self.gen_slick(&mut r, 51.0, Z_MAX - 4.0);
             }
+            Course::Jump => self.gen_parkour(&mut r),
+        }
+    }
+
+    /// Parkour: trenches too wide to step (max stride 1.45 m) and platforms
+    /// you can only reach by jumping the gap in front of them. Adjacent
+    /// platforms of this height would be a step; the gap is what makes them
+    /// a jump.
+    fn gen_parkour(&mut self, r: &mut Rng) {
+        let mut z = 3.2 + r.range(0.0, 0.35);
+        let mut n = 0usize;
+        while z < Z_MAX - 8.0 {
+            let gap = r.range(1.55, 1.95);
+            let z1 = z + gap;
+            self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z1, -0.90, GRIP_PIT);
+            if n % 2 == 1 {
+                let h = r.range(0.16, 0.30);
+                let len = r.range(2.4, 3.8);
+                self.push(
+                    -CORRIDOR_HALF,
+                    CORRIDOR_HALF,
+                    z1,
+                    z1 + len,
+                    h,
+                    GRIP_STEP,
+                );
+                self.waypoints.push([0.0, z1 + (len * 0.45).min(1.6)]);
+                z = z1 + len + r.range(2.0, 3.2);
+            } else {
+                self.waypoints.push([0.0, z1 + 1.4]);
+                z = z1 + r.range(2.6, 4.2);
+            }
+            n += 1;
+        }
+    }
+
+    /// Centreline stations that landed in a trench are walked forward onto
+    /// solid ground. JUMP places its own landings; this is the backstop so a
+    /// finish_route station cannot ask the machine to stand in a pit.
+    fn snap_waypoints_to_ground(&mut self) {
+        let n = self.waypoints.len();
+        for i in 0..n {
+            let (x, mut z) = (self.waypoints[i][0], self.waypoints[i][1]);
+            if self.height(x, z) >= -0.12 {
+                continue;
+            }
+            while z < Z_MAX - 2.0 && self.height(x, z) < -0.12 {
+                z += 0.20;
+            }
+            self.waypoints[i][1] = z;
         }
     }
 
@@ -946,6 +1010,34 @@ mod tests {
             (t.height(-4.0, z) - t.height(4.0, z)).abs() > 0.25
         });
         assert!(banked, "no cross-slope anywhere on the ramps");
+    }
+
+    #[test]
+    fn jump_trenches_are_wider_than_a_stride() {
+        let t = Terrain::new(Course::Jump, 1);
+        let pits: Vec<_> = t.obstacles.iter().filter(|o| o.top < 0.0).collect();
+        assert!(!pits.is_empty(), "JUMP has no trenches");
+        for p in &pits {
+            let w = p.z1 - p.z0;
+            assert!(
+                w > 1.45,
+                "trench at z={:.2} is {:.2} m — still steppable",
+                p.z0,
+                w
+            );
+        }
+        assert!(
+            t.obstacles.iter().any(|o| o.top > 0.10 && o.top < 0.40),
+            "JUMP has no platforms to land on"
+        );
+        for w in &t.waypoints {
+            assert!(
+                t.height(w[0], w[1]) > -0.12,
+                "waypoint ({:.2}, {:.2}) is in a pit",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[test]

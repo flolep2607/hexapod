@@ -99,7 +99,17 @@ pub const T_NAV: usize = 369; // 1 while the policy is steering itself
 pub const T_WALL_X: usize = 370; // where the two invisible walls are
 pub const T_SCAN: usize = 371; // 6: forward terrain scan, near/far x left/mid/right
 
-pub const T_LEN: usize = 380;
+pub const T_VY: usize = 377; // vertical velocity, m/s
+pub const T_AIRBORNE: usize = 378;
+pub const T_APEX: usize = 379; // best extra clearance this episode
+pub const T_HOP_APEX: usize = 380; // current/last hop
+pub const T_BROKEN: usize = 381;
+pub const T_IMPACT: usize = 382; // peak landing demand, g
+pub const T_JUMPS: usize = 383;
+pub const T_TASK: usize = 384; // 1 while a hop is in progress
+pub const T_CLEARANCE: usize = 385;
+
+pub const T_LEN: usize = 392;
 
 // --- system-sizing result buffer, written by hx_solve_system --------------
 

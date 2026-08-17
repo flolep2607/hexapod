@@ -80,10 +80,34 @@ await page.screenshot({ path: path.join(SHOTS, "01-kinematics.png") });
 
 await page.click('[data-tab="training"]');
 await wait(200);
+check(
+  "the page is decoded as UTF-8",
+  (await page.evaluate(() => document.characterSet)) === "UTF-8",
+  await page.evaluate(() => document.characterSet)
+);
+const gaitTable = (await page.textContent("#tblGait")) || "";
+check(
+  "gait table dashes are not mojibake",
+  /—/.test(gaitTable) && /·/.test(gaitTable) && !/â€/.test(gaitTable) && !/Â·/.test(gaitTable),
+  (gaitTable.match(/Running now[^\n]*/)?.[0] || gaitTable.slice(0, 120)).trim()
+);
 await page.screenshot({ path: path.join(SHOTS, "02-training-before.png") });
 
 await page.click("#btnTrain");
-await wait(14000);
+try {
+  await page.waitForFunction(
+    () => {
+      const best = parseFloat(document.getElementById("sBest")?.textContent);
+      const base = parseFloat(document.getElementById("sBase")?.textContent);
+      const feed = parseFloat(document.getElementById("sFeed")?.textContent);
+      const iter = parseInt(document.getElementById("sIter")?.textContent, 10);
+      return iter > 10 && Number.isFinite(best) && Number.isFinite(base) && best > base && feed > 0.01;
+    },
+    { timeout: 28000 }
+  );
+} catch {
+  // fall through to the assertions, which report the actual numbers
+}
 await page.click("#btnTrain");
 await wait(400);
 
@@ -464,6 +488,74 @@ check("side camera on the slalom", (await page.textContent("#hudCam")).includes(
 await page.screenshot({ path: path.join(SHOTS, "14-slalom-side.png") });
 await page.click("#btnCamOrbit");
 await wait(300);
+
+// JUMP is parkour on the same machine: trenches wider than a stride, a
+// speed command, and the seed actually leaves the ground while running.
+const jumpIdx = courses.findIndex((c) => /jump/i.test(c));
+check("the jump course is one of them", jumpIdx >= 0, courses.join(" "));
+await page.click('[data-tab="terrain"]');
+await wait(200);
+await page.click(`[data-course="${jumpIdx}"]`);
+// The sim starts playing (`Pause` on the button). Only click if a previous
+// test left it held — otherwise we pause a running hop and wait on a frozen clock.
+const pauseLabel = await page.textContent("#btnPause");
+if (/Resume/i.test(pauseLabel || "")) await page.click("#btnPause");
+// applyCourse resets the integrator, but the HUD still shows the previous
+// course's clock until the next frame. A stale 00:02.x would look like the
+// hop had already had time to fire.
+await page.waitForFunction(
+  () => {
+    const summary = document.getElementById("tSummary")?.textContent || "";
+    const clock = document.getElementById("hClock")?.textContent || "";
+    const m = clock.match(/(\d+):(\d+(?:\.\d+)?)/);
+    const secs = m ? Number(m[1]) * 60 + Number(m[2]) : 99;
+    return /JUMP/.test(summary) && secs < 0.6;
+  },
+  { timeout: 8000 }
+);
+try {
+  await page.waitForFunction(
+    () => {
+      const state = document.getElementById("hState")?.textContent || "";
+      const meter = document.getElementById("mSpeedLabel")?.textContent || "";
+      const jumps = Number((meter.match(/(\d+)\s*jumps/i) || ["", "0"])[1]);
+      return /JUMPING/i.test(state) || jumps > 0;
+    },
+    { timeout: 25000 }
+  );
+} catch {
+  // assertions below report HUD / meter / clock
+}
+const jump = await page.evaluate(() => ({
+  summary: document.getElementById("tSummary").textContent,
+  note: document.getElementById("tNote").textContent,
+  title: document.getElementById("cruiseTitle").textContent,
+  hold: document.getElementById("vCruise").textContent,
+  meter: document.getElementById("mSpeedLabel").textContent,
+  state: document.getElementById("hState").textContent,
+  speed: document.getElementById("mSpeed").textContent,
+  clock: document.getElementById("hClock").textContent,
+}));
+check("the jump course loads", /JUMP/.test(jump.summary), jump.summary);
+check("the command dial stays a speed", /speed/i.test(jump.title), jump.title);
+check("the hold is metres per second", /m\/s/.test(jump.hold.trim()), jump.hold);
+check(
+  "the note is parkour, not a standing hop",
+  /trench|parkour|platform|stride/i.test(jump.note),
+  jump.note.slice(0, 80)
+);
+check(
+  "the live meter tracks speed and counts jumps",
+  /speed/i.test(jump.meter) && /jump/i.test(jump.meter),
+  jump.meter
+);
+const jumped = /JUMPING|AIRBORNE/i.test(jump.state) || /[1-9]\s*jumps/i.test(jump.meter);
+check(
+  "the seed takes off on the first trench",
+  jumped,
+  `${jump.state} / ${jump.meter} @ ${jump.clock}`
+);
+await page.screenshot({ path: path.join(SHOTS, "15-jump.png") });
 
 // Turning the autopilot off has to actually hand steering back.
 await page.click("#btnNav");
