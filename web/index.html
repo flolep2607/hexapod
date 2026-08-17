@@ -91,8 +91,9 @@
           <canvas id="view"></canvas>
           <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
 GAIT <b id="hudGait">TRIPOD</b> · DUTY <b id="hudDuty">0.50</b></div>
-          <div class="hud tr">CAM ORBIT · DRAG TO ROTATE
-SCROLL TO ZOOM · WASD / QE</div>
+          <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
+SCROLL TO ZOOM · WASD / QE
+<b id="hudHit"></b></div>
           <div class="hud bl">BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm</div>
           <div class="hud br2">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · ω <b id="hudW">0.00</b> rad/s
@@ -327,14 +328,16 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             knows it is a hexapod.</p>
             <p class="note">The course is <b>fenced</b> by two invisible walls at the corridor edges, and
             some of what is inside cannot be climbed — a slalom wall is nearly twice the length of a leg.
-            Both are the same obstruction test. Hitting one takes the velocity component into it and keeps
-            the component along it, so a machine that arrives square stops and one that arrives at an angle
-            slides along and gets round; a step aimed at somewhere a leg cannot reach is deflected to the
-            nearest ground that it can.</p>
+            Both are the same obstruction test, and the legs answer it too: a femur that would enter a wall
+            stops the step the same way the chassis does. Hitting one takes the velocity component into it
+            and keeps the component along it, so a machine that arrives square stops and one that arrives
+            at an angle slides along and gets round; a step aimed at somewhere a leg cannot reach is
+            deflected to the nearest ground that it can.</p>
             <p class="note">What is still kinematic, stated plainly: links are rigid, contact is resolved
             once per tick rather than by an impulse solver, and the leg-inertia terms are the diagonal ones
             — each joint sees the mass below it, without the off-diagonal coupling or the Coriolis terms of
-            a full mass matrix. It is not a general articulated multibody engine.</p>
+            a full mass matrix. It is not a general articulated multibody engine, and it is not Bevy or
+            Rapier: a step has to stay cheap enough that the learner can run in the page.</p>
           </div>
           <div class="sec">
             <div class="sec-bar"><h2>The learner</h2></div>
@@ -359,8 +362,10 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             policy sees the bearing and range to the next waypoint, where it sits between the two walls, and
             a six-point forward scan of the ground one to three metres ahead — which is the only thing it
             knows about terrain it has not reached, and far enough ahead to turn on. On the open courses the
-            route runs straight down the middle and none of it matters. On the slalom it is the difference
-            between finishing and stopping at the first wall.</p>
+            route runs straight down the middle and none of it matters. On the slalom, Follow route yaws
+            toward each gate so the open-loop gait weaves instead of walking into the first wall; the
+            policy's steer action is a residual on top of that. The walls themselves cannot be stepped or
+            jumped: they are 1.8 m, as tall as a fully stretched leg.</p>
             <p class="note">Three of the actions scale cycle time, stride and duty factor online,
             every tick. That is how any legged controller changes speed, and it is where the interesting
             behaviour shows up: given a range of commands to serve, the policy learns to raise its duty
@@ -378,9 +383,16 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
               <tr><td>Dashed grey ring</td><td>Where a swinging leg intends to touch down</td></tr>
               <tr><td>Dashed red polygon</td><td>Support polygon — the convex hull of the planted feet</td></tr>
               <tr><td>Crosshair</td><td>Centre of mass. It turns red as it approaches the polygon edge</td></tr>
+              <tr><td>Clay block</td><td>Unclimbable wall. Turns red, with a red outline, when the chassis or a link is inside it</td></tr>
+              <tr><td>Slate slab</td><td>Staircase tread</td></tr>
+              <tr><td>Sage strip</td><td>Ramp slab</td></tr>
+              <tr><td>Sand block</td><td>Rubble</td></tr>
+              <tr><td>Pale cyan sheet</td><td>Ice. Thin, and slippery</td></tr>
               <tr><td>Recessed grey box</td><td>Pit. Falling into one usually ends the run</td></tr>
+              <tr><td>Red chassis / leg</td><td>That body is currently in a wall</td></tr>
               <tr><td>Red ring with a post</td><td>The waypoint being chased right now</td></tr>
               <tr><td>Small dashed rings</td><td>The rest of the route, faded once passed</td></tr>
+              <tr><td>1 / 2 / 3</td><td>Orbit, top and side cameras. Drag on the stage to take orbit back</td></tr>
               <tr><td>Dashed red line at ±5 m</td><td>An invisible wall. Uprights appear as you close on it</td></tr>
             </tbody>
           </table>
@@ -458,11 +470,18 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnNav" data-on="true">Follow route</button>
           <button class="btn" id="btnRoute" data-on="true">Show route</button>
         </div>
+        <div class="row3" style="margin-top:8px">
+          <button class="btn" id="btnCamOrbit" data-on="true">Orbit</button>
+          <button class="btn" id="btnCamTop">Top</button>
+          <button class="btn" id="btnCamSide">Side</button>
+        </div>
         <p class="note">Every course carries a route, and the corridor is fenced by two
-        invisible walls. With the autopilot on, the policy's own steering action drives the
-        yaw and the machine works its way to each waypoint in turn — on the slalom that is the
-        only way past, because the walls are taller than a leg can reach. Touch the turn keys
-        and steering hands back to you until you let go.</p>
+        invisible walls. With the autopilot on, the machine yaws toward the next waypoint
+        and the policy's steering action is a residual on top of that — on the slalom that
+        is the only way past, because the walls are taller than a leg can reach and cannot
+        be jumped. Touch the turn keys and steering hands back to you until you let go. Orbit, Top and Side lock the camera
+        (keys 1 / 2 / 3); drag the stage to take orbit back. Obstacles are coloured by kind,
+        and a solid the chassis or a link is inside turns red.</p>
       </div>
 
       <div class="sec">

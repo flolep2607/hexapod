@@ -39,8 +39,8 @@ const COURSE_NOTES = {
     "Rubble, then stairs, then trenches, then rubble again. The default training course.",
   RAMPS:
     "Grades up to 1.3 m over three to six metres, and about half of them banked across the corridor. A staircase is a sequence of shocks; a ramp is a sustained tilt, and a banked one slides you sideways the whole way up.",
-  SLALOM:
-    "Walls with a 3.5 m gate in each, staggered left and right. Nothing here can be climbed — the only way past a wall is round it, which is what the route and the steering action are for.",
+    SLALOM:
+        "Walls with a 3.5 m gate in each, staggered left and right. Nothing here can be climbed or jumped — a wall is 1.8 m, as tall as a fully stretched leg, and the gait cannot take off. The only way past is round it: Follow route yaws toward each gate.",
   SLICK:
     "Sheets of ice a centimetre thick and worth about a fifth of the grip of the ground around them, with a few low humps for company. Watch the traction meter, not the terrain.",
   GAUNTLET:
@@ -1196,6 +1196,18 @@ function updateReadouts(t) {
   // Where it is being asked to go, and whether it is choosing that itself.
   const nav = t[L.T_NAV] > 0.5 && Math.abs(state.cmd.turn) < 0.02;
   $("hudNav").textContent = nav ? "AUTO" : "MANUAL";
+  const hit = stage.contact;
+  const colliding = hit && (hit.blocked || hit.chassis || hit.legs > 0);
+  const hudHit = $("hudHit");
+  if (colliding) {
+    const bits = [];
+    if (hit.blocked || hit.chassis) bits.push("CHASSIS");
+    if (hit.legs) bits.push(`${hit.legs} LEG${hit.legs === 1 ? "" : "S"}`);
+    hudHit.textContent = `HIT · ${bits.join(" · ")}`;
+  } else {
+    hudHit.textContent = "";
+  }
+  hudHit.classList.toggle("hot", !!colliding);
   $("hudWp").textContent = `${Math.round(t[L.T_WP_I]) + 1}/${Math.round(t[L.T_WP_N])}`;
   $("hudWpD").textContent = fmt(t[L.T_WP_DIST], 1);
   const brg = (t[L.T_BEARING] * 180) / Math.PI;
@@ -1398,6 +1410,21 @@ function wire() {
     $("btnRoute").dataset.on = String(stage.showRoute);
   });
 
+  const syncCam = (mode) => {
+    $("hudCam").textContent = mode.toUpperCase();
+    $("btnCamOrbit").dataset.on = String(mode === "orbit");
+    $("btnCamTop").dataset.on = String(mode === "top");
+    $("btnCamSide").dataset.on = String(mode === "side");
+  };
+  stage.onView = syncCam;
+  const setCam = (mode) => {
+    stage.setView(mode);
+    log(`cam.set("${mode}")`);
+  };
+  $("btnCamOrbit").addEventListener("click", () => setCam("orbit"));
+  $("btnCamTop").addEventListener("click", () => setCam("top"));
+  $("btnCamSide").addEventListener("click", () => setCam("side"));
+
   $("rSeed").addEventListener("input", () => {
     state.seed = +$("rSeed").value;
     $("vSeed").textContent = state.seed;
@@ -1481,6 +1508,14 @@ function wire() {
       $("btnPause").click();
       e.preventDefault();
     }
+    const typing =
+      e.target &&
+      (e.target.tagName === "SELECT" ||
+        (e.target.tagName === "INPUT" && e.target.type !== "range"));
+    if (!typing && (k === "1" || k === "2" || k === "3")) {
+      setCam(k === "1" ? "orbit" : k === "2" ? "top" : "side");
+      e.preventDefault();
+    }
   });
   addEventListener("keyup", (e) => state.keys.delete(e.key.toLowerCase()));
   addEventListener("resize", () => {
@@ -1552,7 +1587,7 @@ async function boot() {
   window.__ready = true;
 
   log(`boot: wasm ready, ${state.legs * 3} DOF, analytic IK`);
-  log('cmd.move("f") — WASD / QE / X / SPACE');
+  log('cmd.move("f") — WASD / QE / X / SPACE / 1–3');
   requestAnimationFrame(frame);
 }
 

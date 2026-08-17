@@ -60,10 +60,12 @@ weightless legs against 58.2 with real ones.
 **Walls.** The corridor is fenced by two invisible walls at its edges, and some
 of what is inside it cannot be climbed either — a slalom wall is nearly twice
 the length of a leg. Both answer the same obstruction test, because there is no
-reason for them to be two different things. Hitting one takes the velocity
-component into it and keeps the component along it, so a machine that arrives
-square stops dead and one that arrives at an angle slides along and gets round.
-That difference is the entire reason a steering action is worth having.
+reason for them to be two different things, and so do the legs: a femur that
+would enter a wall stops the chassis the same way the disc around the body does.
+Hitting one takes the velocity component into it and keeps the component along
+it, so a machine that arrives square stops dead and one that arrives at an angle
+slides along and gets round. That difference is the entire reason a steering
+action is worth having.
 
 Feet get the same treatment from the other end: a step aimed at ground higher
 than a leg can reach is deflected outward to the nearest foothold it can
@@ -73,7 +75,9 @@ metres in the air, half succeed, and tip the support plane over.
 
 Also modelled, as before: a foot that cannot reach its planted position brakes
 the chassis, a foot that swings too low catches on terrain, and the chassis
-collides with terrain taller than its clearance.
+collides with terrain taller than its clearance — as do the feet, which used
+to be planted inside a slalom wall because a six-point sample of the chassis
+disc missed it and the foothold fallback left them there.
 
 What is still kinematic, stated plainly: links are rigid, contact is resolved
 once per tick rather than by an impulse solver, and the leg-inertia terms are
@@ -219,15 +223,20 @@ meter was built for. `SLALOM` is the one that needs the route.
 | `SLALOM` | −32.1 (falls at the first wall) | **74.9** | 7.3 m → **18.3 m** |
 | `GAUNTLET` | 21.3 (falls) | **120.9** | 23.3 m → **26.9 m** |
 
-The hand-tuned gait on `SLALOM` walks 7.3 m, meets a wall, and goes over. It has
-no steering action, so there is nothing it could have done. Several hundred
-per cent is not a gait improvement — it is the difference between a controller
-that can express *go round that* and one that cannot.
+The open-loop gait on `SLALOM` now yaws toward each gate — Follow route is a
+pursuit controller, and the policy's steer action is a residual on top of it —
+so it weaves instead of walking into the first wall. The walls cannot be
+stepped or jumped: they are 1.8 m, as tall as a fully stretched leg. Training
+can still tighten the line; it no longer has to discover *go round that* from
+a controller that only walks forward.
+
+The table below is from before that pursuit lived in the plant, when the
+hand-tuned gait really did faceplant at 7.3 m. It is still the right picture
+of what the learner does with a steer action: several hundred per cent is not
+a gait improvement.
 
 It works in the browser too, which is where anybody will actually try it: two
-and a half minutes of in-page training on `SLALOM` is about 1300 iterations,
-and takes the machine from −32 to +54 and from stuck at the first wall to four
-waypoints down the course.
+and a half minutes of in-page training on `SLALOM` is about 1300 iterations.
 
 And it transfers. Trained on `MIXED` seed 1 for 300 iterations, then scored on
 all nine courses (`hexapod sweep`):
@@ -248,12 +257,13 @@ all nine courses (`hexapod sweep`):
 \* = a course seed the policy never trained on.
 
 The row worth staring at is `SLALOM`. The policy never trained on it and never
-saw a wall — and it still goes from zero waypoints and a faceplant at 7.3 m to
-nine waypoints and 14.8 m. There is nothing on `MIXED` to steer *around*, but
-there is plenty to be pushed off line by, so bearing error is never zero for
-long and the steering row of the feedback matrix gets a gradient anyway. What
-generalises is "reduce the bearing to where you are going", which is exactly
-the right thing to have learned.
+saw a wall — and it still went from zero waypoints and a faceplant at 7.3 m to
+nine waypoints and 14.8 m, which is how we knew the steer action was doing
+real work before pursuit was in the plant. There is nothing on `MIXED` to steer
+*around*, but there is plenty to be pushed off line by, so bearing error is
+never zero for long and the steering row of the feedback matrix gets a gradient
+anyway. What generalises is "reduce the bearing to where you are going", which
+is exactly the right thing to have learned.
 
 That result is also a correction. Measured at the old ten-direction population,
 this same sweep left `SLALOM` flat at −34, and the tidy conclusion on offer was
@@ -499,7 +509,7 @@ continuous torque is far lower, which is what the safety factor is for.
 ## Layout
 
 ```
-crates/hexapod-core    simulator, dynamics, ARS trainer, hardware. 108 tests.
+crates/hexapod-core    simulator, dynamics, ARS trainer, hardware. 113 tests.
 crates/hexapod-cli     train, bench, sweep, speed, servo, bom, system, courses
 crates/hexapod-wasm    C-ABI bridge; no wasm-bindgen, ~158 kB of wasm
 web/                   dashboard: renderer, panels, styling
@@ -515,17 +525,25 @@ test/smoke.mjs         Playwright end-to-end check of the built page
 | Dashed grey ring | Where a swinging leg intends to touch down |
 | Dashed red polygon | Support polygon — convex hull of the planted feet |
 | Crosshair | Centre of mass; turns red near the polygon edge |
+| Clay block | Unclimbable wall. Turns red, with a red outline, when the chassis or a link is inside it |
+| Slate slab | Staircase tread |
+| Sage strip | Ramp slab |
+| Sand block | Rubble |
+| Pale cyan sheet | Ice. Thin, and slippery |
 | Recessed grey box | Pit. Falling in usually ends the run |
+| Red chassis / leg | That body is currently in a wall |
 | Red ring with a post | The waypoint being chased right now |
 | Small dashed rings | The rest of the route, faded once passed |
+| `1` / `2` / `3` | Orbit, top and side cameras. Drag the stage to take orbit back |
 | Dashed red line at ±5 m | An invisible wall. Uprights fade in as you close on it |
 
 Drag to orbit, scroll to zoom, `WASD`/`QE` to drive, `X` to stop, `space` to
-pause. The **Frame** slider sets the leg count, the **Commanded speed** dial is
+pause, `1`/`2`/`3` for orbit / top / side. The **Frame** slider sets the leg count, the **Commanded speed** dial is
 the number the reward tracks, and the **Machine** selector picks the servo the
 joints are driven with. Changing any of them is a different robot, so anything
-learned for the old one is discarded. **Follow route** hands steering to the
-policy; the turn keys take it back for as long as you hold them.
+learned for the old one is discarded. **Follow route** yaws toward the next
+waypoint; the policy's steer action is a residual on top of that, and the turn
+keys take it back for as long as you hold them.
 
 ### The gait pattern panel is a measurement
 
@@ -550,7 +568,7 @@ before anybody looked for it.
 
 ## Tests
 
-`cargo test` — 108 tests.
+`cargo test` — 113 tests.
 
 Geometry, on every frame from four legs to ten: IK round-trips against forward
 kinematics, hips that never collide however many legs there are, mirrored pairs
@@ -583,10 +601,12 @@ Terrain and navigation: every course generates something and carries a route
 that runs its whole length in order and never passes through a wall, a ramp is
 a sustained grade with a banked section somewhere on it, ice is slippery
 without being an obstacle, the corridor walls obstruct from both sides and so
-does a slalom wall, bearing is zero exactly when the waypoint is dead ahead,
-waypoints are reached one at a time and the route never runs out, the forward
-scan sees a wall three metres before the feet do and sees the invisible fence
-too, no foot is ever planted on top of a wall, and — the one that matters — a
+does a slalom wall, a disc that only just overlaps a wall is still obstructed,
+bearing is zero exactly when the waypoint is dead ahead, waypoints are reached
+one at a time and the route never runs out, the forward scan sees a wall three
+metres before the feet do and sees the invisible fence too, no foot is ever
+planted on top of a wall or inside one, a machine walking into a slalom wall
+keeps its feet and chassis out of the block, and — the one that matters — a
 machine steering toward its waypoints gets through a slalom that the same
 machine walking straight ahead does not.
 

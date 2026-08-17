@@ -13,12 +13,12 @@ pub mod layout;
 use core::ptr::addr_of_mut;
 
 use hexapod_core::ars::{ArsConfig, Trainer};
-use hexapod_core::hardware::{Build, TorqueMeter};
-use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
-use hexapod_core::math::{squash, unsquash};
-use hexapod_core::sim::{Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN};
 use hexapod_core::dynamics::Physics;
+use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
+use hexapod_core::math::{squash, unsquash};
+use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
+use hexapod_core::sim::{Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN};
 use hexapod_core::terrain::{Course, Terrain, Z_MAX};
 use hexapod_core::{Frame, MAX_LEGS, MIN_LEGS};
 
@@ -54,7 +54,8 @@ struct App {
     phys: Physics,
     /// Commanded cruise speed, m/s.
     cruise: f64,
-    /// Let the policy steer itself along the course's route.
+    /// Follow the course's route. The plant yaws toward the next waypoint;
+    /// the policy's steer action is a residual on top of that.
     nav: bool,
     meter: TorqueMeter,
     sizing: Sizing,
@@ -326,8 +327,8 @@ pub extern "C" fn hx_iterations() -> u32 {
 #[no_mangle]
 pub extern "C" fn hx_set_build(scale: f64, mass_kg: f64, safety: f64) {
     let a = app();
-    let changed = (a.build.scale - scale).abs() > 1e-12
-        || (a.build.mass_kg - mass_kg).abs() > 1e-12;
+    let changed =
+        (a.build.scale - scale).abs() > 1e-12 || (a.build.mass_kg - mass_kg).abs() > 1e-12;
     a.build.scale = scale.clamp(0.02, 1.0);
     a.build.mass_kg = mass_kg.clamp(0.05, 200.0);
     a.build.safety = safety.clamp(1.0, 4.0);
@@ -395,7 +396,13 @@ pub extern "C" fn hx_measure_torque() -> *const f32 {
     let mut m = TorqueMeter::default();
     let steps = (8.0 / hexapod_core::DT) as usize;
     for _ in 0..steps {
-        s.step(&a.terrain, policy, &gait, hexapod_core::DT, Cmd::at(a.cruise));
+        s.step(
+            &a.terrain,
+            policy,
+            &gait,
+            hexapod_core::DT,
+            Cmd::at(a.cruise),
+        );
         m.observe(&s, &a.build);
         if s.fallen {
             break;
@@ -551,7 +558,8 @@ impl App {
         let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 6);
         let h = dt / n as f64;
         for _ in 0..n {
-            self.live.step(&self.terrain, policy, &self.live_gait, h, cmd);
+            self.live
+                .step(&self.terrain, policy, &self.live_gait, h, cmd);
         }
     }
 
@@ -665,8 +673,7 @@ impl App {
         t[T_DUTY_NOW] = s.duty_now as f32;
         t[T_MU] = self.phys.mu as f32;
         t[T_STALL] = (self.phys.actuator.stall_nm * NM_TO_KGCM) as f32;
-        t[T_NOLOAD_RPM] =
-            (self.phys.actuator.omega_max * 60.0 / core::f64::consts::TAU) as f32;
+        t[T_NOLOAD_RPM] = (self.phys.actuator.omega_max * 60.0 / core::f64::consts::TAU) as f32;
         t[T_LEG_TORQUE] = s.leg_torque as f32;
         for c in 0..3 {
             t[T_LEG_REACT + c] = s.leg_react[c] as f32;

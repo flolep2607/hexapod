@@ -63,6 +63,17 @@ check("3-D stage renders content", canvasPainted > 6, `${canvasPainted} distinct
 const speed = await page.textContent("#hudV");
 check("robot is moving", parseFloat(speed) > 0.5, `${speed} m/s`);
 
+await page.click("#btnCamTop");
+await wait(250);
+check("top camera toggle", (await page.textContent("#hudCam")).includes("TOP"));
+check("top camera button latches", (await page.getAttribute("#btnCamTop", "data-on")) === "true");
+await page.keyboard.press("3");
+await wait(200);
+check("side camera key", (await page.textContent("#hudCam")).includes("SIDE"));
+await page.click("#btnCamOrbit");
+await wait(200);
+check("orbit camera restore", (await page.textContent("#hudCam")).includes("ORBIT"));
+
 await page.screenshot({ path: path.join(SHOTS, "01-kinematics.png") });
 
 /* --------------------------------------------------------- training */
@@ -379,7 +390,7 @@ check("footfalls are recorded, not assumed", gait && gait.n > 60, `${gait && gai
 check(
   "the pattern is classified from the footfalls, not the label",
   gait && gait.kind === "TRIPOD",
-  `${gait && gait.kind}, offsets ${gait && gait.offsets.map((o) => o.toFixed(2)).join(" ")}`
+  `${gait && gait.kind}, offsets ${gait && gait.offsets && gait.offsets.map((o) => o.toFixed(2)).join(" ")}`
 );
 check(
   "measured cycle matches the one the clock was set to",
@@ -441,6 +452,19 @@ check(
 );
 await page.screenshot({ path: path.join(SHOTS, "12-slalom.png") });
 
+await page.click('[data-tab="kinematics"]');
+await wait(400);
+await page.click("#btnCamTop");
+await wait(500);
+check("top camera on the slalom", (await page.textContent("#hudCam")).includes("TOP"));
+await page.screenshot({ path: path.join(SHOTS, "13-slalom-top.png") });
+await page.click("#btnCamSide");
+await wait(500);
+check("side camera on the slalom", (await page.textContent("#hudCam")).includes("SIDE"));
+await page.screenshot({ path: path.join(SHOTS, "14-slalom-side.png") });
+await page.click("#btnCamOrbit");
+await wait(300);
+
 // Turning the autopilot off has to actually hand steering back.
 await page.click("#btnNav");
 await wait(900);
@@ -449,6 +473,8 @@ check("the autopilot can be switched off", manual === "MANUAL", manual);
 await page.click("#btnNav");
 await wait(400);
 
+await page.click('[data-tab="terrain"]');
+await wait(200);
 await page.click('[data-course="4"]');
 await wait(1200);
 await page.click('[data-tab="kinematics"]');

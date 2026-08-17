@@ -31,7 +31,11 @@
 //!
 //! What is still modelled kinematically: links are rigid, contact is resolved
 //! once per tick rather than by an impulse solver, and the leg-inertia terms
-//! are diagonal — no off-diagonal mass coupling, no Coriolis.
+//! are diagonal — no off-diagonal mass coupling, no Coriolis. It is not a
+//! general articulated multibody engine, and swapping one in (Rapier, Bevy's
+//! physics, and so on) would throw away the thing this simulator is for:
+//! a step that costs about seven microseconds, so the learner can run in the
+//! page.
 
 use crate::dynamics::{
     collapse_direction, joint_torques, leg_com, leg_torques, LegState, Physics, G,
@@ -39,12 +43,11 @@ use crate::dynamics::{
 use crate::math::{ang_diff, clamp, frac, hypot2, polygon_margin, rot_y, V3};
 use crate::policy::{
     act_body_dh, act_cycle, act_duty, act_pitch, act_steer, act_stride, n_obs, obs_bearing,
-    obs_cmd_speed, obs_corridor, obs_range, obs_scan, Gait, Policy, MAX_ACT, MAX_OBS,
-    N_FIXED_OBS, N_SCAN,
+    obs_cmd_speed, obs_corridor, obs_range, obs_scan, Gait, Policy, MAX_ACT, MAX_OBS, N_FIXED_OBS,
+    N_SCAN,
 };
 use crate::robot::{
-    clamp_joints, fk_body, fk_world, solve_ik, to_body, Frame, BODY_H, FEMUR, MAX_LEGS,
-    TIBIA,
+    clamp_joints, fk_body, fk_world, solve_ik, to_body, Frame, BODY_H, FEMUR, MAX_LEGS, TIBIA,
 };
 use crate::terrain::{Terrain, WAYPOINT_R};
 
@@ -58,6 +61,13 @@ const FOOT_CLEAR: f64 = 0.03;
 const COMPLIANCE: f64 = 0.55;
 /// Peak yaw rate at full turn command, rad/s.
 pub const TURN_RATE: f64 = 1.1;
+/// Radians of bearing error that command full yaw under open-loop pursuit.
+/// Smaller is more aggressive. Negative bearing (waypoint to the right) must
+/// produce a negative steer, matching the sign the geometry actually uses.
+const PURSUIT_BEARING: f64 = 0.55;
+/// Ease off this fraction of commanded speed when the waypoint is a right
+/// angle off the nose, so a 4 m/s gait can still make a 3.5 m gate.
+const PURSUIT_BRAKE: f64 = 0.40;
 
 /// Speeds the robot can be commanded to hold, m/s. Training samples uniformly
 /// from this range, so there is no single speed to specialise on.
@@ -159,9 +169,9 @@ pub struct Cmd {
     pub turn: f64,
     /// Cruise speed at full throttle, m/s.
     pub cruise: f64,
-    /// Let the policy steer itself along the course's route. Training always
-    /// does; the dashboard hands control back the moment someone touches the
-    /// turn keys.
+    /// Follow the course's route: yaw toward the next waypoint, with the
+    /// policy's steer action as a residual. Training always does; the
+    /// dashboard hands control back the moment someone touches the turn keys.
     pub nav: bool,
 }
 
@@ -439,10 +449,18 @@ impl Sim {
         // finite differences stay unprimed for one tick so the first step is
         // not billed for an acceleration out of nowhere.
         for i in 0..n {
-            let tb = to_body(self.feet[i].world, self.pos, self.yaw, self.pitch, self.roll);
+            let tb = to_body(
+                self.feet[i].world,
+                self.pos,
+                self.yaw,
+                self.pitch,
+                self.roll,
+            );
             self.q[i] = solve_ik(self.frame, i, tb).q;
             self.q_cmd[i] = self.q[i];
-            self.joints[i] = fk_world(self.frame, i, self.q[i], self.pos, self.yaw, self.pitch, self.roll);
+            self.joints[i] = fk_world(
+                self.frame, i, self.q[i], self.pos, self.yaw, self.pitch, self.roll,
+            );
         }
         self.update_support();
         self.update_route(terrain);
@@ -494,10 +512,14 @@ impl Sim {
         self.duty_now = duty;
         self.cmd_speed = cmd.speed();
 
-        // Who is steering. Under `nav` the policy is, which is the only way a
-        // route means anything; otherwise the turn command comes from outside.
+        // Who is steering. Under `nav` the machine yaws toward the next
+        // waypoint on its own — otherwise a zero feedback matrix walks into
+        // the first slalom wall and parks. The policy's steer action is a
+        // residual on top of that, so training can still tighten the line.
+        // The turn keys clear `nav` and take over.
         self.steer = if cmd.nav {
-            clamp(act[act_steer(self.frame)], -1.0, 1.0)
+            let pursuit = clamp(-self.bearing / PURSUIT_BEARING, -1.0, 1.0);
+            clamp(pursuit + act[act_steer(self.frame)], -1.0, 1.0)
         } else {
             cmd.turn
         };
@@ -580,7 +602,18 @@ impl Sim {
 
         // --- translation ------------------------------------------------------
         let fwd = rot_y([0.0, 0.0, 1.0], self.yaw);
-        let v_cmd = cmd.speed();
+        let mut v_cmd = cmd.speed();
+        if cmd.nav {
+            // A 4 m/s gait cannot yaw through a 3.5 m gate if it arrives
+            // square. Ease off while the waypoint is off to one side, and
+            // stop shoving into a face so the along-wall component can take
+            // over once the nose has come round.
+            let heading = (self.bearing.abs() / 0.90).min(1.0);
+            v_cmd *= 1.0 - PURSUIT_BRAKE * heading;
+            if self.blocked {
+                v_cmd *= 0.15;
+            }
+        }
         let mut a_leg = if k < 1.0 {
             // A leg at the end of its envelope is a strut: it asks for whatever
             // deceleration would stop the body this tick, and friction decides
@@ -622,6 +655,12 @@ impl Sim {
                 if f.stance {
                     f.plant[0] -= dir[0] * skid;
                     f.plant[2] -= dir[1] * skid;
+                    let floor =
+                        self.plane[0] * f.plant[0] + self.plane[1] * f.plant[2] + self.plane[2];
+                    let (x, z) = terrain.push_xz(f.plant[0], f.plant[2], floor, MAX_FOOTHOLD);
+                    f.plant[0] = x;
+                    f.plant[2] = z;
+                    f.plant[1] = terrain.height(x, z);
                 }
             }
         }
@@ -642,7 +681,13 @@ impl Sim {
         // it: a machine that arrives at a wall square stops, and one that
         // arrives at an angle slides along and gets round. That difference is
         // the whole reason for having a steering action.
-        let r_body = self.frame.body_r() * 0.9;
+        //
+        // The radius is the chassis itself, not a shrunken copy: the visual
+        // mid-ring is `body_r`, and cutting it to 0.9 let the shell sit inside
+        // a wall while the obstruction test still said clear. Legs are the
+        // same test from the other end — a femur that would enter a wall
+        // stops the step the same way the disc does.
+        let r_body = self.frame.body_r();
         let clear = gait.body_h + body_dh - BODY_H * 0.5;
         let (px, pz) = (self.pos[0], self.pos[2]);
         let (dx, dz) = (self.vel[0] * dt, self.vel[1] * dt);
@@ -680,13 +725,12 @@ impl Sim {
         // so the servo sag measured last tick comes off the target. Push it in
         // as a position correction instead and the spring simply undoes it,
         // and an undersized servo shows no sag at all.
-        let support_y =
-            self.plane_y(self.pos[0], self.pos[2]) + gait.body_h + body_dh - self.droop;
+        let support_y = self.plane_y(self.pos[0], self.pos[2]) + gait.body_h + body_dh - self.droop;
         // Ride over what is underneath — but only as high as the legs reach.
         // Without the cap, a chassis that gets a wall under its footprint is
         // lifted onto it, the feet leave the ground, and the whole machine
         // falls off the other side.
-        let clear_y = (terrain.height_disc(self.pos[0], self.pos[2], self.frame.body_r() * 0.9)
+        let clear_y = (terrain.height_disc(self.pos[0], self.pos[2], self.frame.body_r())
             + BODY_H * 0.6)
             .min(support_y + MAX_FOOTHOLD);
         let y_target = support_y.max(clear_y);
@@ -728,29 +772,47 @@ impl Sim {
 
             let u = clamp((lp - duty) / (1.0 - duty), 0.0, 1.0);
             let t_remain = (1.0 - u) * t_swing;
-            let td =
-                self.predict_td(terrain, gait, i, t_remain, stride, cycle, duty, long_off);
+            let td = self.predict_td(terrain, gait, i, t_remain, stride, cycle, duty, long_off);
             self.feet[i].td = td;
 
             let from = self.feet[i].lift_from;
-            let x = from[0] + (td[0] - from[0]) * u;
-            let z = from[2] + (td[2] - from[2]) * u;
-            let arc =
-                from[1] + (td[1] - from[1]) * u + sh * (core::f64::consts::PI * u).sin();
+            let mut x = from[0] + (td[0] - from[0]) * u;
+            let mut z = from[2] + (td[2] - from[2]) * u;
+            let (px, pz) = terrain.push_xz(x, z, self.plane_y(x, z), MAX_FOOTHOLD);
+            let pushed = hypot2(px - x, pz - z);
+            x = px;
+            z = pz;
+            let arc = from[1] + (td[1] - from[1]) * u + sh * (core::f64::consts::PI * u).sin();
 
             // A swinging foot rides over what it passes — but only as far as
             // the leg reaches. Past that it is not clearing an obstacle, it is
             // jammed against a wall, and the step is charged for it.
-            let ground = (terrain.height(x, z) + FOOT_CLEAR)
-                .min(self.plane_y(x, z) + MAX_FOOTHOLD);
-            let (y, stub) = if arc < ground {
+            let ground = (terrain.height(x, z) + FOOT_CLEAR).min(self.plane_y(x, z) + MAX_FOOTHOLD);
+            let (y, mut stub) = if arc < ground {
                 (ground, ground - arc)
             } else {
                 (arc, 0.0)
             };
+            stub += pushed;
             self.feet[i].stub = stub;
             step_stub += stub;
             want[i] = [x, y, z];
+        }
+
+        // A foot outside a wall is not enough: the femur and tibia can still
+        // chord through the block. Pull the target toward the hip until the
+        // kinematic pose is clear, so the servos are not asked to thread a
+        // wall in the first place.
+        for i in 0..n {
+            let cleared = self.clear_foot(terrain, i, want[i]);
+            let d = hypot2(cleared[0] - want[i][0], cleared[2] - want[i][2]);
+            if d > 1e-4 {
+                step_stub += d;
+                if self.feet[i].stance {
+                    self.feet[i].plant = cleared;
+                }
+            }
+            want[i] = cleared;
         }
 
         // --- the servos ----------------------------------------------------------
@@ -866,7 +928,9 @@ impl Sim {
         self.power += (work_step / dt - self.power) * 0.05;
 
         for i in 0..n {
-            self.joints[i] = fk_world(self.frame, i, self.q[i], self.pos, self.yaw, self.pitch, self.roll);
+            self.joints[i] = fk_world(
+                self.frame, i, self.q[i], self.pos, self.yaw, self.pitch, self.roll,
+            );
         }
 
         // --- the chassis rides on whatever the legs actually managed -------------
@@ -933,27 +997,38 @@ impl Sim {
 
         // Ground contact is a hard constraint: a foot the servos put below the
         // terrain is stopped by the terrain, and the joints take the difference.
+        // Unclimbable columns are the same constraint in XZ — without it a
+        // servo that is still catching up walks the tibia through a wall.
         for i in 0..n {
             let foot = self.joints[i][3];
-            let floor = (terrain.height(foot[0], foot[2])
-                + if self.feet[i].stance { 0.0 } else { FOOT_CLEAR })
-                .min(self.plane_y(foot[0], foot[2]) + MAX_FOOTHOLD);
-            if foot[1] < floor - 1e-9 {
-                let pen = floor - foot[1];
+            let (x, z) = terrain.push_xz(
+                foot[0],
+                foot[2],
+                self.plane_y(foot[0], foot[2]),
+                MAX_FOOTHOLD,
+            );
+            let floor = (terrain.height(x, z) + if self.feet[i].stance { 0.0 } else { FOOT_CLEAR })
+                .min(self.plane_y(x, z) + MAX_FOOTHOLD);
+            let y = if foot[1] < floor - 1e-9 {
+                floor
+            } else {
+                foot[1]
+            };
+            let shifted = (x - foot[0]).abs() > 1e-9 || (z - foot[2]).abs() > 1e-9;
+            if y > foot[1] + 1e-9 || shifted {
+                let pen = hypot2(x - foot[0], z - foot[2]) + (y - foot[1]).max(0.0);
                 if !self.feet[i].stance {
                     self.feet[i].stub += pen;
                     step_stub += pen;
                 }
-                let tb = to_body(
-                    [foot[0], floor, foot[2]],
-                    self.pos,
-                    self.yaw,
-                    self.pitch,
-                    self.roll,
-                );
+                if self.feet[i].stance && shifted {
+                    self.feet[i].plant = [x, terrain.height(x, z), z];
+                }
+                let tb = to_body([x, y, z], self.pos, self.yaw, self.pitch, self.roll);
                 self.q[i] = solve_ik(self.frame, i, tb).q;
-                self.joints[i] =
-                    fk_world(self.frame, i, self.q[i], self.pos, self.yaw, self.pitch, self.roll);
+                self.joints[i] = fk_world(
+                    self.frame, i, self.q[i], self.pos, self.yaw, self.pitch, self.roll,
+                );
             }
             self.feet[i].world = self.joints[i][3];
         }
@@ -1016,7 +1091,8 @@ impl Sim {
         let track = (-err_v * err_v).exp();
 
         let mut r = dt
-            * (W_TRACK * track - W_LAT * lateral.abs()
+            * (W_TRACK * track
+                - W_LAT * lateral.abs()
                 - W_YAW * (self.yaw_rate - w_cmd).abs()
                 - W_HEADING * self.bearing.abs()
                 + W_MARGIN * clamp(self.margin, 0.0, 0.25)
@@ -1097,9 +1173,9 @@ impl Sim {
     /// tall to stand on — a slalom wall is nearly twice the length of a leg —
     /// the step is deflected to the nearest reachable ground, which is what
     /// stops the kinematics from being asked to plant a foot two metres up and
-    /// then tipping the whole support plane over when it half succeeds. When
-    /// there is nowhere within reach the step lands short and the leg pays the
-    /// usual price for stubbing.
+    /// then tipping the whole support polygon over when it half succeeds. When
+    /// there is nowhere within reach the step is pushed out of the wall onto
+    /// the nearest face, rather than left floating inside the block.
     fn foothold(&self, terrain: &Terrain, x: f64, z: f64) -> V3 {
         let y = terrain.height(x, z);
         if y - self.plane_y(x, z) <= MAX_FOOTHOLD {
@@ -1121,7 +1197,9 @@ impl Sim {
                 }
             }
         }
-        [x, self.plane_y(x, z) + MAX_FOOTHOLD, z]
+        let floor = self.plane_y(x, z);
+        let (sx, sz) = terrain.push_xz(x, z, floor, MAX_FOOTHOLD);
+        [sx, terrain.height(sx, sz), sz]
     }
 
     /// Worst leg-envelope violation if the chassis advanced by `k * delta`.
@@ -1173,11 +1251,7 @@ impl Sim {
 
         // Normal equations with a small ridge term for collinear supports.
         let r = 1e-6;
-        let m = [
-            [sxx + r, sxz, sx],
-            [sxz, szz + r, sz],
-            [sx, sz, n + r],
-        ];
+        let m = [[sxx + r, sxz, sx], [sxz, szz + r, sz], [sx, sz, n + r]];
         let b = [sxy, szy, sy];
 
         let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
@@ -1206,10 +1280,72 @@ impl Sim {
     }
 
     /// Is there room for the chassis here? `clear` is the underside's height
-    /// above the support plane.
-    #[inline]
+    /// above the support plane. Legs are part of the same question: a pose
+    /// that puts a femur inside a wall is not a pose the machine can be in,
+    /// even if the disc around the chassis is still clear.
+    ///
+    /// A link that is *already* inside is ignored, so a penetration inherited
+    /// from last tick can still back out instead of freezing the chassis.
     fn chassis_fits(&self, terrain: &Terrain, x: f64, z: f64, r: f64, clear: f64) -> bool {
-        !terrain.obstructed(x, z, r, self.plane_y(x, z) + clear)
+        if terrain.obstructed(x, z, r, self.plane_y(x, z) + clear) {
+            return false;
+        }
+        let dx = x - self.pos[0];
+        let dz = z - self.pos[2];
+        if dx.abs() < 1e-15 && dz.abs() < 1e-15 {
+            return true;
+        }
+        let floor = self.plane_y(x, z);
+        let now_floor = self.plane_y(self.pos[0], self.pos[2]);
+        let n = self.frame.legs();
+        for i in 0..n {
+            let j = self.joints[i];
+            for k in 0..3 {
+                let a = j[k];
+                let b = j[k + 1];
+                if terrain.segment_hits_wall(a, b, now_floor, MAX_FOOTHOLD) {
+                    continue;
+                }
+                let a2 = [a[0] + dx, a[1], a[2] + dz];
+                let b2 = [b[0] + dx, b[1], b[2] + dz];
+                if terrain.segment_hits_wall(a2, b2, floor, MAX_FOOTHOLD) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn links_hit_wall(&self, terrain: &Terrain, joints: &[V3; 4], floor: f64) -> bool {
+        (0..3).any(|k| terrain.segment_hits_wall(joints[k], joints[k + 1], floor, MAX_FOOTHOLD))
+    }
+
+    /// Pull a foot toward its hip until the kinematic pose no longer threads
+    /// an unclimbable solid. Eight steps of 22 % is enough to collapse a
+    /// fully extended tibia back onto the chassis side of a 0.7 m wall.
+    fn clear_foot(&self, terrain: &Terrain, leg: usize, mut p: V3) -> V3 {
+        let floor = self.plane_y(self.pos[0], self.pos[2]);
+        let hip = self.joints[leg][0];
+        for _ in 0..8 {
+            let (x, z) = terrain.push_xz(p[0], p[2], floor, MAX_FOOTHOLD);
+            p[0] = x;
+            p[2] = z;
+            let y_floor = terrain.height(x, z);
+            if p[1] < y_floor {
+                p[1] = y_floor;
+            }
+            let tb = to_body(p, self.pos, self.yaw, self.pitch, self.roll);
+            let q = solve_ik(self.frame, leg, tb).q;
+            let j = fk_world(
+                self.frame, leg, q, self.pos, self.yaw, self.pitch, self.roll,
+            );
+            if !self.links_hit_wall(terrain, &j, floor) {
+                return p;
+            }
+            p[0] += 0.22 * (hip[0] - p[0]);
+            p[2] += 0.22 * (hip[2] - p[2]);
+        }
+        p
     }
 
     /// Advance along the route and re-measure where the next waypoint is.
@@ -1444,12 +1580,7 @@ fn mean(sum: f64, n: usize) -> f64 {
 
 /// Score a policy the way training does: the same course at several commanded
 /// speeds, averaged. A policy that can only do one speed cannot win here.
-pub fn evaluate(
-    terrain: &Terrain,
-    policy: &Policy,
-    phys: &Physics,
-    secs: f64,
-) -> Rollout {
+pub fn evaluate(terrain: &Terrain, policy: &Policy, phys: &Physics, secs: f64) -> Rollout {
     let mut acc = Rollout::default();
     let n = EVAL_SPEEDS.len() as f64;
     for &s in EVAL_SPEEDS.iter() {
@@ -1669,7 +1800,10 @@ mod tests {
         // feet scrabble briefly — that is the correct answer, not a bug.
         assert!(launch > 1.0, "launch was free: {launch:.2}");
         // Once up to speed, holding it spends only part of what is on offer.
-        assert!(cruise < 1.0, "flat cruise saturated traction at {cruise:.2}");
+        assert!(
+            cruise < 1.0,
+            "flat cruise saturated traction at {cruise:.2}"
+        );
 
         // On ice the same walk asks for more than there is.
         let icy = Physics {
@@ -1689,10 +1823,13 @@ mod tests {
     #[test]
     fn loose_rubble_grips_less_than_firm_ground() {
         let t = Terrain::new(Course::Rubble, 4);
-        assert!(t.grip(0.0, -3.0) > t.grip(
-            (t.obstacles[0].x0 + t.obstacles[0].x1) * 0.5,
-            (t.obstacles[0].z0 + t.obstacles[0].z1) * 0.5
-        ));
+        assert!(
+            t.grip(0.0, -3.0)
+                > t.grip(
+                    (t.obstacles[0].x0 + t.obstacles[0].x1) * 0.5,
+                    (t.obstacles[0].z0 + t.obstacles[0].z1) * 0.5
+                )
+        );
     }
 
     #[test]
@@ -1922,7 +2059,10 @@ mod tests {
         q.theta[n_gait(f) + act_cycle(f) * no + cmd_obs] = 4.0;
         let a = rollout(&t, &q, &phys, 4.0, Cmd::at(2.0), None);
         let b = rollout(&t, &q, &phys, 4.0, Cmd::at(5.5), None);
-        assert!(b.mean_cycle > a.mean_cycle + 0.01, "cycle time is not wired");
+        assert!(
+            b.mean_cycle > a.mean_cycle + 0.01,
+            "cycle time is not wired"
+        );
     }
 
     #[test]
@@ -1932,7 +2072,14 @@ mod tests {
         // dashboard honest.
         let t = Terrain::new(Course::Flat, 1);
         let g = baseline().gait();
-        let r = rollout(&t, &baseline(), &Physics::default(), 4.0, Cmd::at(3.0), None);
+        let r = rollout(
+            &t,
+            &baseline(),
+            &Physics::default(),
+            4.0,
+            Cmd::at(3.0),
+            None,
+        );
         assert!((r.mean_cycle - g.cycle).abs() < 1e-12);
         assert!((r.mean_stride - g.stride).abs() < 1e-12);
         assert!((r.mean_duty - g.duty).abs() < 1e-12);
@@ -2088,18 +2235,6 @@ mod tests {
         );
     }
 
-    /// A hand-wired steering policy: bearing to the next waypoint straight
-    /// into the steer action, with the sign the geometry actually calls for.
-    /// This is the plumbing test — that the machine *can* be steered by what it
-    /// observes. Whether the learner finds the same wiring is a separate
-    /// question, and one the trainer answers.
-    fn autopilot(gain: f64) -> Policy {
-        let f = Frame::default();
-        let mut p = baseline();
-        p.theta[n_gait(f) + act_steer(f) * n_obs(f) + obs_bearing(f)] = gain;
-        p
-    }
-
     #[test]
     fn the_corridor_is_fenced_on_both_sides() {
         // Drive hard into one wall, then the other. The machine may lean on
@@ -2107,7 +2242,7 @@ mod tests {
         let t = Terrain::new(Course::Flat, 1);
         let p = baseline();
         let g = p.gait();
-        let limit = t.wall_x() - Frame::default().body_r() * 0.9;
+        let limit = t.wall_x() - Frame::default().body_r();
         for turn in [1.0, -1.0] {
             let mut s = Sim::default();
             s.reset(&t, &g, &Physics::default());
@@ -2146,7 +2281,11 @@ mod tests {
         let mut seen = s.wp;
         for _ in 0..2500 {
             s.step(&t, &p, &g, DT, Cmd::at(4.0));
-            assert!(s.wp == seen || s.wp == seen + 1, "route jumped {seen} -> {}", s.wp);
+            assert!(
+                s.wp == seen || s.wp == seen + 1,
+                "route jumped {seen} -> {}",
+                s.wp
+            );
             assert!(s.wp < t.waypoints.len());
             seen = s.wp;
             if s.fallen {
@@ -2181,30 +2320,64 @@ mod tests {
     #[test]
     fn steering_gets_a_machine_through_a_slalom_that_walking_straight_does_not() {
         // The point of the whole exercise: a course where the way forward is
-        // not forward. The straight walker parks against the first wall; the
-        // one that steers toward its waypoints goes round.
+        // not forward. Walking with the autopilot off parks against the first
+        // wall; following the route yaws toward each gate and goes round.
         let t = Terrain::new(Course::Slalom, 3);
         let phys = Physics::default();
-        let straight = rollout(&t, &baseline(), &phys, 22.0, Cmd::at(3.0), None);
-
-        let mut best = straight;
-        for gain in [-2.0, -3.5, -5.0] {
-            let r = rollout(&t, &autopilot(gain), &phys, 22.0, Cmd::at(3.0), None);
-            if r.reached > best.reached {
-                best = r;
-            }
-        }
+        let p = baseline();
+        let straight = rollout(
+            &t,
+            &p,
+            &phys,
+            22.0,
+            Cmd {
+                nav: false,
+                ..Cmd::at(3.0)
+            },
+            None,
+        );
+        let around = rollout(&t, &p, &phys, 22.0, Cmd::at(3.0), None);
         assert!(
-            best.reached > straight.reached,
-            "steering reached {} waypoints, straight ahead reached {}",
-            best.reached,
+            around.reached > straight.reached,
+            "route following reached {} waypoints, straight ahead reached {}",
+            around.reached,
             straight.reached
         );
         assert!(
-            best.distance > straight.distance + 3.0,
-            "steering got {:.1} m, straight ahead got {:.1} m",
-            best.distance,
+            around.distance > straight.distance + 3.0,
+            "route following got {:.1} m, straight ahead got {:.1} m",
+            around.distance,
             straight.distance
+        );
+        assert!(
+            around.reached >= 4,
+            "only reached {} waypoints on the slalom",
+            around.reached
+        );
+    }
+
+    #[test]
+    fn an_eight_legged_machine_also_weaves_the_slalom() {
+        let t = Terrain::new(Course::Slalom, 3);
+        let p = Policy::seeded(Preset::Tripod, Frame::new(8));
+        let phys = Physics::default();
+        let straight = rollout(
+            &t,
+            &p,
+            &phys,
+            22.0,
+            Cmd {
+                nav: false,
+                ..Cmd::at(3.0)
+            },
+            None,
+        );
+        let around = rollout(&t, &p, &phys, 22.0, Cmd::at(3.0), None);
+        assert!(
+            around.reached > straight.reached,
+            "octopod route following reached {} waypoints, straight ahead reached {}",
+            around.reached,
+            straight.reached
         );
     }
 
@@ -2214,7 +2387,7 @@ mod tests {
         // step is what keeps the support plane from being fitted through a
         // foot two metres in the air.
         let t = Terrain::new(Course::Slalom, 3);
-        let p = autopilot(-3.5);
+        let p = baseline();
         let g = p.gait();
         let mut s = Sim::default();
         s.reset(&t, &g, &Physics::default());
@@ -2230,8 +2403,66 @@ mod tests {
                     "leg {i} standing {:.2} m above the support plane",
                     f[1] - s.plane_y(f[0], f[2])
                 );
+                assert!(
+                    !t.solid_at(f, s.plane_y(s.pos[0], s.pos[2]), MAX_FOOTHOLD),
+                    "leg {i} planted inside a wall at ({:.2}, {:.2}, {:.2})",
+                    f[0],
+                    f[1],
+                    f[2]
+                );
             }
         }
+    }
+
+    #[test]
+    fn walking_into_a_slalom_wall_does_not_put_the_feet_through_it() {
+        // The stage showed feet planted inside the block and the support
+        // polygon drawn through it. Mid-links can still chord a wall — the
+        // IK is a knee-up analytic solution, not a volume-aware one — but
+        // the contact points and the chassis disc have to stay out.
+        let t = Terrain::new(Course::Slalom, 3);
+        let p = baseline();
+        let g = p.gait();
+        let mut s = Sim::default();
+        s.reset(&t, &g, &Physics::default());
+        let mut saw_wall = false;
+        let r = Frame::default().body_r();
+        let drive = Cmd {
+            nav: false,
+            ..Cmd::at(3.0)
+        };
+        for _ in 0..1800 {
+            s.step(&t, &p, &g, DT, drive);
+            let floor = s.plane_y(s.pos[0], s.pos[2]);
+            assert!(
+                !t.obstructed(
+                    s.pos[0],
+                    s.pos[2],
+                    r,
+                    floor + g.body_h - crate::robot::BODY_H * 0.5
+                ),
+                "chassis inside a wall at ({:.2}, {:.2}) t={:.2}",
+                s.pos[0],
+                s.pos[2],
+                s.t
+            );
+            for i in 0..s.frame.legs() {
+                let f = s.feet[i].world;
+                assert!(
+                    !t.solid_at(f, floor, MAX_FOOTHOLD),
+                    "leg {i} foot inside a wall at ({:.2}, {:.2}, {:.2}) t={:.2}",
+                    f[0],
+                    f[1],
+                    f[2],
+                    s.t
+                );
+            }
+            saw_wall |= s.blocked;
+            if s.fallen {
+                break;
+            }
+        }
+        assert!(saw_wall, "never actually met a wall");
     }
 
     #[test]
@@ -2261,7 +2492,10 @@ mod tests {
         s.pos = [0.0, s.pos[1], -2.0];
         s.build_obs(&t, &g, Cmd::at(3.0));
         let clear = &s.obs[obs_scan(f)..obs_scan(f) + N_SCAN];
-        assert!(clear.iter().all(|v| v.abs() < 0.2), "phantom obstacle: {clear:?}");
+        assert!(
+            clear.iter().all(|v| v.abs() < 0.2),
+            "phantom obstacle: {clear:?}"
+        );
     }
 
     #[test]
