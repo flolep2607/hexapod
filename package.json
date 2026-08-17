@@ -6,7 +6,7 @@
   "scripts": {
     "build": "./build.sh",
     "serve": "python3 -m http.server 8000 --bind 0.0.0.0 --directory dist",
-    "dev": "./build.sh && npm run serve",
+    "dev": "./dev.sh",
     "smoke": "node test/smoke.mjs"
   },
   "devDependencies": {

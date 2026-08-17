@@ -2,6 +2,7 @@
 # Build the single-file dashboard.
 #
 #   ./build.sh            release build -> dist/hexapod-simulator.html
+#   ./build.sh --fast     dev build: no tests, no LTO, live-reload snippet
 #
 # The wasm module is inlined as base64 and the telemetry offsets are generated
 # from the Rust source, so the output is self-contained and the two sides of
@@ -9,14 +10,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-CARGO_FLAGS="--release --offline"
-WASM=target/wasm32-unknown-unknown/release/hexapod_wasm.wasm
+if [ "${1:-}" = "--fast" ]; then
+    PROFILE=dev-fast
+    CARGO_FLAGS="--profile dev-fast --offline"
+    export HX_LIVE=1          # inject the live-reload poller
+else
+    PROFILE=release
+    CARGO_FLAGS="--release --offline"
+fi
+WASM=target/wasm32-unknown-unknown/$PROFILE/hexapod_wasm.wasm
 
-echo "==> cargo test"
-cargo test $CARGO_FLAGS -q 2>&1 | tail -5 || cargo test --offline -q
-echo "==> cargo test (rapier plant)"
-cargo test $CARGO_FLAGS -q -p hexapod-core --features rapier -- --test-threads=1 2>&1 | tail -8 \
-  || cargo test --offline -q -p hexapod-core --features rapier -- --test-threads=1
+if [ -z "${HX_LIVE:-}" ]; then
+    echo "==> cargo test"
+    cargo test $CARGO_FLAGS -q 2>&1 | tail -5 || cargo test --offline -q
+    echo "==> cargo test (rapier plant)"
+    cargo test $CARGO_FLAGS -q -p hexapod-core --features rapier -- --test-threads=1 2>&1 | tail -8 \
+      || cargo test --offline -q -p hexapod-core --features rapier -- --test-threads=1
+fi
 
 echo "==> building wasm"
 cargo build $CARGO_FLAGS --target wasm32-unknown-unknown -p hexapod-wasm
@@ -29,7 +39,7 @@ cargo run $CARGO_FLAGS -q -p hexapod-cli -- courses > web/courses.gen.json
 echo "==> assembling dist/hexapod-simulator.html"
 mkdir -p dist
 python3 - "$WASM" <<'PY'
-import base64, json, pathlib, re, sys
+import base64, json, os, pathlib, re, sys
 
 root = pathlib.Path(".")
 web = root / "web"
@@ -78,6 +88,18 @@ parts = [
     # shared global scope; they talk to each other only through `window`.
     "<script>\n(function(){\n" + (web / "render.js").read_text(encoding="utf-8") + "\n})();\n</script>",
     "<script>\n(function(){\n" + (web / "app.js").read_text(encoding="utf-8") + "\n})();\n</script>",
+]
+
+# Dev builds reload themselves when dev.sh rewrites this file.
+if os.environ.get("HX_LIVE"):
+    parts.append(
+        "<script>\n(function(){let seen=null;setInterval(async()=>{try{"
+        "const r=await fetch(location.pathname,{method:'HEAD',cache:'no-store'});"
+        "const m=r.headers.get('last-modified');"
+        "if(seen&&m!==seen)location.reload();seen=m;}catch(e){}},1000);})();\n</script>"
+    )
+
+parts += [
     "</body>",
     "</html>",
 ]

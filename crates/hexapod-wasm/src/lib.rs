@@ -140,13 +140,13 @@ fn make(seed: u64) -> App {
 
 // ---------------------------------------------------------------- lifecycle
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_init(seed: u32) {
     unsafe { APP = Some(make(seed as u64)) };
     app().reset_live();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_course(kind: u32, seed: u32) {
     let a = app();
     a.course = Course::from_u32(kind);
@@ -169,7 +169,7 @@ pub extern "C" fn hx_set_course(kind: u32, seed: u32) {
 ///
 /// A different leg count is a different machine with a different policy shape,
 /// so everything learned is discarded.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_legs(legs: u32) -> u32 {
     let a = app();
     let next = Frame::new(legs as usize);
@@ -191,45 +191,45 @@ pub extern "C" fn hx_set_legs(legs: u32) -> u32 {
 
 /// The gait preset in force. Changing the leg count can change it, because a
 /// frame that cannot stand on an alternating gait is moved to the crawl.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_preset() -> u32 {
     app().preset as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_legs() -> u32 {
     app().frame.legs() as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_legs_min() -> u32 {
     MIN_LEGS as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_legs_max() -> u32 {
     MAX_LEGS as u32
 }
 
 /// 1 when an alternating half-set gait keeps this frame statically stable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_alternating_is_stable() -> u32 {
     u32::from(app().frame.alternating_is_stable())
 }
 
 /// Number of parameters the policy carries on the current frame, and the shape
 /// of the feedback matrix that makes up most of them.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_theta_len() -> u32 {
     n_theta(app().frame) as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_n_obs() -> u32 {
     hexapod_core::policy::n_obs(app().frame) as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_n_act() -> u32 {
     hexapod_core::policy::n_act(app().frame) as u32
 }
@@ -239,18 +239,18 @@ pub extern "C" fn hx_n_act() -> u32 {
 /// The dashboard classifies a *measured* footfall pattern by matching it
 /// against these, so the named patterns it compares against are the ones the
 /// simulator actually defines rather than a second copy of the tables.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_preset_offset(preset: u32, leg: u32) -> f64 {
     let a = app();
     Preset::from_u32(preset).offsets(a.frame)[(leg as usize).min(MAX_LEGS - 1)]
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_preset_count() -> u32 {
     3
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_preset(p: u32) {
     let a = app();
     a.preset = Preset::from_u32(p);
@@ -259,7 +259,7 @@ pub extern "C" fn hx_set_preset(p: u32) {
     a.reset_live();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_mode(mode: u32) {
     let a = app();
     if a.mode != mode {
@@ -268,7 +268,7 @@ pub extern "C" fn hx_set_mode(mode: u32) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_reset_live() {
     app().reset_live();
 }
@@ -276,7 +276,7 @@ pub extern "C" fn hx_reset_live() {
 // ------------------------------------------------------------- manual gait
 
 /// Set gait scalar `idx` (0..6) on the hand-tuned policy.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_param(idx: u32, value: f64) {
     let a = app();
     let i = idx as usize;
@@ -289,7 +289,7 @@ pub extern "C" fn hx_set_param(idx: u32, value: f64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_get_param(idx: u32) -> f64 {
     let a = app();
     let i = idx as usize;
@@ -301,7 +301,7 @@ pub extern "C" fn hx_get_param(idx: u32) -> f64 {
 
 // ---------------------------------------------------------------- training
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_train_cfg(dirs: u32, top: u32, alpha: f64, sigma: f64, horizon: f64) {
     let a = app();
     a.trainer.cfg.n_dirs = (dirs as usize).clamp(2, 32);
@@ -311,13 +311,13 @@ pub extern "C" fn hx_set_train_cfg(dirs: u32, top: u32, alpha: f64, sigma: f64, 
     a.trainer.cfg.horizon = horizon.clamp(2.0, 30.0);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_reset_training() {
     app().reset_training();
 }
 
 /// Run `iters` ARS iterations. Returns the best reward so far.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_train(iters: u32) -> f64 {
     let a = app();
     if a.trainer.curve.is_empty() {
@@ -332,14 +332,14 @@ pub extern "C" fn hx_train(iters: u32) -> f64 {
 }
 
 /// Number of ARS iterations completed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_iterations() -> u32 {
     app().trainer.iter as u32
 }
 
 // ------------------------------------------------------------------- build
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_build(scale: f64, mass_kg: f64, safety: f64) {
     let a = app();
     let changed =
@@ -357,7 +357,7 @@ pub extern "C" fn hx_set_build(scale: f64, mass_kg: f64, safety: f64) {
 
 /// Choose the servo whose torque-speed line drives the joints. `0xFFFF_FFFF`
 /// restores the generic default. Returns 1 if the machine changed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_servo(index: u32) -> u32 {
     let a = app();
     let next = if (index as usize) < SERVOS.len() {
@@ -375,7 +375,7 @@ pub extern "C" fn hx_set_servo(index: u32) -> u32 {
 
 /// Commanded cruise speed, clamped to the range training samples from on
 /// the current course.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_cruise(v: f64) {
     let a = app();
     a.cruise = if a.course.is_jump() {
@@ -385,7 +385,7 @@ pub extern "C" fn hx_set_cruise(v: f64) {
     };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_cruise_lo() -> f64 {
     if app().course.is_jump() {
         JUMP_CRUISE_MIN
@@ -394,7 +394,7 @@ pub extern "C" fn hx_cruise_lo() -> f64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_cruise_hi() -> f64 {
     if app().course.is_jump() {
         JUMP_CRUISE_MAX
@@ -406,7 +406,7 @@ pub extern "C" fn hx_cruise_hi() -> f64 {
 /// Measure peak joint torques over one full gait cycle of the active policy.
 /// Writes `[coxa, femur, tibia, required, peak_foot_N, cycle_s, stance_mm, set_mass_kg]`
 /// in kg-cm where applicable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_measure_torque() -> *const f32 {
     let a = app();
     let policy: &Policy = if a.mode == MODE_LEARNED && a.trained {
@@ -453,7 +453,7 @@ pub extern "C" fn hx_measure_torque() -> *const f32 {
 
 // -------------------------------------------------------------------- step
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_step(dt: f64, fwd: f64, turn: f64) {
     let a = app();
     a.step(dt, fwd, turn);
@@ -462,61 +462,61 @@ pub extern "C" fn hx_step(dt: f64, fwd: f64, turn: f64) {
 
 // ------------------------------------------------------------ data access
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_telemetry_ptr() -> *const f32 {
     app().telemetry.as_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_telemetry_len() -> u32 {
     T_LEN as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_course_ptr() -> *const f32 {
     app().course_buf.as_ptr()
 }
 
 /// Number of obstacles; each is 5 floats `[x0, x1, z0, z1, top]`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_course_len() -> u32 {
     (app().course_buf.len() / 5) as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_route_ptr() -> *const f32 {
     app().route_buf.as_ptr()
 }
 
 /// Number of waypoints; each is two floats `[x, z]`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_route_len() -> u32 {
     (app().route_buf.len() / 2) as u32
 }
 
 /// Turn the route-following autopilot on or off. With it off the machine only
 /// turns when it is told to, which is what the arrow keys do anyway.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_nav(on: u32) {
     app().nav = on != 0;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_course_count() -> u32 {
     hexapod_core::terrain::COURSES.len() as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_curve_ptr() -> *const f32 {
     app().trainer.curve.as_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_curve_len() -> u32 {
     app().trainer.curve.len() as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_dist_curve_ptr() -> *const f32 {
     app().trainer.dist_curve.as_ptr()
 }
@@ -792,12 +792,12 @@ impl App {
 
 /// Lower bound of gait scalar `idx`, so the UI never has to duplicate the
 /// ranges declared in the core.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_param_lo(idx: u32) -> f64 {
     GAIT_BOUNDS.get(idx as usize).map(|b| b.0).unwrap_or(0.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_param_hi(idx: u32) -> f64 {
     GAIT_BOUNDS.get(idx as usize).map(|b| b.1).unwrap_or(1.0)
 }
@@ -805,7 +805,7 @@ pub extern "C" fn hx_param_hi(idx: u32) -> f64 {
 /// Gait value `idx` for a given policy: `0..6` are the scalars in
 /// `GAIT_BOUNDS` order, `6..12` are the per-leg phase offsets.
 /// `mode` 0 selects the hand-tuned policy, 1 the learned one.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_gait(mode: u32, idx: u32) -> f64 {
     let a = app();
     let g = if mode == MODE_LEARNED && a.trained {
@@ -826,7 +826,7 @@ pub extern "C" fn hx_gait(mode: u32, idx: u32) -> f64 {
 }
 
 /// Terrain height at a point, for drawing the elevation profile.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_height(x: f64, z: f64) -> f64 {
     app().terrain.height(x, z)
 }
@@ -851,7 +851,7 @@ fn part_index(p: Option<&'static Part>) -> f32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_sizing(chassis_kg: f64, runtime_min: f64, safety: f64) {
     let a = app();
     a.sizing.chassis_kg = chassis_kg.clamp(0.05, 40.0);
@@ -861,7 +861,7 @@ pub extern "C" fn hx_set_sizing(chassis_kg: f64, runtime_min: f64, safety: f64) 
 
 /// Size a whole machine around servo `servo_idx` and the active gait.
 /// Writes the `S_*` layout and returns a pointer to it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_solve_system(servo_idx: u32) -> *const f32 {
     let a = app();
     let servo = match hexapod_core::SERVOS.get(servo_idx as usize) {
@@ -924,7 +924,7 @@ pub extern "C" fn hx_solve_system(servo_idx: u32) -> *const f32 {
     b.as_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_servo_count() -> u32 {
     hexapod_core::SERVOS.len() as u32
 }
