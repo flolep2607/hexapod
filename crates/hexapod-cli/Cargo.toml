@@ -1,0 +1,13 @@
+[package]
+name = "hexapod-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless trainer and benchmark for the hexapod simulator."
+
+[[bin]]
+name = "hexapod"
+path = "src/main.rs"
+
+[dependencies]
+hexapod-core = { path = "../hexapod-core" }

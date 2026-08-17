@@ -1,0 +1,489 @@
+<title>Hexapod Gait Lab</title>
+
+<div class="app">
+  <header class="hdr">
+    <div class="chips">
+      <div class="chip"><span class="k">Model</span><b id="hModel">HEXAPOD · 18 DOF</b></div>
+      <div class="chip"><span class="k">Solver</span><b>ANALYTIC 3-DOF IK</b></div>
+      <div class="chip"><span class="k">Clock</span><b id="hClock">00:00.0</b></div>
+    </div>
+    <div class="wordmark">HEXAPOD<small>GAIT LAB</small></div>
+    <div class="chips right">
+      <div class="chip"><span class="k">Policy</span><b id="hPolicy" class="hot">HAND-TUNED</b></div>
+      <div class="chip"><span class="k">Course</span><b id="hCourse">MIXED</b></div>
+      <div class="chip"><span class="k">State</span><b id="hState" class="hot">WALKING</b></div>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="kinematics" aria-selected="true">Kinematics</button>
+    <button class="tab" role="tab" data-tab="training" aria-selected="false">Training</button>
+    <button class="tab" role="tab" data-tab="terrain" aria-selected="false">Terrain</button>
+    <button class="tab" role="tab" data-tab="hardware" aria-selected="false">Servos</button>
+    <button class="tab" role="tab" data-tab="system" aria-selected="false">System</button>
+    <button class="tab" role="tab" data-tab="about" aria-selected="false">About</button>
+  </nav>
+
+  <main class="grid">
+    <!-- ------------------------------------------------ telemetry rail -->
+    <aside class="rail left">
+      <div class="sec">
+        <div class="hd"><h2>Joint Angle</h2><span class="k">Femur · <span class="hot">Tibia</span></span></div>
+        <div class="br"><i></i><canvas id="cTorque" height="150"></canvas></div>
+      </div>
+
+      <div class="sec">
+        <div class="hd"><h2>Foot Height</h2><span class="k">Swing trace · L1</span></div>
+        <div class="br"><i></i><canvas id="cFoot" height="130"></canvas></div>
+      </div>
+
+      <div class="sec">
+        <div class="hd"><h2>Leg Load</h2><span class="k">Stance share</span></div>
+        <div class="bars" id="loadBars"></div>
+      </div>
+
+      <div class="dials">
+        <div class="dial"><canvas id="dSolver" width="84" height="84"></canvas><span class="k">Step time</span></div>
+        <div class="dial"><canvas id="dStab" width="84" height="84"></canvas><span class="k">Stability margin</span></div>
+      </div>
+
+      <div class="meter">
+        <div class="hd"><span class="k">Speed / commanded</span><b id="mSpeed">0.00</b></div>
+        <div class="track"><div class="fill" id="fSpeed"></div></div>
+      </div>
+      <div class="meter">
+        <div class="hd"><span class="k">Traction used</span><b id="mTrac">0%</b></div>
+        <div class="track"><div class="fill warn" id="fTrac"></div></div>
+      </div>
+      <div class="meter">
+        <div class="hd"><span class="k">Servo torque / stall</span><b id="mServo">0%</b></div>
+        <div class="track"><div class="fill warn" id="fServo"></div></div>
+      </div>
+      <div class="meter">
+        <div class="hd"><span class="k">Foot catches</span><b id="mStub">0.00</b></div>
+        <div class="track"><div class="fill warn" id="fStub"></div></div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Contact &amp; actuators</h2></div>
+        <div class="statrow tight">
+          <div class="stat mute"><span class="k">Skid</span><b id="pSlip">0.00</b><span class="k">m</span></div>
+          <div class="stat mute"><span class="k">Sag</span><b id="pDroop">0.0</b><span class="k">mm</span></div>
+          <div class="stat mute"><span class="k">Joint lag</span><b id="pLag">0.0</b><span class="k">° rms</span></div>
+          <div class="stat mute"><span class="k">Transport</span><b id="pCot">—</b><span class="k">cost</span></div>
+          <div class="stat mute"><span class="k">Leg torque</span><b id="pLegTq">0.00</b><span class="k">kg·cm</span></div>
+          <div class="stat mute"><span class="k">Swing kick</span><b id="pReact">0.0</b><span class="k">N into chassis</span></div>
+          <div class="stat mute"><span class="k">Waypoints</span><b id="pReached">0</b><span class="k">reached</span></div>
+          <div class="stat mute"><span class="k">Wall</span><b id="pWall">0.00</b><span class="k">m of room</span></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Log</h2></div>
+        <div class="console" id="logMini"></div>
+      </div>
+    </aside>
+
+    <!-- ----------------------------------------------------- the stage -->
+    <section class="stage">
+      <div class="pane" data-pane="kinematics" data-active="true">
+        <div class="viewwrap">
+          <canvas id="view"></canvas>
+          <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
+GAIT <b id="hudGait">TRIPOD</b> · DUTY <b id="hudDuty">0.50</b></div>
+          <div class="hud tr">CAM ORBIT · DRAG TO ROTATE
+SCROLL TO ZOOM · WASD / QE</div>
+          <div class="hud bl">BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
+MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm</div>
+          <div class="hud br2">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · ω <b id="hudW">0.00</b> rad/s
+CYCLE <b id="hudCycle">0.47</b> s · STRIDE <b id="hudStride">1.08</b> m
+NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b> m · BRG <b id="hudBrg">+0°</b></div>
+          <div class="banner" id="banner">RECOVERING</div>
+        </div>
+      </div>
+
+      <div class="pane scroll" data-pane="training">
+        <div class="sec-bar"><h2>Augmented Random Search</h2><span class="k" id="trStatus">idle</span></div>
+
+        <p class="lede">The learner starts as an exact copy of the hand-tuned gait on the right, then searches
+        for something better on <b id="trCourse">MIXED</b>. Each iteration samples random directions in
+        parameter space, runs the gait forward and backward along each, and steps toward the directions that
+        scored best. There is no gradient and no neural network — <b id="trTheta">428 parameters</b>: six gait
+        scalars, one phase offset per leg, two stance trims, and a <b id="trShape">18×23</b> linear feedback
+        matrix mapping what the machine senses onto what it does with its legs, its gait clock and its
+        steering.</p>
+
+        <div class="statrow">
+          <div class="stat mute"><span class="k">Hand-tuned</span><b id="sBase">—</b><span class="k">reward</span></div>
+          <div class="stat"><span class="k">Learned best</span><b id="sBest">—</b><span class="k">reward</span></div>
+          <div class="stat mute"><span class="k">Iterations</span><b id="sIter">0</b><span class="k" id="sIterMs">— ms each</span></div>
+          <div class="stat mute"><span class="k">Rollouts</span><b id="sRoll">0</b><span class="k">simulated episodes</span></div>
+          <div class="stat"><span class="k">Improvement</span><b id="sGain">—</b><span class="k">over baseline</span></div>
+          <div class="stat mute"><span class="k">Feedback norm</span><b id="sFeed">0.00</b><span class="k">0 = open loop</span></div>
+        </div>
+
+        <div class="sec">
+          <div class="hd"><h2>Learning curve</h2><span class="k">Reward per iteration · <span class="hot">best so far</span></span></div>
+          <div class="br"><i></i><canvas id="cCurve" height="300"></canvas></div>
+        </div>
+
+        <div class="grid2">
+          <div class="sec">
+            <div class="sec-bar"><h2>Run</h2></div>
+            <div class="row2">
+              <button class="btn primary" id="btnTrain">Train</button>
+              <button class="btn" id="btnResetTrain">Reset</button>
+            </div>
+            <label class="slider"><span class="hd"><span class="k">Directions / iteration</span><b id="vDirs">16</b></span>
+              <input type="range" id="rDirs" min="2" max="32" step="1" value="16"></label>
+            <label class="slider"><span class="hd"><span class="k">Top directions used</span><b id="vTop">6</b></span>
+              <input type="range" id="rTop" min="1" max="32" step="1" value="6"></label>
+            <label class="slider"><span class="hd"><span class="k">Step size α</span><b id="vAlpha">0.030</b></span>
+              <input type="range" id="rAlpha" min="0.005" max="0.08" step="0.005" value="0.03"></label>
+            <label class="slider"><span class="hd"><span class="k">Noise σ</span><b id="vSigma">0.045</b></span>
+              <input type="range" id="rSigma" min="0.01" max="0.12" step="0.005" value="0.045"></label>
+            <label class="slider"><span class="hd"><span class="k">Episode horizon</span><b id="vHorizon">10.0 s</b></span>
+              <input type="range" id="rHorizon" min="4" max="16" step="1" value="10"></label>
+          </div>
+
+          <div class="sec">
+            <div class="sec-bar"><h2>What it changed</h2><span class="k">nominal gait</span></div>
+            <div class="scrollx">
+              <table id="tblGait">
+                <thead><tr><th>Parameter</th><th>Hand-tuned</th><th>Learned</th><th>Δ</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="note">Phase offsets decide which legs swing together. Starting from a tripod, the
+            learner is free to invent any coordination pattern it likes — watch the gait diagram on the
+            right redraw itself as it trains.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="pane scroll" data-pane="terrain">
+        <div class="sec-bar"><h2>Obstacle course</h2><span class="k" id="tSummary">—</span></div>
+        <p class="lede">Courses are generated from a seed, so a run is reproducible. Training uses one seed;
+        switch the seed afterwards to see whether the policy learned the terrain or learned to walk.</p>
+
+        <div class="row3" id="courseBtns"></div>
+        <div class="row2">
+          <label class="slider"><span class="hd"><span class="k">Course seed</span><b id="vSeed">1</b></span>
+            <input type="range" id="rSeed" min="1" max="60" step="1" value="1"></label>
+          <div style="display:flex;align-items:flex-end"><button class="btn" id="btnReroll" style="width:100%">Re-roll course</button></div>
+        </div>
+
+        <div class="sec">
+          <div class="hd"><h2>Elevation along the corridor</h2><span class="k">centre line, x = 0</span></div>
+          <div class="br"><i></i><canvas id="cProfile" height="220"></canvas></div>
+        </div>
+        <p class="note" id="tNote"></p>
+      </div>
+
+      <div class="pane scroll" data-pane="hardware">
+        <div class="sec-bar"><h2>Servo sizing</h2><span class="k">from the running gait</span></div>
+        <p class="lede">The simulated gait gives a per-foot load and a leg pose every tick. Multiply the load
+        by the horizontal lever arm from each joint to the foot and you get the torque that joint must hold —
+        the Jacobian transpose for a vertical force. Change the build below and the shopping list changes with
+        it. <b>A wider stance costs torque; more feet on the ground saves it.</b></p>
+
+        <div class="grid2">
+          <div class="sec">
+            <div class="sec-bar"><h2>Build</h2></div>
+            <label class="slider"><span class="hd"><span class="k">All-up mass</span><b id="vMass">2.0 kg</b></span>
+              <input type="range" id="rMass" min="0.3" max="12" step="0.1" value="2"></label>
+            <label class="slider"><span class="hd"><span class="k">Femur length</span><b id="vScale">80 mm</b></span>
+              <input type="range" id="rScale" min="30" max="220" step="5" value="80"></label>
+            <label class="slider"><span class="hd"><span class="k">Safety factor</span><b id="vSafety">1.35×</b></span>
+              <input type="range" id="rSafety" min="1" max="3" step="0.05" value="1.35"></label>
+            <p class="note" id="hwDims">—</p>
+          </div>
+
+          <div class="sec">
+            <div class="sec-bar"><h2>Peak joint torque</h2></div>
+            <div class="statrow">
+              <div class="stat mute"><span class="k">Coxa</span><b id="tqCoxa">—</b><span class="k">kg·cm</span></div>
+              <div class="stat"><span class="k">Femur</span><b id="tqFemur">—</b><span class="k">kg·cm · sizing case</span></div>
+              <div class="stat mute"><span class="k">Tibia</span><b id="tqTibia">—</b><span class="k">kg·cm</span></div>
+            </div>
+            <div class="stat"><span class="k">Servo must be rated for</span><b id="tqReq">—</b><span class="k">kg·cm stall, including safety factor</span></div>
+            <p class="note" id="tqNote">—</p>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-bar"><h2>Off-the-shelf servos</h2><span class="k">18 per robot</span></div>
+          <div class="scrollx">
+            <table id="tblServo">
+              <thead><tr>
+                <th>Part</th><th>Stall</th><th>Head</th><th>Mass ×18</th><th>Bus</th>
+                <th>Marketplace ×18</th><th>Distributor ×18</th><th>Verdict</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="note" id="priceNote"></p>
+        </div>
+      </div>
+
+
+      <div class="pane scroll" data-pane="system">
+        <div class="sec-bar"><h2>Whole-machine sizing</h2><span class="k" id="sysStatus">—</span></div>
+        <p class="lede">Battery mass is part of all-up mass, all-up mass sets joint torque, torque sets
+        current, and current sets the battery you need. That is a loop, and it is solved here by iteration
+        rather than guessed — <b id="sysIters">—</b>. Past a certain endurance it has no solution at all:
+        the robot cannot carry the battery its own runtime demands, and the table says so instead of
+        inventing a number.</p>
+
+        <div class="grid2">
+          <div class="sec">
+            <div class="sec-bar"><h2>Assumptions</h2></div>
+            <label class="slider"><span class="hd"><span class="k">Chassis, brackets, wiring</span><b id="vChassis">0.45 kg</b></span>
+              <input type="range" id="rChassis" min="0.1" max="4" step="0.05" value="0.45"></label>
+            <label class="slider"><span class="hd"><span class="k">Target endurance</span><b id="vRuntime">20 min</b></span>
+              <input type="range" id="rRuntime" min="5" max="90" step="5" value="20"></label>
+            <p class="note">Femur length and safety factor come from the Servos tab. Current is modelled
+            from torque — a brushed motor's torque is proportional to its current — so it ignores gearbox
+            friction and reversal inrush and reads slightly optimistic.</p>
+          </div>
+
+          <div class="sec">
+            <div class="sec-bar"><h2>Mass budget</h2><span class="k" id="sysAllUp">—</span></div>
+            <div class="bars" id="massBars"></div>
+            <div class="statrow" style="margin-top:8px">
+              <div class="stat"><span class="k">Mean draw</span><b id="sysMeanA">—</b><span class="k">A at the pack</span></div>
+              <div class="stat mute"><span class="k">Peak</span><b id="sysPeakA">—</b><span class="k">A at the pack</span></div>
+              <div class="stat mute"><span class="k">Power</span><b id="sysWatts">—</b><span class="k">W mean</span></div>
+              <div class="stat"><span class="k">Endurance</span><b id="sysRuntime">—</b><span class="k">minutes walking</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-bar"><h2>Every servo, sized as a complete robot</h2><span class="k">click a row to build it</span></div>
+          <div class="scrollx">
+            <table id="tblSystem">
+              <thead><tr>
+                <th>Servo</th><th>All-up</th><th>Needs</th><th>Stall</th><th>Battery</th>
+                <th>Mean A</th><th>Peak A</th><th>Endurance</th><th>Total</th><th>Verdict</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="note">“Needs” is peak joint torque at the converged mass, including the safety factor.
+          A heavier servo makes the robot heavier, which raises the torque it has to produce — which is why
+          the requirement moves from row to row.</p>
+        </div>
+
+        <div class="sec">
+          <div class="sec-bar"><h2>Parts list</h2><span class="k" id="sysPick">—</span></div>
+          <div class="scrollx">
+            <table id="tblParts">
+              <thead><tr><th>Role</th><th>Part</th><th>Qty</th><th>Mass</th><th>Cost</th><th>Why this one</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-bar"><h2>What the policy demands of the sensors</h2></div>
+          <p class="lede">The observation vector is not free. The policy reads six terrain heights, a pitch,
+          a roll and a stability margin every control tick; on a real robot each of those is a measurement
+          with a range, a rate and a resolution.</p>
+          <div class="scrollx">
+            <table id="tblSense">
+              <thead><tr><th>Observation</th><th>Needs</th><th>Part</th><th>Provides</th><th>Verdict</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="note" id="senseNote"></p>
+        </div>
+      </div>
+
+      <div class="pane scroll" data-pane="about">
+        <div class="sec-bar"><h2>What this is</h2></div>
+        <p class="lede">A legged-locomotion simulator with a policy-search trainer, written in Rust and
+        compiled to WebAssembly. Four legs to ten; six is the default. The browser only draws; every piece of
+        kinematics, physics and learning runs in the wasm module.</p>
+
+        <div class="grid2">
+          <div class="sec">
+            <div class="sec-bar"><h2>The simulator</h2></div>
+            <p class="note">A <b>centroidal rigid-body</b> model. The chassis carries linear and angular
+            momentum; it cannot change speed faster than traction allows, it coasts when a foot slips, and
+            its own acceleration throws the centre of mass around — braking hard pitches the mass forward
+            over the toes.</p>
+            <p class="note">Contact is <b>Coulomb friction</b>: a stance foot transmits at most μ·N, and past
+            that it skids and its contact point moves in the world, corrupting the support polygon for every
+            tick after. Loose rubble grips about two thirds of what firm ground does.</p>
+            <p class="note">Joints are driven by a <b>real servo</b> — the one selected in the control rail —
+            along its torque-speed line: full speed at no load, zero speed at stall, and past stall the joint
+            back-drives, the leg folds and the chassis sags. The gait you train is a gait for that servo.</p>
+            <p class="note"><b>Leg mass</b> is real and it is not small — on a machine this size the
+            legs are about half of it. A swinging leg holds itself up against gravity and has to be
+            accelerated and stopped, its joints pay for both in torque, and the reaction goes back into the
+            chassis and eats the same friction budget as everything else. Swing used to be free.</p>
+            <p class="note">The frame is parametric: four legs to ten, in pairs. Nothing in the simulator
+            knows it is a hexapod.</p>
+            <p class="note">The course is <b>fenced</b> by two invisible walls at the corridor edges, and
+            some of what is inside cannot be climbed — a slalom wall is nearly twice the length of a leg.
+            Both are the same obstruction test. Hitting one takes the velocity component into it and keeps
+            the component along it, so a machine that arrives square stops and one that arrives at an angle
+            slides along and gets round; a step aimed at somewhere a leg cannot reach is deflected to the
+            nearest ground that it can.</p>
+            <p class="note">What is still kinematic, stated plainly: links are rigid, contact is resolved
+            once per tick rather than by an impulse solver, and the leg-inertia terms are the diagonal ones
+            — each joint sees the mass below it, without the off-diagonal coupling or the Coriolis terms of
+            a full mass matrix. It is not a general articulated multibody engine.</p>
+          </div>
+          <div class="sec">
+            <div class="sec-bar"><h2>The learner</h2></div>
+            <p class="note">Augmented Random Search (Mania, Guy &amp; Recht, 2018), the V2-t variant:
+            finite-difference estimates along random directions, scaled by the spread of the returns, using
+            only the best-scoring directions, over a linear policy with normalised observations. Derivative
+            free, so the simulator never has to be differentiable.</p>
+            <p class="note">The update comes from the spread of returns across <b>sampled directions</b>, so
+            the population it needs grows with the parameter count — and the parameter count grew by seventy
+            per cent when the policy gained a forward scan and somewhere to go. Run it at eight directions
+            and it still converges, to a worse policy: the walk-to-run duty trend flattens out and speed
+            tracking lands behind the hand-tuned gait. More iterations do not fix that. More directions do,
+            which is why the default is sixteen.</p>
+            <p class="note">The reward contains <b>no distance term at all</b>. The task is to hold a
+            commanded speed, and the command is sampled fresh for every rollout and fed to the policy as an
+            observation, so there is no single speed to specialise on. An early version rewarded raw
+            distance and the optimiser correctly pinned cycle time and stride to their bounds; the version
+            after that hard-coded one cruise speed, which only moved the specialisation somewhere less
+            visible. Beyond tracking it pays for mechanical work in joules, foot skid in metres, terrain
+            clipped by a swinging foot, and time spent asking a servo for more torque than it has.</p>
+            <p class="note">Every course carries a <b>route</b>, and one action is <b>steering</b>. The
+            policy sees the bearing and range to the next waypoint, where it sits between the two walls, and
+            a six-point forward scan of the ground one to three metres ahead — which is the only thing it
+            knows about terrain it has not reached, and far enough ahead to turn on. On the open courses the
+            route runs straight down the middle and none of it matters. On the slalom it is the difference
+            between finishing and stopping at the first wall.</p>
+            <p class="note">Three of the actions scale cycle time, stride and duty factor online,
+            every tick. That is how any legged controller changes speed, and it is where the interesting
+            behaviour shows up: given a range of commands to serve, the policy learns to raise its duty
+            factor when walking slowly and drop it when running — the walk-to-run transition, which nobody
+            put in the reward.</p>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-bar"><h2>Reading the stage</h2></div>
+          <table>
+            <thead><tr><th>Mark</th><th>Meaning</th></tr></thead>
+            <tbody>
+              <tr><td>Solid red ring</td><td>Foot planted; ring grows with its share of the load</td></tr>
+              <tr><td>Dashed grey ring</td><td>Where a swinging leg intends to touch down</td></tr>
+              <tr><td>Dashed red polygon</td><td>Support polygon — the convex hull of the planted feet</td></tr>
+              <tr><td>Crosshair</td><td>Centre of mass. It turns red as it approaches the polygon edge</td></tr>
+              <tr><td>Recessed grey box</td><td>Pit. Falling into one usually ends the run</td></tr>
+              <tr><td>Red ring with a post</td><td>The waypoint being chased right now</td></tr>
+              <tr><td>Small dashed rings</td><td>The rest of the route, faded once passed</td></tr>
+              <tr><td>Dashed red line at ±5 m</td><td>An invisible wall. Uprights appear as you close on it</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="sec">
+          <div class="sec-bar"><h2>Full log</h2></div>
+          <div class="console" id="logFull" style="height:220px"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- -------------------------------------------------- control rail -->
+    <aside class="rail right">
+      <div class="sec">
+        <div class="sec-bar"><h2>Simulation</h2></div>
+        <div class="row2">
+          <button class="btn primary" id="btnPause" data-on="false">Pause</button>
+          <button class="btn" id="btnReset">Reset</button>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Policy</h2></div>
+        <div class="row2">
+          <button class="btn" id="btnBase" data-on="true">Hand-tuned</button>
+          <button class="btn" id="btnLearn" disabled>Learned</button>
+        </div>
+        <p class="note" id="policyNote">Train a policy to enable the comparison.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Frame</h2><span class="k" id="legsNote"></span></div>
+        <label class="slider"><span class="hd"><span class="k">Legs</span><b id="vLegs">6 legs</b></span>
+          <input type="range" id="rLegs" min="4" max="10" step="2" value="6"></label>
+        <p class="note">Four legs to ten, in pairs. The chassis grows, the policy is
+        reshaped around the new observation and action counts, and anything learned for the
+        old frame is discarded. A quadruped starts on the crawl: a trot stands on two
+        diagonal feet, which is dynamically stable and not statically stable, and this
+        simulator judges stability statically.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Gait pattern</h2><span class="k" id="presetNote"></span></div>
+        <div class="row3" id="presetBtns"></div>
+        <div class="br"><i></i><canvas id="cGait" height="124"></canvas></div>
+        <p class="note">Footfalls as they happen, not the schedule they were meant to follow:
+        each row is one leg over the last four seconds, dark where the foot was down and
+        darker the more weight it carried. Everything under it — cycle time, duty per leg,
+        how many legs are ever in the air at once, and which named pattern that adds up to —
+        is measured from the same recording, so a learned policy that invents a coordination
+        nobody has a name for reads as <b>IRREGULAR</b> rather than as whatever it started from.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Commanded speed</h2><span class="k" id="cruiseNote"></span></div>
+        <label class="slider"><span class="hd"><span class="k">Hold this cruise</span><b id="vCruise">4.0 m/s</b></span>
+          <input type="range" id="rCruise" min="1.5" max="6" step="0.1" value="4"></label>
+        <p class="note">The reward is speed tracking, not distance, and the command is an input to the
+        policy. Move it and watch the learned gait change its cycle time, stride and duty factor to keep up
+        — the hand-tuned one cannot, because it has no feedback layer.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>The machine</h2><span class="k" id="machineNote"></span></div>
+        <select id="selServo" class="sel"></select>
+        <p class="note">The servo's torque-speed line drives the joints. Pick an undersized one and the legs
+        give way under load and the chassis sags. Changing it changes the robot, so anything already learned
+        is discarded.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Navigation</h2><span class="k" id="navNote"></span></div>
+        <div class="row2">
+          <button class="btn" id="btnNav" data-on="true">Follow route</button>
+          <button class="btn" id="btnRoute" data-on="true">Show route</button>
+        </div>
+        <p class="note">Every course carries a route, and the corridor is fenced by two
+        invisible walls. With the autopilot on, the policy's own steering action drives the
+        yaw and the machine works its way to each waypoint in turn — on the slalom that is the
+        only way past, because the walls are taller than a leg can reach. Touch the turn keys
+        and steering hands back to you until you let go.</p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Locomotion</h2></div>
+        <div class="pad">
+          <button class="btn" data-cmd="turnL">↺</button>
+          <button class="btn" data-cmd="fwd">▲</button>
+          <button class="btn" data-cmd="turnR">↻</button>
+          <button class="btn" data-cmd="left">◀</button>
+          <button class="btn" data-cmd="stop">■</button>
+          <button class="btn" data-cmd="right">▶</button>
+          <span></span>
+          <button class="btn" data-cmd="back">▼</button>
+          <span></span>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Parameters</h2><span class="k" id="paramLock"></span></div>
+        <div id="sliders"></div>
+      </div>
+    </aside>
+  </main>
+</div>

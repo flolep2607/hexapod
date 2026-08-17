@@ -1,0 +1,864 @@
+//! Headless driver for the hexapod core: train a policy, benchmark the
+//! simulator, or check how a learned policy transfers to courses it never saw.
+//!
+//! ```text
+//! hexapod train  [--course mixed] [--iters 200] [--seed 1] [--preset tripod]
+//! hexapod bench  [--course mixed]
+//! hexapod sweep  [--iters 150]
+//! hexapod speed  [--iters 200]      commanded vs achieved speed
+//! hexapod servo                     the same gait on every servo
+//! ```
+//!
+//! `--course` takes any of `flat steps rubble gaps mixed ramps slalom slick
+//! gauntlet`, matched case-insensitively against the names the simulator
+//! defines; `hexapod courses` prints them as JSON for the web build.
+//!
+//! `--leg-mass G` overrides the swinging mass of one leg in grams; `0` makes
+//! the legs weightless, which is what the simulator assumed before it had a
+//! leg-inertia model.
+//!
+//! `--legs N` sets the frame: any even count from 4 to 10. Four legs start on
+//! the crawl rather than the alternating gait, because a trot stands on two
+//! diagonal feet and this simulator judges stability statically.
+//!
+//! `--servo NAME` picks the actuator the simulator drives its joints with, and
+//! `--mass` / `--scale` the machine it is driving. They change what the
+//! optimiser converges to, not just what the bill of materials says.
+
+use std::time::Instant;
+
+use hexapod_core::ars::ArsConfig;
+use hexapod_core::hardware::{shortlist, Build, Provenance, TorqueMeter, PRICES_CHECKED, SERVOS};
+use hexapod_core::sim::Sim;
+use hexapod_core::power::{parts_of, solve, Kind, Sizing, TorqueTrace};
+use hexapod_core::policy::Preset;
+use hexapod_core::sim::{evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT};
+use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("train");
+
+    let course = parse_course(flag(&args, "--course").unwrap_or_else(|| "mixed".into()));
+    let iters: usize = flag(&args, "--iters")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let seed: u64 = flag(&args, "--seed")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let frame = Frame::new(
+        flag(&args, "--legs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6),
+    );
+    let preset = match flag(&args, "--preset") {
+        Some(v) => match v.as_str() {
+            "ripple" => Preset::Ripple,
+            "wave" => Preset::Wave,
+            "tripod" | "alternate" | "trot" => Preset::Tripod,
+            other => {
+                eprintln!("unknown preset {other:?}; try tripod, ripple or wave");
+                std::process::exit(2)
+            }
+        },
+        // Six legs and up start on the alternating gait; four have to crawl,
+        // because a trot is not statically stable and this simulator judges
+        // stability statically.
+        None => Preset::default_for(frame),
+    };
+
+    let build = build_from(&args);
+    let servo = flag(&args, "--servo").and_then(|name| {
+        SERVOS
+            .iter()
+            .find(|s| s.part.eq_ignore_ascii_case(&name))
+            .or_else(|| {
+                eprintln!("unknown servo {name:?}; known: {}", servo_names());
+                std::process::exit(2)
+            })
+    });
+    let mut phys = build.physics(servo);
+    // Per-leg swinging mass, grams. `0` makes the legs weightless, which is
+    // what the simulator assumed before there was a leg-inertia model at all.
+    if let Some(g) = flag(&args, "--leg-mass").and_then(|v| v.parse::<f64>().ok()) {
+        phys.leg = if g <= 0.0 {
+            hexapod_core::LegMass::WEIGHTLESS
+        } else {
+            let total = g / 1000.0;
+            hexapod_core::LegMass {
+                femur_kg: total * 0.556,
+                tibia_kg: total * 0.444,
+            }
+        };
+    }
+
+    let mut cfg = ArsConfig::default();
+    if let Some(v) = flag(&args, "--dirs").and_then(|v| v.parse().ok()) {
+        cfg.n_dirs = v;
+    }
+    if let Some(v) = flag(&args, "--top").and_then(|v| v.parse().ok()) {
+        cfg.n_top = v;
+    }
+    if let Some(v) = flag(&args, "--alpha").and_then(|v| v.parse().ok()) {
+        cfg.alpha = v;
+    }
+    if let Some(v) = flag(&args, "--sigma").and_then(|v| v.parse().ok()) {
+        cfg.sigma = v;
+    }
+    if let Some(v) = flag(&args, "--horizon").and_then(|v| v.parse().ok()) {
+        cfg.horizon = v;
+    }
+
+    match cmd {
+        "bench" => bench(frame, course, seed, phys),
+        "bom" => bom(frame, course, seed, iters, cfg, phys, build),
+        "sweep" => sweep(frame, iters, cfg, phys, seed),
+        "speed" => speed(frame, course, seed, iters, cfg, phys),
+        "servo" => servo_shootout(frame, course, seed, iters, cfg, build),
+        "servos" => servos_json(),
+        "parts" => parts_json(),
+        "courses" => courses_json(),
+        "system" => system(frame, course, seed, iters, cfg, phys, &args),
+        _ => train(frame, course, seed, iters, preset, cfg, phys),
+    }
+}
+
+fn servo_names() -> String {
+    SERVOS
+        .iter()
+        .map(|s| s.part)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn build_from(args: &[String]) -> Build {
+    let mut build = Build::default();
+    if let Some(v) = flag(args, "--mass").and_then(|v| v.parse().ok()) {
+        build.mass_kg = v;
+    }
+    if let Some(v) = flag(args, "--scale").and_then(|v| v.parse().ok()) {
+        build.scale = v;
+    }
+    build
+}
+
+fn flag(args: &[String], name: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).cloned()
+}
+
+fn parse_course(s: String) -> Course {
+    hexapod_core::terrain::COURSES
+        .iter()
+        .copied()
+        .find(|c| c.name().eq_ignore_ascii_case(&s))
+        .unwrap_or(Course::Mixed)
+}
+
+fn train(
+    frame: Frame,
+    course: Course,
+    seed: u64,
+    iters: usize,
+    preset: Preset,
+    cfg: ArsConfig,
+    phys: Physics,
+) {
+    let terrain = Terrain::new(course, seed);
+    let mut t = Trainer::new(Policy::seeded(preset, frame), cfg, phys, seed ^ 0xA5A5);
+
+    println!(
+        "machine: {} on {} legs | {:.2} kg, scale {:.3}, servo {:.1} kg-cm at {:.0} rpm no-load, mu {:.2}",
+        frame.label(),
+        frame.legs(),
+        phys.mass_kg,
+        phys.scale,
+        phys.actuator.stall_nm * hexapod_core::hardware::NM_TO_KGCM,
+        phys.actuator.omega_max * 60.0 / std::f64::consts::TAU,
+        phys.mu
+    );
+    println!(
+        "legs: {:.0} g of swinging mass each, {:.0} g in total ({:.0}% of the machine)",
+        phys.leg.total() * 1000.0,
+        phys.swing_mass(frame) * 1000.0,
+        phys.swing_mass(frame) / phys.mass_kg * 100.0
+    );
+    println!(
+        "commanded speeds sampled from {CRUISE_MIN:.1} to {CRUISE_MAX:.1} m/s; \
+         scored on the mean over 2.0 / 4.0 / 5.5"
+    );
+    println!(
+        "course {} seed {}  |  ARS dirs={} top={} alpha={} sigma={} horizon={}s",
+        course.name(),
+        seed,
+        cfg.n_dirs,
+        cfg.n_top,
+        cfg.alpha,
+        cfg.sigma,
+        cfg.horizon
+    );
+    println!(
+        "obstacles: {}  |  route: {} waypoints, corridor +-{:.1} m between two walls",
+        terrain.obstacles.len(),
+        terrain.waypoints.len(),
+        terrain.wall_x()
+    );
+
+    let start = Instant::now();
+    t.record_baseline(&terrain);
+    println!(
+        "\nbaseline  reward {:8.2}   distance {:6.2} m   {}",
+        t.baseline_reward,
+        t.baseline_distance,
+        if t.last_eval.fell { "FELL" } else { "survived" }
+    );
+    println!(
+        "\n{:>5}  {:>9}  {:>9}  {:>8}  {:>8}  {:>7}  {:>6}  {:>7}",
+        "iter", "reward", "best", "v err", "slip m", "stub", "CoT", "fell"
+    );
+
+    for i in 1..=iters {
+        t.iterate(&terrain);
+        if i % (iters / 20).max(1) == 0 || i == iters {
+            let e = t.last_eval;
+            println!(
+                "{i:>5}  {:>9.2}  {:>9.2}  {:>8.2}  {:>8.2}  {:>7.2}  {:>6.2}  {:>7}",
+                e.reward,
+                t.best_reward,
+                e.speed_error,
+                e.slip,
+                e.stub_total,
+                e.cot,
+                if e.fell { "yes" } else { "" }
+            );
+        }
+    }
+
+    let secs = start.elapsed().as_secs_f64();
+    let best = t.best_policy();
+    let g = best.gait();
+
+    println!("\n--- learned gait ---");
+    println!("cycle time    {:6.3} s", g.cycle);
+    println!("stride        {:6.3} m", g.stride);
+    println!("step height   {:6.3} m", g.step_h);
+    println!("body height   {:6.3} m", g.body_h);
+    println!("stance width  {:6.3} m", g.stance_w);
+    println!("duty          {:6.3}", g.duty);
+    print!("phase offsets ");
+    for (i, o) in g.offsets.iter().enumerate() {
+        print!("{}={:.3} ", frame.name(i), o);
+    }
+    println!("\nfeedback norm {:6.3}", best.feedback_norm());
+
+    let gain = if t.baseline_reward.abs() > 1e-6 {
+        (t.best_reward - t.baseline_reward) / t.baseline_reward.abs() * 100.0
+    } else {
+        0.0
+    };
+    println!("\n--- result ---");
+    println!(
+        "reward   {:8.2}  ->  {:8.2}   ({gain:+.0}%)",
+        t.baseline_reward, t.best_reward
+    );
+    println!(
+        "distance {:8.2}  ->  {:8.2} m",
+        t.baseline_distance, t.best_distance
+    );
+    println!(
+        "{} rollouts in {:.1}s  ({:.0} rollouts/s)",
+        t.rollouts,
+        secs,
+        t.rollouts as f64 / secs
+    );
+    println!("\n{}", sparkline(&t.curve));
+
+    println!("\n--- speed tracking ---");
+    speed_table(&terrain, &Policy::seeded(preset, frame), &best, &phys, cfg.horizon);
+}
+
+/// Commanded speed against achieved speed, for the baseline and the learned
+/// policy. This is the whole point of the reward: the hand-tuned gait has one
+/// speed it can walk at, and the learned one has a range.
+fn speed_table(
+    terrain: &Terrain,
+    base: &Policy,
+    learned: &Policy,
+    phys: &Physics,
+    horizon: f64,
+) {
+    println!(
+        "{:>10} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>7}",
+        "commanded", "base m/s", "base err", "got m/s", "err", "cycle", "stride", "duty"
+    );
+    let mut sum_b = 0.0;
+    let mut sum_l = 0.0;
+    let speeds = [2.0, 2.75, 3.5, 4.25, 5.0, 5.75];
+    for &v in speeds.iter() {
+        let a = rollout(terrain, base, phys, horizon, Cmd::at(v), None);
+        let b = rollout(terrain, learned, phys, horizon, Cmd::at(v), None);
+        let av = a.distance / (a.steps as f64 * DT);
+        let bv = b.distance / (b.steps as f64 * DT);
+        sum_b += a.speed_error;
+        sum_l += b.speed_error;
+        println!(
+            "{v:>9.2}  {av:>9.2} {:>9.2} {bv:>9.2} {:>9.2} {:>8.3} {:>8.3} {:>7.3}",
+            a.speed_error, b.speed_error, b.mean_cycle, b.mean_stride, b.mean_duty
+        );
+    }
+    let n = speeds.len() as f64;
+    println!("{:>10} {:>19.2} {:>19.2}", "mean err", sum_b / n, sum_l / n);
+    println!(
+        "\ncycle, stride and duty are the learned policy's *online* values,\n\
+         averaged over the rollout. A speed-conditioned policy moves them."
+    );
+}
+
+fn bench(frame: Frame, course: Course, seed: u64, phys: Physics) {
+    let terrain = Terrain::new(course, seed);
+    let p = Policy::seeded(Preset::default_for(frame), frame);
+
+    let n = 400;
+    let start = Instant::now();
+    let mut steps = 0usize;
+    for _ in 0..n {
+        steps += rollout(&terrain, &p, &phys, 8.0, Cmd::at(4.0), None).steps;
+    }
+    let secs = start.elapsed().as_secs_f64();
+
+    println!("course {}", course.name());
+    println!("{n} rollouts, {steps} steps in {secs:.2}s");
+    println!("{:.0} steps/s", steps as f64 / secs);
+    println!("{:.2} us/step", secs / steps as f64 * 1e6);
+    println!(
+        "{:.1} simulated seconds per wall second",
+        steps as f64 * DT / secs
+    );
+}
+
+/// Train on MIXED, then check the policy on courses it never trained on.
+fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
+    let train_terrain = Terrain::new(Course::Mixed, seed);
+    let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+    t.record_baseline(&train_terrain);
+    for _ in 0..iters {
+        t.iterate(&train_terrain);
+    }
+
+    let base = Policy::seeded(Preset::default_for(frame), frame);
+    let best = t.best_policy();
+
+    println!("trained {iters} iterations on MIXED seed {seed}\n");
+    println!(
+        "{:<10} {:>10} {:>10} {:>11} {:>11} {:>9} {:>7} {:>9}",
+        "course", "base rwd", "learn rwd", "base dist", "learn dist", "waypoints", "fell", "verdict"
+    );
+
+    let mut plan: Vec<(Course, u64)> = hexapod_core::terrain::COURSES
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (*c, seed + 100 * i as u64))
+        .collect();
+    // MIXED is what it trained on, so run it on the training seed as well.
+    plan.insert(4, (Course::Mixed, seed));
+    for (course, cseed) in plan {
+        let terr = Terrain::new(course, cseed);
+        let a = evaluate(&terr, &base, &phys, cfg.horizon);
+        let b = evaluate(&terr, &best, &phys, cfg.horizon);
+        println!(
+            "{:<10} {:>10.2} {:>10.2} {:>10.2}m {:>10.2}m {:>4} ->{:>4} {:>7} {:>9}",
+            format!("{}{}", course.name(), if cseed == seed { "" } else { "*" }),
+            a.reward,
+            b.reward,
+            a.distance,
+            b.distance,
+            a.reached,
+            b.reached,
+            match (a.fell, b.fell) {
+                (true, true) => "both",
+                (true, false) => "base",
+                (false, true) => "learned",
+                _ => "",
+            },
+            if b.reward > a.reward { "better" } else { "worse" }
+        );
+    }
+    println!("\n* = course seed the policy never trained on");
+    println!(
+        "\"fell\" marks which side went over in at least one of the three\n\
+         evaluation speeds. Reward is not distance: a policy can score better\n\
+         by taking fewer penalties over less ground."
+    );
+}
+
+/// Size the servos for a build, comparing the hand-tuned gait against a
+/// trained one on the same machine.
+fn bom(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics, build: Build) {
+    let terrain = Terrain::new(course, seed);
+    let base = Policy::seeded(Preset::default_for(frame), frame);
+
+    let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+    t.record_baseline(&terrain);
+    for _ in 0..iters {
+        t.iterate(&terrain);
+    }
+    let learned = t.best_policy();
+
+    let measure = |p: &Policy| {
+        let g = p.gait();
+        let mut s = Sim::default();
+        s.reset(&terrain, &g, &phys);
+        let mut m = TorqueMeter::default();
+        for _ in 0..(cfg.horizon / hexapod_core::DT) as usize {
+            s.step(&terrain, p, &g, hexapod_core::DT, Cmd::at(4.0));
+            m.observe(&s, &build);
+            if s.fallen {
+                break;
+            }
+        }
+        m
+    };
+
+    let links = build.link_mm();
+    println!(
+        "build: {} ({} legs, {} joints), {:.1} kg, scale {:.3}",
+        frame.label(),
+        frame.legs(),
+        frame.legs() * 3,
+        build.mass_kg,
+        build.scale
+    );
+    println!(
+        "links: coxa {:.0} mm, femur {:.0} mm, tibia {:.0} mm",
+        links[0], links[1], links[2]
+    );
+    println!(
+        "allowances: dynamic x{:.2}, traction {:.0}%, safety x{:.2}\n",
+        build.dynamic_factor,
+        build.traction_ratio * 100.0,
+        build.safety
+    );
+
+    println!(
+        "{:<12} {:>9} {:>9} {:>9} {:>12} {:>12}",
+        "gait", "coxa", "femur", "tibia", "peak foot N", "required"
+    );
+    let mut required = 0.0f64;
+    for (name, p) in [("hand-tuned", &base), ("learned", &learned)] {
+        let m = measure(p);
+        let k = m.peak_kgcm();
+        let req = m.required_kgcm(&build);
+        if name == "learned" {
+            required = req;
+        }
+        println!(
+            "{name:<12} {:>8.2} {:>8.2} {:>8.2} {:>11.1} {:>10.1} kg-cm",
+            k[0], k[1], k[2], m.peak_foot_load, req
+        );
+    }
+
+    let gb = base.gait();
+    let gl = learned.gait();
+    println!(
+        "\nstance width {:.2} -> {:.2} sim units ({:.0} -> {:.0} mm)",
+        gb.stance_w,
+        gl.stance_w,
+        gb.stance_w * build.scale * 1000.0,
+        gl.stance_w * build.scale * 1000.0
+    );
+
+    let joints = frame.legs() * 3;
+    println!("\n--- servos clearing {required:.1} kg-cm, {joints} per robot ---");
+    println!(
+        "{:<11} {:<10} {:>7} {:>6} {:>8} {:>16} {:>14}",
+        "part", "maker", "kg-cm", "head", "bus", "full set (USD)", "set mass"
+    );
+    for s in shortlist(required) {
+        let (lo, hi) = s.build_cost(joints);
+        println!(
+            "{:<11} {:<10} {:>7.1} {:>5.2}x {:>8} {:>7.0} - {:<6.0} {:>11.2} kg",
+            s.part,
+            s.maker,
+            s.stall_kgcm,
+            s.headroom(required),
+            s.bus.name(),
+            lo,
+            hi,
+            s.set_mass_kg(joints)
+        );
+    }
+
+    println!("\n--- excluded (insufficient torque) ---");
+    for s in SERVOS.iter().filter(|s| !s.meets(required)) {
+        println!(
+            "{:<11} {:>7.1} kg-cm  ({:.2}x required)",
+            s.part,
+            s.stall_kgcm,
+            s.headroom(required)
+        );
+    }
+
+    println!("\nprices: vendor-checked {PRICES_CHECKED}; marketplace bands indicative.");
+    for s in SERVOS.iter().filter(|s| s.provenance == Provenance::Vendor) {
+        println!(
+            "  {:<10} ${:>6.2} at {:<14} {}",
+            s.part,
+            s.vendor_usd.unwrap_or(0.0),
+            s.vendor_name,
+            s.source
+        );
+    }
+}
+
+/// Train once, then report commanded speed against achieved speed.
+///
+/// This is the answer to the question the old reward could not ask. The
+/// earlier version rewarded raw distance, so the optimiser pinned cycle time
+/// and stride to their bounds and ran flat out; the version after that hard-
+/// coded a single 4 m/s cruise, which merely moved the specialisation. Here
+/// the command is an input, sampled per rollout and fed to the policy, so a
+/// gait that only works at one speed cannot score.
+fn speed(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
+    let terrain = Terrain::new(course, seed);
+    let base = Policy::seeded(Preset::default_for(frame), frame);
+    let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+    t.record_baseline(&terrain);
+    for _ in 0..iters {
+        t.iterate(&terrain);
+    }
+    let learned = t.best_policy();
+
+    println!(
+        "{} seed {}, {iters} iterations, commanded speeds sampled from {CRUISE_MIN:.1} to {CRUISE_MAX:.1} m/s\n",
+        course.name(),
+        seed
+    );
+    speed_table(&terrain, &base, &learned, &phys, cfg.horizon);
+
+    let gb = base.gait();
+    let gl = learned.gait();
+    println!(
+        "\nnominal gait speed (stride / duty / cycle): {:.2} -> {:.2} m/s",
+        gb.nominal_speed(),
+        gl.nominal_speed()
+    );
+    println!(
+        "the learned policy also modulates cycle and stride online, which is\n\
+         what lets one gait cover the range instead of one speed."
+    );
+}
+
+/// The same course and the same learner, once per servo.
+///
+/// The servo is not a post-hoc sizing decision any more: its torque-speed line
+/// drives the joints, so it changes what the optimiser converges to.
+fn servo_shootout(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, build: Build) {
+    let terrain = Terrain::new(course, seed);
+    println!(
+        "{} seed {}, {iters} iterations per servo, {:.2} kg at scale {:.3}\n",
+        course.name(),
+        seed,
+        build.mass_kg,
+        build.scale
+    );
+    println!(
+        "{:<11} {:>7} {:>8} {:>9} {:>9} {:>8} {:>7} {:>7} {:>6}",
+        "servo", "kg-cm", "rpm", "base rwd", "best rwd", "peak/stall", "cycle", "duty", "CoT"
+    );
+
+    for servo in SERVOS.iter() {
+        let phys = build.physics(Some(servo));
+        let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+        t.record_baseline(&terrain);
+        for _ in 0..iters {
+            t.iterate(&terrain);
+        }
+        let best = t.best_policy();
+        let g = best.gait();
+        let e = evaluate(&terrain, &best, &phys, cfg.horizon);
+        println!(
+            "{:<11} {:>7.1} {:>8.0} {:>9.2} {:>9.2} {:>9.2}x {:>7.3} {:>7.3} {:>6.2}",
+            servo.part,
+            servo.stall_kgcm,
+            phys.actuator.omega_max * 60.0 / std::f64::consts::TAU,
+            t.baseline_reward,
+            t.best_reward,
+            e.peak_servo_load,
+            g.cycle,
+            g.duty,
+            e.cot
+        );
+    }
+    println!(
+        "\npeak/stall above 1.00 means the servo was driven past its rating and\n\
+         the leg gave way under load."
+    );
+}
+
+/// Emit the servo catalogue as JSON. `build.sh` inlines this into the web
+/// bundle so the browser and the simulator share one source of truth.
+fn servos_json() {
+    println!("{{");
+    println!("  \"checked\": \"{}\",", PRICES_CHECKED);
+    println!("  \"servos\": [");
+    for (i, s) in SERVOS.iter().enumerate() {
+        let comma = if i + 1 == SERVOS.len() { "" } else { "," };
+        println!(
+            "    {{\"part\":{:?},\"maker\":{:?},\"stall\":{},\"volts\":{},\"mass\":{},\
+             \"speed\":{},\"bus\":{:?},\"metal\":{},\"feedback\":{},\"low\":{},\"high\":{},\
+             \"vendor\":{},\"vendorName\":{:?},\"source\":{:?},\"checked\":{},\"note\":{:?}}}{}",
+            s.part,
+            s.maker,
+            s.stall_kgcm,
+            s.at_volts,
+            s.mass_g,
+            s.speed_s60,
+            s.bus.name(),
+            s.metal_gear,
+            s.feedback,
+            s.market_usd.0,
+            s.market_usd.1,
+            match s.vendor_usd {
+                Some(v) => format!("{v}"),
+                None => "null".into(),
+            },
+            s.vendor_name,
+            s.source,
+            s.provenance == Provenance::Vendor,
+            s.note,
+            comma
+        );
+    }
+    println!("  ]");
+    println!("}}");
+}
+
+/// Whole-machine sizing: current, battery, regulator, controller, sensors.
+fn system(
+    frame: Frame,
+    course: Course,
+    seed: u64,
+    iters: usize,
+    cfg: ArsConfig,
+    phys: Physics,
+    args: &[String],
+) {
+    let scale = phys.scale;
+    let mut sizing = Sizing::default();
+    if let Some(v) = flag(args, "--chassis").and_then(|v| v.parse().ok()) {
+        sizing.chassis_kg = v;
+    }
+    if let Some(v) = flag(args, "--runtime").and_then(|v| v.parse().ok()) {
+        sizing.runtime_min = v;
+    }
+
+    let terrain = Terrain::new(course, seed);
+    let mut policy = Policy::seeded(Preset::default_for(frame), frame);
+    let mut label = "hand-tuned";
+    if iters > 0 {
+        let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+        t.record_baseline(&terrain);
+        for _ in 0..iters {
+            t.iterate(&terrain);
+        }
+        policy = t.best_policy();
+        label = "learned";
+    }
+
+    let trace = TorqueTrace::record(&terrain, &policy, &phys, 8.0);
+    println!(
+        "gait: {label} on {} | chassis {:.2} kg | femur {:.0} mm | target runtime {:.0} min\n",
+        course.name(),
+        sizing.chassis_kg,
+        0.8 * scale * 1000.0,
+        sizing.runtime_min
+    );
+
+    println!(
+        "{:<10} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8}",
+        "servo", "all-up", "needs", "battery", "mean", "peak", "runtime", "total"
+    );
+    println!(
+        "{:<10} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8}",
+        "", "kg", "kg-cm", "kg", "A", "A", "min", "USD"
+    );
+
+    let mut best: Option<(f64, &'static str)> = None;
+    for servo in hexapod_core::SERVOS {
+        let s = solve(&trace, servo, &sizing);
+        let verdict = if !s.converged {
+            s.failure
+        } else if !s.servo_ok {
+            "under-torqued"
+        } else {
+            ""
+        };
+        println!(
+            "{:<10} {:>7.2} {:>8.1} {:>8.2} {:>7.2} {:>7.1} {:>8.0} {:>8.0}  {}",
+            servo.part,
+            s.all_up_kg,
+            s.required_kgcm,
+            s.battery_kg,
+            s.mean_amps,
+            s.peak_amps,
+            s.runtime_min,
+            s.cost_usd,
+            verdict
+        );
+        if s.converged && s.servo_ok && best.map_or(true, |b| s.cost_usd < b.0) {
+            best = Some((s.cost_usd, servo.part));
+        }
+    }
+
+    let Some((_, pick)) = best else {
+        println!("\nno servo in the catalogue can build this machine.");
+        return;
+    };
+    let servo = hexapod_core::SERVOS.iter().find(|s| s.part == pick).unwrap();
+    let s = solve(&trace, servo, &sizing);
+
+    println!("\n=== cheapest viable build: {} ===\n", servo.part);
+    println!("converged in {} iterations of the mass/current loop", s.iterations);
+    println!("  chassis      {:>6.2} kg", s.chassis_kg);
+    println!("  18x servo    {:>6.2} kg", s.servo_kg);
+    println!("  battery      {:>6.2} kg", s.battery_kg);
+    println!("  electronics  {:>6.2} kg", s.electronics_kg);
+    println!("  ------------------------");
+    println!("  all-up       {:>6.2} kg", s.all_up_kg);
+    println!();
+    println!(
+        "  peak joint torque {:.1} kg-cm vs {:.1} kg-cm stall ({:.2}x)",
+        s.peak_torque_kgcm,
+        servo.stall_kgcm,
+        servo.stall_kgcm / s.peak_torque_kgcm
+    );
+    println!(
+        "  mean draw {:.2} A ({:.0} W), peak {:.1} A, {:.0} min endurance",
+        s.mean_amps, s.mean_watts, s.peak_amps, s.runtime_min
+    );
+
+    println!("\n--- parts ---");
+    let line = |kind: &str, name: &str, qty: usize, unit: f64, note: &str| {
+        println!(
+            "  {:<13} {:<30} x{:<3} ${:>7.2}   {}",
+            kind,
+            name,
+            qty,
+            unit * qty as f64,
+            note
+        );
+    };
+    line(
+        "SERVO",
+        servo.part,
+        frame.legs() * 3,
+        servo.unit_low(),
+        servo.bus.name(),
+    );
+    if let Some(b) = s.battery {
+        line("BATTERY", b.name, 1, b.unit_price(), b.note);
+    }
+    match s.regulator {
+        Some(r) => line("REGULATOR", r.name, 1, r.unit_price(), r.note),
+        None => println!(
+            "  {:<13} {:<30} {}",
+            "REGULATOR", "none", "pack voltage matches the servo bus"
+        ),
+    }
+    if let Some(d) = s.driver {
+        line("DRIVER", d.name, s.driver_count, d.unit_price(), d.note);
+    }
+    if let Some(c) = s.compute {
+        line("COMPUTE", c.name, 1, c.unit_price(), c.note);
+    }
+    let n = s.sensing;
+    if let Some(r) = parts_of(Kind::Ranger).next() {
+        line("RANGEFINDER", r.name, n.rangers, r.unit_price(), "one per leg");
+    }
+    if let Some(m) = parts_of(Kind::Support).next() {
+        line("SUPPORT", m.name, 1, m.unit_price(), m.note);
+    }
+    if let Some(i) = parts_of(Kind::Imu).next() {
+        line("IMU", i.name, 1, i.unit_price(), "pitch and roll");
+    }
+    println!("  {:<13} {:<30}     ${:>7.2}", "", "TOTAL", s.cost_usd);
+
+    println!("\n--- what the policy demands of the sensors ---");
+    println!("  the observation vector is not free: each input is a measurement.");
+    println!(
+        "  6x terrain lookahead  ->  {:.2} m range, >= {:.0} Hz, {:.0} mm resolution",
+        n.lookahead_m, n.min_rate_hz, n.resolution_mm
+    );
+    println!("  pitch, roll           ->  IMU at the control rate");
+    println!(
+        "  stability margin      ->  which feet are loaded: {}",
+        if n.contact_from_bus {
+            "free, the servo bus reports load"
+        } else {
+            "needs 6 contact switches or FSRs"
+        }
+    );
+}
+
+/// The course list, so the dashboard's buttons come from the same enum the
+/// simulator switches on rather than a hand-kept copy of it.
+fn courses_json() {
+    let names: Vec<String> = hexapod_core::terrain::COURSES
+        .iter()
+        .map(|c| format!("\"{}\"", c.name()))
+        .collect();
+    println!("{{\"courses\":[{}]}}", names.join(","));
+}
+
+/// Emit the non-servo component catalogue as JSON for the web bundle.
+fn parts_json() {
+    use hexapod_core::power::PARTS;
+    println!("{{ \"parts\": [");
+    for (i, p) in PARTS.iter().enumerate() {
+        let comma = if i + 1 == PARTS.len() { "" } else { "," };
+        println!(
+            "    {{\"name\":{:?},\"maker\":{:?},\"kind\":{:?},\"mass\":{},\"low\":{},\"high\":{},\
+             \"vendor\":{},\"vendorName\":{:?},\"source\":{:?},\"note\":{:?},\
+             \"accuracy\":{},\"volts\":{},\"capacity\":{},\"rating\":{},\"unit\":{}}}{}",
+            p.name,
+            p.maker,
+            p.kind.name(),
+            p.mass_g,
+            p.market_usd.0,
+            p.market_usd.1,
+            match p.vendor_usd {
+                Some(v) => format!("{v}"),
+                None => "null".into(),
+            },
+            p.vendor_name,
+            p.source,
+            p.note,
+            p.accuracy_mm,
+            p.volts,
+            p.capacity,
+            p.rating,
+            p.unit_price(),
+            comma
+        );
+    }
+    println!("  ]");
+    println!("}}");
+}
+
+fn sparkline(v: &[f32]) -> String {
+    if v.is_empty() {
+        return String::new();
+    }
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let lo = v.iter().cloned().fold(f32::INFINITY, f32::min);
+    let hi = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let span = (hi - lo).max(1e-6);
+    let step = (v.len() / 100).max(1);
+    let mut s = String::new();
+    for chunk in v.chunks(step) {
+        let m = chunk.iter().sum::<f32>() / chunk.len() as f32;
+        let i = (((m - lo) / span) * 7.0).round().clamp(0.0, 7.0) as usize;
+        s.push(BARS[i]);
+    }
+    format!("{s}   [{lo:.1} .. {hi:.1}]")
+}

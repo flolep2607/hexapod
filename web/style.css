@@ -1,0 +1,792 @@
+/* Hexapod Gait Lab — instrument-panel styling.
+ *
+ * Deliberately single-theme: this is a lab bench readout, and the white
+ * ground with one red accent is the whole point of the look. Every colour is
+ * painted explicitly so the page holds together on any host background.
+ */
+
+:root {
+  --paper: #f1f1ee;
+  --panel: #ffffff;
+  --sunk: #f7f7f5;
+  --rule: #d8d8d2;
+  --rule-soft: #e8e8e3;
+  --ink: #141416;
+  --graphite: #55554f;
+  --dim: #8a8a82;
+  --accent: #e5391d;
+  --accent-soft: #fbe7e2;
+  --pass: #2f7d55;
+  --fail: #c0341c;
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+  --sans: "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
+
+  --gap: 10px;
+  --pad: 12px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ------------------------------------------------------------------ shell */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  height: 100vh;
+  padding: var(--gap);
+}
+
+.hdr {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  padding: 10px 16px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+}
+
+.wordmark {
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 26px;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  text-align: center;
+  line-height: 1;
+}
+
+.wordmark small {
+  display: block;
+  font-family: var(--mono);
+  font-weight: 400;
+  font-size: 9px;
+  letter-spacing: 0.42em;
+  text-indent: 0.42em;
+  color: var(--dim);
+  margin-top: 5px;
+}
+
+.chips {
+  display: flex;
+  gap: 22px;
+  align-items: baseline;
+}
+
+.chips.right {
+  justify-content: flex-end;
+}
+
+.chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chip b {
+  font-weight: 700;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.k {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--dim);
+  text-transform: uppercase;
+}
+
+.hot {
+  color: var(--accent);
+}
+
+/* ------------------------------------------------------------------- tabs */
+
+.tabs {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: var(--gap);
+}
+
+.tab {
+  position: relative;
+  appearance: none;
+  font: inherit;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  padding: 9px 12px;
+  background: var(--panel);
+  color: var(--graphite);
+  border: 1px solid var(--rule);
+  cursor: pointer;
+  text-align: left;
+}
+
+.tab::before {
+  content: "▪";
+  margin-right: 8px;
+  color: var(--dim);
+}
+
+.tab:hover {
+  border-color: var(--ink);
+}
+
+.tab[aria-selected="true"] {
+  background: var(--ink);
+  color: var(--panel);
+  border-color: var(--ink);
+}
+
+.tab[aria-selected="true"]::before {
+  content: "▲";
+  color: var(--accent);
+}
+
+.tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  border: 9px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+}
+
+/* ------------------------------------------------------------------- grid */
+
+.grid {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 320px;
+  gap: var(--gap);
+  min-height: 0;
+  flex: 1;
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: var(--pad);
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.stage {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pane {
+  position: absolute;
+  inset: 0;
+  display: none;
+  min-height: 0;
+}
+
+.pane[data-active="true"] {
+  display: flex;
+  flex-direction: column;
+}
+
+.pane.scroll {
+  overflow-y: auto;
+  padding: 18px;
+  gap: 18px;
+}
+
+/* --------------------------------------------------------------- sections */
+
+.sec {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.sec > h2 {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.sec-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  background: var(--sunk);
+  border: 1px solid var(--rule-soft);
+  padding: 5px 8px;
+}
+
+.sec-bar h2 {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.hd {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.hd .k {
+  letter-spacing: 0.1em;
+}
+
+/* Corner brackets, as on the reference instrument panels. */
+.br {
+  position: relative;
+  padding: 6px;
+}
+
+.br::before,
+.br::after,
+.br > i::before,
+.br > i::after {
+  content: "";
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--dim);
+}
+
+.br::before {
+  top: 0;
+  left: 0;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+.br::after {
+  top: 0;
+  right: 0;
+  border-left: 0;
+  border-bottom: 0;
+}
+
+.br > i::before {
+  bottom: 0;
+  left: 0;
+  border-right: 0;
+  border-top: 0;
+}
+
+.br > i::after {
+  bottom: 0;
+  right: 0;
+  border-left: 0;
+  border-top: 0;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+}
+
+/* ------------------------------------------------------------------ meters */
+
+.bars {
+  display: grid;
+  gap: 3px;
+}
+
+.bar {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  align-items: center;
+  gap: 7px;
+}
+
+.bar span {
+  color: var(--dim);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+
+.track {
+  position: relative;
+  height: 11px;
+  background: var(--sunk);
+  border: 1px solid var(--rule);
+  overflow: hidden;
+}
+
+.fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--ink) 0 4px,
+    transparent 4px 6px
+  );
+}
+
+.fill.warn {
+  background: repeating-linear-gradient(
+    90deg,
+    var(--accent) 0 4px,
+    transparent 4px 6px
+  );
+}
+
+.dials {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  justify-items: center;
+}
+
+.dial {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Square, and it has to stay square: the height comes from the canvas element's
+   own `height` attribute, which app.js pins as the CSS height. Change one and
+   change the other. */
+.dial canvas {
+  width: 84px;
+}
+
+.meter {
+  display: grid;
+  gap: 4px;
+}
+
+.meter .hd b {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ inputs */
+
+.btn {
+  appearance: none;
+  font: inherit;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 9px 10px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  cursor: pointer;
+}
+
+.btn:hover {
+  border-color: var(--ink);
+}
+
+.btn[data-on="true"] {
+  background: var(--ink);
+  color: var(--panel);
+  border-color: var(--ink);
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+
+.btn.primary[data-on="true"] {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sel {
+  appearance: none;
+  font: inherit;
+  width: 100%;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 9px 26px 9px 10px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  border-radius: 0;
+  cursor: pointer;
+  /* A caret drawn in the panel's own ink, so no external asset is needed. */
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 15px) 55%, calc(100% - 10px) 55%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.sel:hover {
+  border-color: var(--ink);
+}
+
+.btn:focus-visible,
+.tab:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.row2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.row3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  justify-items: stretch;
+}
+
+.pad .btn {
+  padding: 11px 0;
+  text-align: center;
+}
+
+.slider {
+  display: grid;
+  gap: 5px;
+}
+
+.slider .hd b {
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="range"] {
+  appearance: none;
+  width: 100%;
+  height: 14px;
+  background: transparent;
+  cursor: pointer;
+  margin: 0;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  background: var(--rule);
+}
+
+input[type="range"]::-moz-range-track {
+  height: 3px;
+  background: var(--rule);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 9px;
+  height: 16px;
+  margin-top: -7px;
+  background: var(--accent);
+  border: 0;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 9px;
+  height: 16px;
+  border-radius: 0;
+  background: var(--accent);
+  border: 0;
+}
+
+input[type="range"]:disabled::-webkit-slider-thumb {
+  background: var(--dim);
+}
+
+input[type="range"]:disabled::-moz-range-thumb {
+  background: var(--dim);
+}
+
+input[type="number"] {
+  font: inherit;
+  width: 100%;
+  padding: 6px 7px;
+  background: var(--sunk);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------- stage */
+
+.viewwrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+#view {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  cursor: grab;
+}
+
+#view:active {
+  cursor: grabbing;
+}
+
+.hud {
+  position: absolute;
+  padding: 12px 14px;
+  pointer-events: none;
+  color: var(--graphite);
+  white-space: pre-line;
+}
+
+.hud.tl {
+  top: 0;
+  left: 0;
+}
+
+.hud.tr {
+  top: 0;
+  right: 0;
+  text-align: right;
+}
+
+.hud.bl {
+  bottom: 0;
+  left: 0;
+}
+
+.hud.br2 {
+  bottom: 0;
+  right: 0;
+  text-align: right;
+  color: var(--accent);
+}
+
+.hud b {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.banner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 10px 18px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  opacity: 0;
+  transition: opacity 0.18s;
+  pointer-events: none;
+}
+
+.banner[data-on="true"] {
+  opacity: 1;
+}
+
+/* ------------------------------------------------------------------ tables */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  text-align: right;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--rule-soft);
+  white-space: nowrap;
+}
+
+th {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-weight: 400;
+  border-bottom: 1px solid var(--rule);
+}
+
+th:first-child,
+td:first-child {
+  text-align: left;
+}
+
+tr[data-pass="false"] td {
+  color: var(--dim);
+}
+
+.tag {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  border: 1px solid currentColor;
+}
+
+.tag.pass {
+  color: var(--pass);
+}
+
+.tag.fail {
+  color: var(--fail);
+}
+
+.tag.neutral {
+  color: var(--dim);
+}
+
+.scrollx {
+  overflow-x: auto;
+}
+
+/* Explanatory cells wrap and keep their sentence case; .k would shout them. */
+td.why {
+  text-align: left;
+  white-space: normal;
+  max-width: 30ch;
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* -------------------------------------------------------------- typography */
+
+.lede {
+  max-width: 68ch;
+  color: var(--graphite);
+  line-height: 1.65;
+}
+
+.lede b {
+  color: var(--ink);
+}
+
+.note {
+  color: var(--dim);
+  max-width: 78ch;
+  line-height: 1.6;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  background: var(--sunk);
+  border: 1px solid var(--rule-soft);
+  border-left: 2px solid var(--accent);
+}
+
+.stat b {
+  font-size: 17px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat.mute {
+  border-left-color: var(--graphite);
+}
+
+.statrow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+/* Four small readouts in a narrow rail: two columns, not four squeezed ones. */
+.statrow.tight {
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.console {
+  background: var(--sunk);
+  border: 1px solid var(--rule-soft);
+  padding: 8px;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  font-size: 10px;
+  line-height: 1.7;
+}
+
+.console div {
+  white-space: pre;
+}
+
+.console .t {
+  color: var(--accent);
+}
+
+.console .m {
+  color: var(--graphite);
+}
+
+.left .console {
+  height: 92px;
+}
+
+@media (max-width: 1180px) {
+  .grid {
+    grid-template-columns: 1fr;
+    grid-auto-rows: minmax(320px, auto);
+    height: auto;
+  }
+
+  .app {
+    height: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

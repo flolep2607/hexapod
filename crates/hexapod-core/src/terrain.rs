@@ -1,0 +1,752 @@
+//! Obstacle courses, represented as an axis-aligned height field.
+//!
+//! The field is a list of rectangular prisms (positive `top` = block,
+//! negative `top` = pit) bucketed along Z so that a height query touches only
+//! a handful of candidates. Height lookups sit in the innermost loop of every
+//! training rollout, so this is the one place worth keeping tight.
+//!
+//! A course is more than its obstacles. It is fenced by two invisible walls at
+//! the corridor edges — there is nothing outside them and a policy that wanders
+//! off is not solving anything — and it carries a **route**: a list of
+//! waypoints the machine is asked to reach in order. On the open courses the
+//! route runs straight down the middle and asking for it changes nothing. On
+//! the ones with something in the way it threads the gaps, which is the whole
+//! point of having it.
+
+use crate::math::Rng;
+
+/// Half-width of the walkable corridor, in metres. Also where the two
+/// invisible walls are: the robot cannot cross them, and neither can a rock.
+pub const CORRIDOR_HALF: f64 = 5.0;
+/// Course start, behind the robot's spawn.
+pub const Z_MIN: f64 = -6.0;
+/// Course end. Rollouts are scored on progress toward this.
+pub const Z_MAX: f64 = 64.0;
+
+/// Spacing of the waypoints on a course with nothing to steer around.
+const ROUTE_STEP: f64 = 8.0;
+/// How close counts as reached, in metres.
+pub const WAYPOINT_R: f64 = 1.6;
+
+const BUCKET: f64 = 2.0;
+const N_BUCKETS: usize = ((Z_MAX - Z_MIN) / BUCKET) as usize + 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Course {
+    Flat = 0,
+    Steps = 1,
+    Rubble = 2,
+    Gaps = 3,
+    Mixed = 4,
+    Ramps = 5,
+    Slalom = 6,
+    Slick = 7,
+    Gauntlet = 8,
+}
+
+/// Every course, in the order the dashboard lists them.
+pub const COURSES: [Course; 9] = [
+    Course::Flat,
+    Course::Steps,
+    Course::Rubble,
+    Course::Gaps,
+    Course::Mixed,
+    Course::Ramps,
+    Course::Slalom,
+    Course::Slick,
+    Course::Gauntlet,
+];
+
+impl Course {
+    pub fn from_u32(v: u32) -> Course {
+        COURSES.get(v as usize).copied().unwrap_or(Course::Flat)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Course::Flat => "FLAT",
+            Course::Steps => "STEPS",
+            Course::Rubble => "RUBBLE",
+            Course::Gaps => "GAPS",
+            Course::Mixed => "MIXED",
+            Course::Ramps => "RAMPS",
+            Course::Slalom => "SLALOM",
+            Course::Slick => "SLICK",
+            Course::Gauntlet => "GAUNTLET",
+        }
+    }
+}
+
+/// Friction multiplier of the base ground. Everything else is measured
+/// against it.
+pub const GRIP_GROUND: f64 = 1.0;
+/// Loose debris shifts underfoot; a foot on rubble grips noticeably less.
+pub const GRIP_RUBBLE: f64 = 0.62;
+/// A step tread is firm but its edge is not, and feet land near edges.
+pub const GRIP_STEP: f64 = 0.88;
+/// Down in a trench, on whatever collected there.
+pub const GRIP_PIT: f64 = 0.75;
+/// A sheet of ice. Thin enough to be no obstacle at all, and the reason the
+/// traction meter exists.
+pub const GRIP_ICE: f64 = 0.22;
+/// How thick that sheet is. It has to have *some* height or the height field,
+/// which resolves grip through whichever surface supplies the height, would
+/// never see it.
+const ICE_THICK: f64 = 0.01;
+/// Height of a slalom wall. Well above anything a leg can reach, so it is not
+/// an obstacle to climb — it is somewhere the machine cannot go.
+const WALL_TOP: f64 = 1.8;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Obstacle {
+    pub x0: f64,
+    pub x1: f64,
+    pub z0: f64,
+    pub z1: f64,
+    /// Height above ground for a block, or negative depth for a pit.
+    pub top: f64,
+    /// Friction multiplier of this surface, relative to the base ground.
+    pub grip: f64,
+}
+
+impl Obstacle {
+    #[inline]
+    fn contains(&self, x: f64, z: f64) -> bool {
+        x >= self.x0 && x <= self.x1 && z >= self.z0 && z <= self.z1
+    }
+}
+
+#[derive(Clone)]
+pub struct Terrain {
+    pub course: Course,
+    pub seed: u64,
+    pub obstacles: Vec<Obstacle>,
+    /// The route, in order. Always ends at the far end of the corridor.
+    pub waypoints: Vec<[f64; 2]>,
+    buckets: Vec<Vec<u16>>,
+}
+
+impl Terrain {
+    pub fn new(course: Course, seed: u64) -> Terrain {
+        let mut t = Terrain {
+            course,
+            seed,
+            obstacles: Vec::new(),
+            waypoints: Vec::new(),
+            buckets: vec![Vec::new(); N_BUCKETS],
+        };
+        t.generate();
+        t.finish_route();
+        t.rebuild_buckets();
+        t
+    }
+
+    /// Where the two invisible walls are, as a distance from the centreline.
+    #[inline]
+    pub fn wall_x(&self) -> f64 {
+        CORRIDOR_HALF
+    }
+
+    /// The waypoint at `i`, saturating at the last one so a machine that has
+    /// run the whole course still has something to aim at.
+    #[inline]
+    pub fn waypoint(&self, i: usize) -> [f64; 2] {
+        let n = self.waypoints.len();
+        if n == 0 {
+            return [0.0, Z_MAX];
+        }
+        self.waypoints[i.min(n - 1)]
+    }
+
+    /// Would a chassis of radius `r`, its underside at `under`, be inside
+    /// something here? The corridor walls answer this the same way a rock does,
+    /// which is the point: there is one obstruction test, not two.
+    pub fn obstructed(&self, x: f64, z: f64, r: f64, under: f64) -> bool {
+        if x.abs() > CORRIDOR_HALF - r {
+            return true;
+        }
+        self.height_disc(x, z, r) > under + 0.02
+    }
+
+    #[inline]
+    fn bucket_of(z: f64) -> usize {
+        let i = ((z - Z_MIN) / BUCKET).floor();
+        if i < 0.0 {
+            0
+        } else if i as usize >= N_BUCKETS {
+            N_BUCKETS - 1
+        } else {
+            i as usize
+        }
+    }
+
+    fn rebuild_buckets(&mut self) {
+        for b in self.buckets.iter_mut() {
+            b.clear();
+        }
+        for (i, ob) in self.obstacles.iter().enumerate() {
+            let b0 = Self::bucket_of(ob.z0);
+            let b1 = Self::bucket_of(ob.z1);
+            for b in b0..=b1 {
+                self.buckets[b].push(i as u16);
+            }
+        }
+    }
+
+    /// Terrain height at a point. Blocks win over pits where they overlap.
+    #[inline]
+    pub fn height(&self, x: f64, z: f64) -> f64 {
+        if !(Z_MIN..=Z_MAX).contains(&z) || x.abs() > CORRIDOR_HALF {
+            return 0.0;
+        }
+        let mut top = 0.0f64;
+        let mut pit = 0.0f64;
+        for &i in &self.buckets[Self::bucket_of(z)] {
+            let ob = &self.obstacles[i as usize];
+            if ob.contains(x, z) {
+                if ob.top >= 0.0 {
+                    if ob.top > top {
+                        top = ob.top;
+                    }
+                } else if ob.top < pit {
+                    pit = ob.top;
+                }
+            }
+        }
+        if top > 0.0 {
+            top
+        } else {
+            pit
+        }
+    }
+
+    /// Friction multiplier of the surface a foot standing here would be on.
+    ///
+    /// Whichever obstacle supplies the height supplies the grip, so a foot on
+    /// top of a rubble block gets the rubble's number and a foot beside it gets
+    /// the ground's.
+    pub fn grip(&self, x: f64, z: f64) -> f64 {
+        if !(Z_MIN..=Z_MAX).contains(&z) || x.abs() > CORRIDOR_HALF {
+            return GRIP_GROUND;
+        }
+        let mut top = 0.0f64;
+        let mut pit = 0.0f64;
+        let mut grip = GRIP_GROUND;
+        let mut pit_grip = GRIP_GROUND;
+        for &i in &self.buckets[Self::bucket_of(z)] {
+            let ob = &self.obstacles[i as usize];
+            if ob.contains(x, z) {
+                if ob.top >= 0.0 {
+                    if ob.top > top {
+                        top = ob.top;
+                        grip = ob.grip;
+                    }
+                } else if ob.top < pit {
+                    pit = ob.top;
+                    pit_grip = ob.grip;
+                }
+            }
+        }
+        if top > 0.0 {
+            grip
+        } else if pit < 0.0 {
+            pit_grip
+        } else {
+            GRIP_GROUND
+        }
+    }
+
+    /// Height a forward-looking sensor would report. The same as [`height`]
+    /// inside the corridor, and the fence outside it: the walls are invisible,
+    /// not undetectable, and a policy that cannot see them cannot avoid them.
+    ///
+    /// [`height`]: Terrain::height
+    #[inline]
+    pub fn probe(&self, x: f64, z: f64) -> f64 {
+        if x.abs() >= CORRIDOR_HALF {
+            WALL_TOP
+        } else {
+            self.height(x, z)
+        }
+    }
+
+    /// Surface gradient `(dy/dx, dy/dz)` around a point, by central difference.
+    /// Used for the downslope pull and for the cosine loss on normal load.
+    pub fn slope(&self, x: f64, z: f64) -> (f64, f64) {
+        const H: f64 = 0.12;
+        let gx = (self.height(x + H, z) - self.height(x - H, z)) / (2.0 * H);
+        let gz = (self.height(x, z + H) - self.height(x, z - H)) / (2.0 * H);
+        (gx, gz)
+    }
+
+    /// Highest point under a disc — used for body-clearance checks.
+    pub fn height_disc(&self, x: f64, z: f64, r: f64) -> f64 {
+        let mut h = self.height(x, z);
+        for k in 0..6 {
+            let a = k as f64 * core::f64::consts::TAU / 6.0;
+            let hh = self.height(x + r * a.cos(), z + r * a.sin());
+            if hh > h {
+                h = hh;
+            }
+        }
+        h
+    }
+
+    fn push(&mut self, x0: f64, x1: f64, z0: f64, z1: f64, top: f64, grip: f64) {
+        self.obstacles.push(Obstacle {
+            x0,
+            x1,
+            z0,
+            z1,
+            top,
+            grip,
+        });
+    }
+
+    fn generate(&mut self) {
+        let mut r = Rng::new(self.seed ^ ((self.course as u64) << 32));
+        match self.course {
+            Course::Flat => {}
+            Course::Steps => self.gen_steps(&mut r, 6.0, Z_MAX - 4.0),
+            Course::Rubble => self.gen_rubble(&mut r, 5.0, Z_MAX - 4.0, 1.0),
+            Course::Gaps => self.gen_gaps(&mut r, 6.0, Z_MAX - 4.0),
+            Course::Mixed => {
+                self.gen_rubble(&mut r, 5.0, 20.0, 0.75);
+                self.gen_steps(&mut r, 22.0, 38.0);
+                self.gen_gaps(&mut r, 40.0, 52.0);
+                self.gen_rubble(&mut r, 53.0, Z_MAX - 4.0, 1.1);
+            }
+            Course::Ramps => self.gen_ramps(&mut r, 6.0, Z_MAX - 4.0),
+            Course::Slalom => self.gen_slalom(&mut r, 8.0, Z_MAX - 6.0),
+            Course::Slick => self.gen_slick(&mut r, 5.0, Z_MAX - 4.0),
+            Course::Gauntlet => {
+                self.gen_rubble(&mut r, 5.0, 14.0, 0.9);
+                self.gen_ramps(&mut r, 15.0, 27.0);
+                self.gen_slalom(&mut r, 28.0, 42.0);
+                self.gen_gaps(&mut r, 43.0, 50.0);
+                self.gen_slick(&mut r, 51.0, Z_MAX - 4.0);
+            }
+        }
+    }
+
+    /// Ascending / descending staircases spanning the corridor.
+    fn gen_steps(&mut self, r: &mut Rng, z_from: f64, z_to: f64) {
+        let mut z = z_from;
+        while z < z_to - 4.0 {
+            let n_up = 3 + (r.unit() * 3.0) as usize;
+            let rise = r.range(0.16, 0.34);
+            let tread = r.range(0.45, 0.80);
+            // Up.
+            for k in 0..n_up {
+                let h = rise * (k + 1) as f64;
+                self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + tread, h, GRIP_STEP);
+                z += tread;
+            }
+            // Plateau.
+            let plateau = r.range(1.0, 2.4);
+            let top_h = rise * n_up as f64;
+            self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + plateau, top_h, GRIP_STEP);
+            z += plateau;
+            // Down.
+            for k in (0..n_up).rev() {
+                let h = rise * k as f64;
+                if h > 0.0 {
+                    self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + tread, h, GRIP_STEP);
+                }
+                z += tread;
+            }
+            z += r.range(1.5, 3.5);
+        }
+    }
+
+    /// Scattered debris. `density` scales the count.
+    fn gen_rubble(&mut self, r: &mut Rng, z_from: f64, z_to: f64, density: f64) {
+        let span = z_to - z_from;
+        let n = (span * 2.8 * density) as usize;
+        for _ in 0..n {
+            let cx = r.range(-CORRIDOR_HALF + 0.2, CORRIDOR_HALF - 0.2);
+            let cz = r.range(z_from, z_to);
+            let sx = r.range(0.30, 0.95);
+            let sz = r.range(0.30, 0.95);
+            let h = r.range(0.10, 0.58);
+            self.push(
+                cx - sx * 0.5,
+                cx + sx * 0.5,
+                cz - sz * 0.5,
+                cz + sz * 0.5,
+                h,
+                GRIP_RUBBLE,
+            );
+        }
+    }
+
+    /// Trenches across the corridor.
+    fn gen_gaps(&mut self, r: &mut Rng, z_from: f64, z_to: f64) {
+        let mut z = z_from;
+        while z < z_to {
+            let w = r.range(0.45, 1.05);
+            self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + w, -0.90, GRIP_PIT);
+            z += w + r.range(2.5, 5.0);
+        }
+    }
+
+    /// Long grades, half of them banked across the corridor.
+    ///
+    /// A staircase is a sequence of shocks; a ramp is a sustained tilt, and the
+    /// two are not the same problem. A banked one is worse still: the support
+    /// plane rolls, the downhill legs carry more, and the machine slides
+    /// sideways unless it does something about it.
+    fn gen_ramps(&mut self, r: &mut Rng, z_from: f64, z_to: f64) {
+        const SLAB: f64 = 0.30;
+        const STRIPS: usize = 6;
+        let mut z = z_from;
+        while z < z_to - 6.0 {
+            let run = r.range(3.5, 6.5);
+            let rise = r.range(0.55, 1.30);
+            // Cross-fall from one edge of the corridor to the other, or none.
+            let bank = if r.unit() < 0.45 {
+                r.range(0.30, 0.75) * if r.unit() < 0.5 { 1.0 } else { -1.0 }
+            } else {
+                0.0
+            };
+            let flat = r.range(1.2, 2.6);
+            let total = run * 2.0 + flat;
+            let mut d = 0.0;
+            while d < total {
+                // Up the first run, level across the crown, down the second.
+                let h = if d < run {
+                    rise * d / run
+                } else if d < run + flat {
+                    rise
+                } else {
+                    rise * (1.0 - (d - run - flat) / run)
+                };
+                // A level slab is one prism; a banked one is the same slab cut
+                // into strips that step down across the corridor. Height
+                // lookups are the innermost loop of every rollout, so an
+                // unbanked ramp is not paid for six times over.
+                let n = if bank == 0.0 { 1 } else { STRIPS };
+                let w = 2.0 * CORRIDOR_HALF / n as f64;
+                for s in 0..n {
+                    let x0 = -CORRIDOR_HALF + w * s as f64;
+                    // Strip centre in [-1, 1] across the corridor.
+                    let u = (x0 + w * 0.5) / CORRIDOR_HALF;
+                    let top = (h + bank * u).max(0.02);
+                    self.push(x0, x0 + w, z + d, z + d + SLAB, top, GRIP_STEP);
+                }
+                d += SLAB;
+            }
+            z += total + r.range(2.0, 4.0);
+        }
+    }
+
+    /// Staggered walls with a gate in each, and the route threaded through
+    /// them. Nothing here can be climbed or stepped over — the only way past a
+    /// wall is round it, which is why the machine needs somewhere to steer to.
+    fn gen_slalom(&mut self, r: &mut Rng, z_from: f64, z_to: f64) {
+        // Wide enough for the machine and its legs to fit through — a gate a
+        // walker cannot physically pass is not an obstacle course, it is a
+        // dead end.
+        const GATE_HALF: f64 = 1.75;
+        const THICK: f64 = 0.7;
+        let mut z = z_from;
+        // Alternate which side the gap is on, so the route actually weaves
+        // instead of happening to line up.
+        let mut side = if r.unit() < 0.5 { 1.0 } else { -1.0 };
+        while z < z_to {
+            // Bounded so both wall segments survive: an opening against the
+            // corridor edge is a corner to cut, not a gate to aim at.
+            let reach = CORRIDOR_HALF - GATE_HALF - 0.75;
+            let gate = side * r.range(reach * 0.70, reach);
+            if gate - GATE_HALF > -CORRIDOR_HALF {
+                self.push(-CORRIDOR_HALF, gate - GATE_HALF, z, z + THICK, WALL_TOP, GRIP_STEP);
+            }
+            if gate + GATE_HALF < CORRIDOR_HALF {
+                self.push(gate + GATE_HALF, CORRIDOR_HALF, z, z + THICK, WALL_TOP, GRIP_STEP);
+            }
+            // Approach and exit, so the machine lines up before the gap rather
+            // than arriving at it sideways.
+            self.waypoints.push([gate, z - 2.2]);
+            self.waypoints.push([gate, z + THICK + 1.4]);
+            side = -side;
+            z += THICK + r.range(5.0, 7.5);
+        }
+    }
+
+    /// Sheets of ice, one centimetre thick and worth about a fifth of the grip
+    /// of the ground around them.
+    fn gen_slick(&mut self, r: &mut Rng, z_from: f64, z_to: f64) {
+        let span = z_to - z_from;
+        let n = (span * 0.42) as usize;
+        for _ in 0..n {
+            let cx = r.range(-CORRIDOR_HALF + 1.0, CORRIDOR_HALF - 1.0);
+            let cz = r.range(z_from, z_to);
+            let sx = r.range(1.6, 4.2);
+            let sz = r.range(1.6, 4.2);
+            self.push(
+                (cx - sx * 0.5).max(-CORRIDOR_HALF),
+                (cx + sx * 0.5).min(CORRIDOR_HALF),
+                cz - sz * 0.5,
+                cz + sz * 0.5,
+                ICE_THICK,
+                GRIP_ICE,
+            );
+        }
+        // A few low humps, so it is not only a friction test.
+        self.gen_rubble(r, z_from, z_to, 0.25);
+    }
+
+    /// Fill in whatever the course did not route for itself: waypoints down
+    /// the centreline, in order, ending past the far end of the obstacles.
+    fn finish_route(&mut self) {
+        self.waypoints.sort_by(|a, b| a[1].total_cmp(&b[1]));
+        let mut out: Vec<[f64; 2]> = Vec::new();
+        let mut z = ROUTE_STEP;
+        let mut placed = self.waypoints.iter().copied().peekable();
+        while z < Z_MAX - 2.0 {
+            // Anything the generator placed before this station comes first,
+            // and suppresses the station if it is close enough to serve.
+            let mut covered = false;
+            while placed.peek().is_some_and(|w| w[1] <= z) {
+                let w = placed.next().unwrap();
+                out.push(w);
+                covered = true;
+            }
+            if !covered {
+                out.push([0.0, z]);
+            }
+            z += ROUTE_STEP;
+        }
+        out.extend(placed.filter(|w| w[1] < Z_MAX - 2.0));
+        out.push([0.0, Z_MAX - 2.0]);
+        self.waypoints = out;
+    }
+
+    /// Flat `[x0, x1, z0, z1, top]` rows for the renderer.
+    pub fn export(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.obstacles.len() * 5);
+        for ob in &self.obstacles {
+            out.push(ob.x0 as f32);
+            out.push(ob.x1 as f32);
+            out.push(ob.z0 as f32);
+            out.push(ob.z1 as f32);
+            out.push(ob.top as f32);
+        }
+        out
+    }
+
+    /// Flat `[x, z]` rows for the renderer.
+    pub fn export_route(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.waypoints.len() * 2);
+        for w in &self.waypoints {
+            out.push(w[0] as f32);
+            out.push(w[1] as f32);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flat_course_is_flat() {
+        let t = Terrain::new(Course::Flat, 1);
+        assert_eq!(t.height(0.0, 10.0), 0.0);
+        assert!(t.obstacles.is_empty());
+    }
+
+    #[test]
+    fn generation_is_deterministic() {
+        let a = Terrain::new(Course::Mixed, 42);
+        let b = Terrain::new(Course::Mixed, 42);
+        assert_eq!(a.obstacles.len(), b.obstacles.len());
+        for (x, y) in a.obstacles.iter().zip(b.obstacles.iter()) {
+            assert_eq!(x.z0, y.z0);
+            assert_eq!(x.top, y.top);
+        }
+        let c = Terrain::new(Course::Mixed, 43);
+        assert!(a.obstacles.len() != c.obstacles.len() || a.obstacles[0].z0 != c.obstacles[0].z0);
+    }
+
+    #[test]
+    fn bucket_lookup_matches_brute_force() {
+        let t = Terrain::new(Course::Mixed, 9);
+        let mut r = Rng::new(5);
+        for _ in 0..4000 {
+            let x = r.range(-CORRIDOR_HALF, CORRIDOR_HALF);
+            let z = r.range(Z_MIN, Z_MAX);
+            let fast = t.height(x, z);
+
+            let mut top = 0.0f64;
+            let mut pit = 0.0f64;
+            for ob in &t.obstacles {
+                if ob.contains(x, z) {
+                    if ob.top >= 0.0 {
+                        top = top.max(ob.top);
+                    } else {
+                        pit = pit.min(ob.top);
+                    }
+                }
+            }
+            let brute = if top > 0.0 { top } else { pit };
+            assert!((fast - brute).abs() < 1e-12, "at ({x},{z})");
+        }
+    }
+
+    #[test]
+    fn courses_actually_contain_obstacles() {
+        for c in COURSES.iter().copied().filter(|c| *c != Course::Flat) {
+            let t = Terrain::new(c, 3);
+            assert!(!t.obstacles.is_empty(), "{c:?} generated nothing");
+        }
+        assert!(Terrain::new(Course::Gaps, 3)
+            .obstacles
+            .iter()
+            .any(|o| o.top < 0.0));
+    }
+
+    #[test]
+    fn grip_follows_whichever_surface_supplies_the_height() {
+        let t = Terrain::new(Course::Rubble, 7);
+        let ob = t.obstacles[0];
+        let (cx, cz) = ((ob.x0 + ob.x1) * 0.5, (ob.z0 + ob.z1) * 0.5);
+        assert_eq!(t.height(cx, cz), ob.top);
+        assert_eq!(t.grip(cx, cz), GRIP_RUBBLE);
+        // Off the course entirely, and behind the first obstacle.
+        assert_eq!(t.grip(0.0, Z_MIN - 1.0), GRIP_GROUND);
+        assert_eq!(t.grip(0.0, 0.0), GRIP_GROUND);
+        assert!(GRIP_RUBBLE < GRIP_GROUND);
+    }
+
+    #[test]
+    fn gaps_are_slippery_underfoot_and_still_pits() {
+        let t = Terrain::new(Course::Gaps, 3);
+        let ob = t.obstacles.iter().find(|o| o.top < 0.0).unwrap();
+        let cz = (ob.z0 + ob.z1) * 0.5;
+        assert!(t.height(0.0, cz) < 0.0);
+        assert_eq!(t.grip(0.0, cz), GRIP_PIT);
+    }
+
+    #[test]
+    fn slope_matches_the_height_field_it_is_measured_from() {
+        let t = Terrain::new(Course::Steps, 2);
+        // Flat ground has no gradient anywhere the corridor is empty.
+        assert_eq!(t.slope(0.0, 0.0), (0.0, 0.0));
+        // Step risers do, and the gradient agrees with the heights either
+        // side of the edge it is measured across.
+        const H: f64 = 0.12;
+        let edge = t
+            .obstacles
+            .iter()
+            .map(|o| o.z0)
+            .find(|&z| (t.height(0.0, z + H) - t.height(0.0, z - H)).abs() > 0.05)
+            .expect("a staircase with no risers");
+        let (_, gz) = t.slope(0.0, edge);
+        let expect = (t.height(0.0, edge + H) - t.height(0.0, edge - H)) / (2.0 * H);
+        assert!((gz - expect).abs() < 1e-12);
+        assert!(gz.abs() > 0.2, "riser gradient too shallow: {gz}");
+    }
+
+    #[test]
+    fn outside_corridor_is_ground() {
+        let t = Terrain::new(Course::Rubble, 2);
+        assert_eq!(t.height(CORRIDOR_HALF + 1.0, 20.0), 0.0);
+        assert_eq!(t.height(0.0, Z_MAX + 5.0), 0.0);
+    }
+
+    #[test]
+    fn every_course_carries_a_route_that_runs_the_length_of_it() {
+        for c in COURSES {
+            let t = Terrain::new(c, 5);
+            let w = &t.waypoints;
+            assert!(w.len() >= 6, "{c:?}: only {} waypoints", w.len());
+            // In order, inside the walls, and finishing at the far end.
+            for pair in w.windows(2) {
+                assert!(
+                    pair[1][1] > pair[0][1],
+                    "{c:?}: waypoints out of order at z={}",
+                    pair[0][1]
+                );
+            }
+            assert!(w.iter().all(|p| p[0].abs() < CORRIDOR_HALF - 1.0));
+            assert!(w[0][1] > 0.0, "{c:?}: first waypoint is behind the spawn");
+            assert!(w.last().unwrap()[1] > Z_MAX - 4.0);
+        }
+    }
+
+    #[test]
+    fn the_slalom_route_goes_round_the_walls_and_not_through_them() {
+        let t = Terrain::new(Course::Slalom, 11);
+        // Every wall is unclimbable, and the gap in it is where the route goes.
+        let walls: Vec<_> = t.obstacles.iter().filter(|o| o.top > 1.0).collect();
+        assert!(walls.len() >= 8, "only {} wall segments", walls.len());
+        for w in &walls {
+            let cz = (w.z0 + w.z1) * 0.5;
+            assert!(t.height((w.x0 + w.x1) * 0.5, cz) > 1.0);
+        }
+        // Every waypoint has somewhere to stand.
+        for p in &t.waypoints {
+            assert!(
+                t.height(p[0], p[1]) < 1.0,
+                "waypoint ({:.2}, {:.2}) is inside a wall",
+                p[0],
+                p[1]
+            );
+        }
+        // And the route is not a straight line down the middle.
+        let sway = t
+            .waypoints
+            .iter()
+            .map(|p| p[0].abs())
+            .fold(0.0f64, f64::max);
+        assert!(sway > 1.0, "route never leaves the centreline: {sway:.2}");
+    }
+
+    #[test]
+    fn the_corridor_walls_obstruct_and_so_does_a_slalom_wall() {
+        let t = Terrain::new(Course::Slalom, 4);
+        let (r, under) = (0.9, 0.7);
+        assert!(!t.obstructed(0.0, 2.0, r, under), "open ground is blocked");
+        assert!(t.obstructed(CORRIDOR_HALF - 0.5, 2.0, r, under), "walked through the wall");
+        assert!(t.obstructed(-CORRIDOR_HALF - 3.0, 2.0, r, under));
+        let w = t.obstacles.iter().find(|o| o.top > 1.0).unwrap();
+        assert!(t.obstructed((w.x0 + w.x1) * 0.5, (w.z0 + w.z1) * 0.5, r, under));
+    }
+
+    #[test]
+    fn ice_is_slippery_without_being_an_obstacle() {
+        let t = Terrain::new(Course::Slick, 6);
+        let ice = t
+            .obstacles
+            .iter()
+            .find(|o| o.grip == GRIP_ICE)
+            .expect("no ice on the slick course");
+        let (cx, cz) = ((ice.x0 + ice.x1) * 0.5, (ice.z0 + ice.z1) * 0.5);
+        assert_eq!(t.grip(cx, cz), GRIP_ICE);
+        assert!(t.height(cx, cz) < 0.02, "ice is not a step");
+        assert!(GRIP_ICE < GRIP_RUBBLE);
+    }
+
+    #[test]
+    fn a_ramp_is_a_grade_and_not_a_staircase() {
+        let t = Terrain::new(Course::Ramps, 8);
+        // Somewhere on the course the ground rises steadily over several
+        // metres, which is what makes it a ramp and not a step.
+        let climb = (0..600)
+            .map(|i| {
+                let z = 6.0 + i as f64 * 0.1;
+                t.height(0.0, z)
+            })
+            .fold(0.0f64, f64::max);
+        assert!(climb > 0.5, "highest point on the ramps is only {climb:.2} m");
+        // And at least one section is banked: the two edges are at different
+        // heights at the same z.
+        let banked = (0..600).any(|i| {
+            let z = 6.0 + i as f64 * 0.1;
+            (t.height(-4.0, z) - t.height(4.0, z)).abs() > 0.25
+        });
+        assert!(banked, "no cross-slope anywhere on the ramps");
+    }
+}

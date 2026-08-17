@@ -1,0 +1,10 @@
+[package]
+name = "hexapod-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kinematic hexapod simulator and Augmented Random Search trainer. No dependencies."
+
+[lib]
+name = "hexapod_core"
+path = "src/lib.rs"
