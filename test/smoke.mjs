@@ -72,7 +72,20 @@ await wait(200);
 await page.screenshot({ path: path.join(SHOTS, "02-training-before.png") });
 
 await page.click("#btnTrain");
-await wait(14000);
+try {
+  await page.waitForFunction(
+    () => {
+      const best = parseFloat(document.getElementById("sBest")?.textContent);
+      const base = parseFloat(document.getElementById("sBase")?.textContent);
+      const feed = parseFloat(document.getElementById("sFeed")?.textContent);
+      const iter = parseInt(document.getElementById("sIter")?.textContent, 10);
+      return iter > 10 && Number.isFinite(best) && Number.isFinite(base) && best > base && feed > 0.01;
+    },
+    { timeout: 28000 }
+  );
+} catch {
+  // fall through to the assertions, which report the actual numbers
+}
 await page.click("#btnTrain");
 await wait(400);
 
@@ -446,7 +459,26 @@ await page.screenshot({ path: path.join(SHOTS, "12-slalom.png") });
 const jumpIdx = courses.findIndex((c) => /jump/i.test(c));
 check("the jump course is one of them", jumpIdx >= 0, courses.join(" "));
 await page.click(`[data-course="${jumpIdx}"]`);
-await wait(2800);
+// The sim starts playing (`Pause` on the button). Only click if a previous
+// test left it held — otherwise we pause a running hop and wait on a frozen clock.
+const pauseLabel = await page.textContent("#btnPause");
+if (/Resume/i.test(pauseLabel || "")) await page.click("#btnPause");
+try {
+  await page.waitForFunction(
+    () => {
+      const state = document.getElementById("hState")?.textContent || "";
+      const meter = document.getElementById("mSpeedLabel")?.textContent || "";
+      const clock = document.getElementById("hClock")?.textContent || "";
+      const jumps = Number((meter.match(/(\d+)\s*jumps/i) || ["", "0"])[1]);
+      const m = clock.match(/(\d+):(\d+(?:\.\d+)?)/);
+      const secs = m ? Number(m[1]) * 60 + Number(m[2]) : 0;
+      return /JUMPING/i.test(state) || jumps > 0 || secs >= 1.4;
+    },
+    { timeout: 25000 }
+  );
+} catch {
+  // assertions below report HUD / meter / clock
+}
 const jump = await page.evaluate(() => ({
   summary: document.getElementById("tSummary").textContent,
   note: document.getElementById("tNote").textContent,
@@ -455,6 +487,7 @@ const jump = await page.evaluate(() => ({
   meter: document.getElementById("mSpeedLabel").textContent,
   state: document.getElementById("hState").textContent,
   speed: document.getElementById("mSpeed").textContent,
+  clock: document.getElementById("hClock").textContent,
 }));
 check("the jump course loads", /JUMP/.test(jump.summary), jump.summary);
 check("the command dial stays a speed", /speed/i.test(jump.title), jump.title);
@@ -473,7 +506,7 @@ const jumped = /JUMPING|AIRBORNE/i.test(jump.state) || /[1-9]\s*jumps/i.test(jum
 check(
   "the seed takes off on the first trench",
   jumped,
-  `${jump.state} / ${jump.meter}`
+  `${jump.state} / ${jump.meter} @ ${jump.clock}`
 );
 await page.screenshot({ path: path.join(SHOTS, "13-jump.png") });
 
