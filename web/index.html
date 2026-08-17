@@ -366,10 +366,12 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             behaviour shows up: given a range of commands to serve, the policy learns to raise its duty
             factor when walking slowly and drop it when running — the walk-to-run transition, which nobody
             put in the reward.</p>
-            <p class="note">A seventh action is <b>jump</b>, ignored while walking. On the JUMP course the
-            command is an apex, not a speed: the same sampling discipline, a small seeded hop as iteration 0,
-            and a landing the servos cannot absorb costs more than a fall. Extra height past the command
-            earns nothing. That is how you train a hexapod to jump higher without breaking it.</p>
+            <p class="note">A seventh action is <b>jump</b>. Above a threshold it crouches, pushes and
+            lifts every foot at once — the only way this machine leaves the ground, because a walking duty
+            cannot. The seeded weight is zero, so a walking rollout does not jump. On the JUMP course the
+            trenches are wider than a stride and the platforms sit behind a gap: the seed jumps when it
+            sees a pit, keeps its forward speed, and has to land without stripping the servos. The command
+            is still a speed.</p>
           </div>
         </div>
 

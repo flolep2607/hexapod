@@ -191,7 +191,7 @@ already had only ever see the next footfall, which is far too late to turn on.
 The scan sees the invisible walls too — they are invisible, not undetectable,
 and a policy that cannot sense a fence cannot avoid one.
 
-Nine courses plus a jump pad, all generated from a seed:
+Nine courses plus a parkour jump, all generated from a seed:
 
 | course | what is in it |
 | --- | --- |
@@ -204,7 +204,7 @@ Nine courses plus a jump pad, all generated from a seed:
 | `SLALOM` | Walls with a 3.5 m gate in each, staggered left and right |
 | `SLICK` | Ice at a fifth of the grip of the ground around it |
 | `GAUNTLET` | All of the above in one run |
-| `JUMP` | Flat pad. The command is an apex, not a speed |
+| `JUMP` | Trenches wider than a stride (1.55–1.95 m), and platforms behind a gap. A running jump |
 
 `RAMPS` is a different problem from `STEPS`: a staircase is a sequence of
 shocks, a ramp is a sustained tilt, and a banked one rolls the support plane and
@@ -270,44 +270,30 @@ wash.
 
 ## Jumping
 
-Walking is holding a speed. Jumping is holding an **apex**. The same rule
-applies: there is no raw-height term, because that is how you train a machine
-to jump until the servos strip. The command is sampled from 0.06–0.40 m of
-extra clearance, shared between both sides of each finite difference, and
-handed to the policy as an observation. Evaluation averages three heights. A
-gait that only hops one height cannot score.
+Walking is holding a speed. Jumping is how you keep holding it when the ground
+runs out. `JUMP` is a parkour course: trenches **1.55–1.95 m** wide — past the
+1.45 m stride, so they cannot be stepped — and platforms 16–30 cm high that
+sit behind a gap, so they cannot be stepped onto either. The command is still
+a speed, sampled from 3.5–6.0 m/s (a walking pace does not have the hang time
+to clear two metres). Evaluation averages 4.0 / 5.0 / 5.5. There is no raw
+height term: extra apex earns nothing, a landing the servos cannot absorb
+**breaks** the machine (priced higher than a fall), and the reward is the
+same speed-tracking objective as every other course. Fall in the trench and
+you stop scoring; clear it and you keep running.
 
-Iteration 0 is a small seeded hop — crouch, push, lift, land — the same way
-iteration 0 of walking is the tripod. The jump action is ignored on every
-other course, so a walking rollout of the seeded policy is bit-identical to
-what it was. On `JUMP` the hop clock gathers every foot, then raises them all
-at once, which is the only way this machine leaves the ground: the walking
-duty factor cannot go below 0.45.
+The jump action is a takeoff trigger, available on every course. Above a
+threshold it crouches, pushes and lifts every foot at once, which is the only
+way this machine leaves the ground: the walking duty factor cannot go below
+0.45. The seeded weight is zero, so a walking rollout of iteration 0 is
+bit-identical to what it was. On `JUMP`, seeing a trench in the near scan is
+iteration 0 — the seed jumps, keeps its forward speed, and has to land.
 
 A landing whose servo demand exceeds 8 g **breaks** the robot. The integrator
-will not apply that acceleration; asking for it still ends the run, priced
-higher than a fall. Extra height past the command earns nothing, so the
-search that jumps as hard as it can, and the search that lands stiff, both
-lose.
+will not apply that acceleration; asking for it still ends the run.
 
-80 iterations, horizon 5 s (`hexapod jump --iters 80 --horizon 5`):
-
-| commanded | seed hop | learned | error |
-| --------: | -------: | ------: | ----: |
-|  0.08 m |    0.122 |   0.155 | 0.075 |
-|  0.14 m |    0.122 |   0.187 | 0.047 |
-|  0.22 m |    0.122 |   0.234 | 0.014 |
-|  0.28 m |    0.122 |   0.272 | 0.008 |
-|  0.36 m |    0.122 |   0.337 | 0.023 |
-
-The seed hop is 12 cm whatever you ask for, because it is open-loop. The
-learned policy tracks the command: mean apex error **0.111 → 0.033 m**. Reward
-goes 73 → 644. At 36 cm the landing demand is 2.3 g — well under the 8 g that
-strips the gearbox — and it never broke.
-
-That is the walk-to-run result, pointed up. Nobody put crouch depth or flight
-time in the reward. The command is an input, breaking is expensive, and the
-search finds a hop that scales.
+That is the walk-to-run result, pointed at a gap. Nobody put crouch depth or
+flight time in the reward. The command is an input, falling in the trench is
+expensive, breaking is more expensive, and the search finds a running jump.
 
 ## How many legs
 
@@ -544,7 +530,7 @@ continuous torque is far lower, which is what the safety factor is for.
 ## Layout
 
 ```
-crates/hexapod-core    simulator, dynamics, ARS trainer, hardware. 115 tests.
+crates/hexapod-core    simulator, dynamics, ARS trainer, hardware. 117 tests.
 crates/hexapod-cli     train, bench, sweep, speed, jump, servo, bom, system, courses
 crates/hexapod-wasm    C-ABI bridge; no wasm-bindgen, ~167 kB of wasm
 web/                   dashboard: renderer, panels, styling
@@ -567,7 +553,7 @@ test/smoke.mjs         Playwright end-to-end check of the built page
 
 Drag to orbit, scroll to zoom, `WASD`/`QE` to drive, `X` to stop, `space` to
 pause. The **Frame** slider sets the leg count, the **Commanded speed** dial is
-the number the reward tracks (an apex, on `JUMP`), and the **Machine** selector
+the number the reward tracks, and the **Machine** selector
 picks the servo the joints are driven with. Changing any of them is a different
 robot, so anything learned for the old one is discarded. **Follow route** hands
 steering to the policy; the turn keys take it back for as long as you hold them.
@@ -595,7 +581,7 @@ before anybody looked for it.
 
 ## Tests
 
-`cargo test` — 115 tests.
+`cargo test` — 117 tests.
 
 Geometry, on every frame from four legs to ten: IK round-trips against forward
 kinematics, hips that never collide however many legs there are, mirrored pairs
@@ -622,10 +608,11 @@ over and a crawling one does not, cost of transport lands in the range legged
 machines actually occupy, the body holds the speed it is commanded regardless of
 what its stride is set to, the three gait modulations are wired to the command,
 and the baseline gait is untouched by them so iteration 0 really is the
-hand-tuned gait. Jumping: the seeded hop leaves the ground without breaking,
-walking does not become a jump, airborne is not a fall, a slam landing strips
-the gearbox, the reward tracks the commanded apex rather than raw height, and
-a short ARS run improves on the seed hop.
+hand-tuned gait. Jumping: the seeded gait jumps the first trench without
+breaking, walking on flat ground does not become a jump, airborne is not a
+fall, a slam landing strips the gearbox, JUMP trenches are wider than a
+stride with platforms behind a gap, and a short ARS run improves on walking
+into the pit.
 
 Terrain and navigation: every course generates something and carries a route
 that runs its whole length in order and never passes through a wall, a ramp is
@@ -655,6 +642,6 @@ repaints the stage and still walks. Then: every canvas's backing store matches
 the box CSS lays it out in, so nothing on the page is drawn stretched; the
 footfall recorder holds real samples and its measured cycle, duty and pattern
 agree with the gait actually running; every course the simulator knows has a
-button; the slalom loads with a route that leaves the centreline; the jump pad
-loads with an apex dial and the seed hop leaves the ground; and the autopilot
+button; the slalom loads with a route that leaves the centreline; the jump course
+loads with a speed dial and the seed takes off on the first trench; and the autopilot
 can be switched off and hands steering back.

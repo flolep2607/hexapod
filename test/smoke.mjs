@@ -441,12 +441,12 @@ check(
 );
 await page.screenshot({ path: path.join(SHOTS, "12-slalom.png") });
 
-// JUMP is a different task on the same machine: the command is an apex,
-// the seed hop actually leaves the ground, and walking is not what scores.
+// JUMP is parkour on the same machine: trenches wider than a stride, a
+// speed command, and the seed actually leaves the ground while running.
 const jumpIdx = courses.findIndex((c) => /jump/i.test(c));
-check("the jump pad is one of them", jumpIdx >= 0, courses.join(" "));
+check("the jump course is one of them", jumpIdx >= 0, courses.join(" "));
 await page.click(`[data-course="${jumpIdx}"]`);
-await wait(2500);
+await wait(2800);
 const jump = await page.evaluate(() => ({
   summary: document.getElementById("tSummary").textContent,
   note: document.getElementById("tNote").textContent,
@@ -454,26 +454,26 @@ const jump = await page.evaluate(() => ({
   hold: document.getElementById("vCruise").textContent,
   meter: document.getElementById("mSpeedLabel").textContent,
   state: document.getElementById("hState").textContent,
-  apex: document.getElementById("mSpeed").textContent,
+  speed: document.getElementById("mSpeed").textContent,
 }));
-check("the jump pad loads", /JUMP/.test(jump.summary), jump.summary);
-check("the command dial becomes an apex", /jump/i.test(jump.title), jump.title);
-check("the apex is in metres, not metres per second", /m$/.test(jump.hold.trim()), jump.hold);
+check("the jump course loads", /JUMP/.test(jump.summary), jump.summary);
+check("the command dial stays a speed", /speed/i.test(jump.title), jump.title);
+check("the hold is metres per second", /m\/s/.test(jump.hold.trim()), jump.hold);
 check(
-  "the seed hop is described as a jump, not a walk",
-  /apex|jump/i.test(jump.note),
+  "the note is parkour, not a standing hop",
+  /trench|parkour|platform|stride/i.test(jump.note),
   jump.note.slice(0, 80)
 );
 check(
-  "the live meter tracks apex against the command",
-  /apex/i.test(jump.meter),
+  "the live meter tracks speed and counts jumps",
+  /speed/i.test(jump.meter) && /jump/i.test(jump.meter),
   jump.meter
 );
-const apexHit = parseFloat(String(jump.apex).split("/")[0]);
+const jumped = /JUMPING|AIRBORNE/i.test(jump.state) || /[1-9]\s*jumps/i.test(jump.meter);
 check(
-  "the seed hop leaves the ground",
-  Number.isFinite(apexHit) && apexHit > 0.02,
-  jump.apex
+  "the seed takes off on the first trench",
+  jumped,
+  `${jump.state} / ${jump.meter}`
 );
 await page.screenshot({ path: path.join(SHOTS, "13-jump.png") });
 

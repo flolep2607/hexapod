@@ -15,8 +15,11 @@
 //! stride and duty factor — scale them online every tick. Those three are how
 //! any legged controller changes speed, and without them a gait has exactly
 //! one speed it walks well at, so a commanded speed is not something a policy
-//! can be asked to hold. A seventh action, jump, is ignored while walking and
-//! is the takeoff trigger on the jump task.
+//! can be asked to hold. A seventh action, jump, is a takeoff trigger: above
+//! a threshold it crouches, pushes and lifts every foot at once, which is the
+//! only way this machine leaves the ground. The walking gait never does that,
+//! because its duty factor cannot, and the seeded feedback is zero, so a
+//! walking rollout of iteration 0 is bit-identical to what it was.
 //!
 //! Every dimension here is a function of the leg count, so the vectors are
 //! sized at `MAX_*` and the live length is carried by the [`Frame`].
@@ -128,9 +131,10 @@ pub fn act_stride(frame: Frame) -> usize {
 pub fn act_duty(frame: Frame) -> usize {
     2 * frame.legs() + 4
 }
-/// Takeoff trigger. Ignored while walking; on the jump task a positive value
-/// lifts every foot at once, which is the only way the machine leaves the
-/// ground. The walking gait never does that, because its duty factor cannot.
+/// Takeoff trigger. Above a threshold the simulator runs a hop: crouch, push,
+/// lift every foot at once, which is the only way the machine leaves the
+/// ground. The walking gait never does that, because its duty factor cannot,
+/// and the seeded weight is zero, so a walking rollout does not jump.
 #[inline]
 pub fn act_jump(frame: Frame) -> usize {
     2 * frame.legs() + 5

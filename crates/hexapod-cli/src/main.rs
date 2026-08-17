@@ -6,7 +6,7 @@
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
 //! hexapod speed  [--iters 200]      commanded vs achieved speed
-//! hexapod jump   [--iters 200]      commanded vs achieved apex
+//! hexapod jump   [--iters 200]      parkour: distance, waypoints, jumps
 //! hexapod servo                     the same gait on every servo
 //! ```
 //!
@@ -33,7 +33,10 @@ use hexapod_core::hardware::{shortlist, Build, Provenance, TorqueMeter, PRICES_C
 use hexapod_core::sim::Sim;
 use hexapod_core::power::{parts_of, solve, Kind, Sizing, TorqueTrace};
 use hexapod_core::policy::Preset;
-use hexapod_core::sim::{evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_MAX, JUMP_MIN};
+use hexapod_core::sim::{
+    evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
+    JUMP_EVAL_SPEEDS,
+};
 use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
 
 fn main() {
@@ -187,8 +190,8 @@ fn train(
     );
     if course.is_jump() {
         println!(
-            "commanded heights sampled from {JUMP_MIN:.2} to {JUMP_MAX:.2} m; \
-             scored on the mean over 0.10 / 0.22 / 0.36"
+            "commanded speeds sampled from {JUMP_CRUISE_MIN:.1} to {JUMP_CRUISE_MAX:.1} m/s; \
+             scored on the mean over 4.0 / 5.0 / 5.5 — a running jump, not a walk"
         );
     } else {
         println!(
@@ -366,7 +369,6 @@ fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
     let mut plan: Vec<(Course, u64)> = hexapod_core::terrain::COURSES
         .iter()
         .copied()
-        .filter(|c| !c.is_jump())
         .enumerate()
         .map(|(i, c)| (c, seed + 100 * i as u64))
         .collect();
@@ -559,8 +561,8 @@ fn speed(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, 
     );
 }
 
-/// Train on JUMP, then print commanded vs achieved apex. The analogue of
-/// `hexapod speed`, for the other half of the locomotion problem.
+/// Train on JUMP, then print distance, waypoints and jumps. The analogue of
+/// `hexapod speed`, for a course you cannot walk.
 fn jump(frame: Frame, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
     let terrain = Terrain::new(Course::Jump, seed);
     let base = Policy::seeded(Preset::default_for(frame), frame);
@@ -577,39 +579,36 @@ fn jump(frame: Frame, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
     let learned = t.best_policy();
 
     println!(
-        "JUMP seed {}, {iters} iterations, commanded heights sampled from {JUMP_MIN:.2} to {JUMP_MAX:.2} m\n",
+        "JUMP seed {}, {iters} iterations, commanded speeds sampled from {JUMP_CRUISE_MIN:.1} to {JUMP_CRUISE_MAX:.1} m/s\n",
         seed
     );
     println!(
         "{:>10} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7} {:>7}",
-        "commanded", "base m", "base err", "got m", "err", "jumps", "g", "broke"
+        "commanded", "base m", "base wp", "got m", "got wp", "jumps", "g", "broke"
     );
-    let heights = [0.08, 0.14, 0.22, 0.28, 0.36];
-    let mut sum_b = 0.0;
-    let mut sum_l = 0.0;
-    for &h in heights.iter() {
-        let a = rollout(&terrain, &base, &phys, cfg.horizon, Cmd::jump(h), None);
-        let b = rollout(&terrain, &learned, &phys, cfg.horizon, Cmd::jump(h), None);
-        sum_b += (a.apex - h).abs();
-        sum_l += (b.apex - h).abs();
+    for &v in JUMP_EVAL_SPEEDS.iter() {
+        let a = rollout(&terrain, &base, &phys, cfg.horizon, Cmd::at(v), None);
+        let b = rollout(&terrain, &learned, &phys, cfg.horizon, Cmd::at(v), None);
         println!(
-            "{h:>9.2}  {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>7} {:>7.1} {:>7}",
-            a.apex,
-            (a.apex - h).abs(),
-            b.apex,
-            (b.apex - h).abs(),
+            "{v:>9.2}  {:>9.2} {:>9} {:>9.2} {:>9} {:>7} {:>7.1} {:>7}",
+            a.distance,
+            a.reached,
+            b.distance,
+            b.reached,
             b.jumps,
             b.impact_g,
             if b.broken { "BROKE" } else { "ok" }
         );
     }
-    let n = heights.len() as f64;
-    println!("{:>10} {:>19.3} {:>19.3}", "mean err", sum_b / n, sum_l / n);
     println!(
         "\nbaseline reward {:7.2}  learned {:7.2}  ({:+.0}%)",
         t.baseline_reward,
         t.best_reward,
         100.0 * (t.best_reward - t.baseline_reward) / t.baseline_reward.abs().max(1e-6)
+    );
+    println!(
+        "baseline distance {:6.2} m  learned {:6.2} m",
+        t.baseline_distance, t.best_distance
     );
 }
 

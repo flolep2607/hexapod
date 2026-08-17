@@ -37,7 +37,7 @@ pub use power::{solve, Kind, Part, Sizing, Solution, TorqueTrace, PARTS};
 pub use policy::{n_act, n_obs, n_theta, Gait, Policy, Preset};
 pub use robot::{Frame, MAX_LEGS, MIN_LEGS};
 pub use sim::{
-    evaluate, rollout, Cmd, Rollout, Sim, Task, CRUISE_MAX, CRUISE_MIN, DT, JUMP_DEFAULT,
-    JUMP_MAX, JUMP_MIN,
+    evaluate, rollout, Cmd, Rollout, Sim, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_DEFAULT,
+    JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
 };
 pub use terrain::{Course, Terrain};

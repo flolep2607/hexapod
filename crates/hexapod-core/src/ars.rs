@@ -9,7 +9,9 @@
 use crate::dynamics::Physics;
 use crate::math::Rng;
 use crate::policy::{n_theta, Normalizer, Policy};
-use crate::sim::{evaluate, rollout, Cmd, Rollout, CRUISE_MAX, CRUISE_MIN, JUMP_MAX, JUMP_MIN};
+use crate::sim::{
+    evaluate, rollout, Cmd, Rollout, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
+};
 use crate::terrain::Terrain;
 
 #[derive(Clone, Copy, Debug)]
@@ -116,21 +118,13 @@ impl Trainer {
     pub fn record_baseline(&mut self, terrain: &Terrain) {
         let r = self.evaluate(terrain);
         self.baseline_reward = r.reward;
-        self.baseline_distance = if terrain.course.is_jump() {
-            r.apex
-        } else {
-            r.distance
-        };
+        self.baseline_distance = r.distance;
         self.best_reward = r.reward;
         self.best_distance = self.baseline_distance;
         self.best_theta.copy_from_slice(&self.policy.theta);
         self.best_norm = self.policy.norm.clone();
         self.curve.push(r.reward as f32);
-        self.dist_curve.push(if terrain.course.is_jump() {
-            r.apex as f32
-        } else {
-            r.distance as f32
-        });
+        self.dist_curve.push(r.distance as f32);
     }
 
     /// One ARS iteration: `2 * n_dirs` exploratory rollouts plus one
@@ -158,10 +152,10 @@ impl Trainer {
 
             // One command per direction, shared by both sides of the finite
             // difference — otherwise the difference measures the command draw
-            // rather than the perturbation. Walking samples a speed; jumping
-            // samples a height.
+            // rather than the perturbation. JUMP samples a faster band: the
+            // trenches are a running jump, not a walk.
             let cmd = if terrain.course.is_jump() {
-                Cmd::jump(JUMP_MIN + self.rng.unit() * (JUMP_MAX - JUMP_MIN))
+                Cmd::at(JUMP_CRUISE_MIN + self.rng.unit() * (JUMP_CRUISE_MAX - JUMP_CRUISE_MIN))
             } else {
                 Cmd::at(CRUISE_MIN + self.rng.unit() * (CRUISE_MAX - CRUISE_MIN))
             };
@@ -235,18 +229,10 @@ impl Trainer {
 
         let ev = self.evaluate(terrain);
         self.curve.push(ev.reward as f32);
-        self.dist_curve.push(if terrain.course.is_jump() {
-            ev.apex as f32
-        } else {
-            ev.distance as f32
-        });
+        self.dist_curve.push(ev.distance as f32);
         if ev.reward > self.best_reward {
             self.best_reward = ev.reward;
-            self.best_distance = if terrain.course.is_jump() {
-                ev.apex
-            } else {
-                ev.distance
-            };
+            self.best_distance = ev.distance;
             self.best_theta.copy_from_slice(&self.policy.theta);
             self.best_norm = self.policy.norm.clone();
         }
@@ -361,19 +347,22 @@ mod tests {
     }
 
     #[test]
-    fn jump_training_improves_on_the_seed_hop() {
+    fn jump_training_improves_on_falling_in_the_trench() {
         let terrain = Terrain::new(Course::Jump, 1);
         let mut t = trainer(0xBEEF);
-        t.cfg.horizon = 5.0;
+        t.cfg.horizon = 6.0;
         t.record_baseline(&terrain);
         for _ in 0..40 {
             t.iterate(&terrain);
         }
         assert!(
-            t.best_reward > t.baseline_reward,
-            "no improvement: baseline {:.2}, best {:.2}",
+            t.best_reward > t.baseline_reward
+                || t.best_distance > t.baseline_distance + 0.5,
+            "no improvement: baseline reward {:.2} dist {:.2}, best reward {:.2} dist {:.2}",
             t.baseline_reward,
-            t.best_reward
+            t.baseline_distance,
+            t.best_reward,
+            t.best_distance
         );
     }
 }

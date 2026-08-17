@@ -46,7 +46,7 @@ const COURSE_NOTES = {
   GAUNTLET:
     "Rubble, ramps, a slalom, trenches, then ice. Everything the generator can build, in one run.",
   JUMP:
-    "Flat pad, no route. The command is an apex, not a speed: crouch, push, leave the ground, land without stripping the servos. Extra height past the command earns nothing — that is how you break the machine.",
+    "Parkour. Trenches wider than a stride, and platforms you can only reach by jumping the gap in front of them. The command is still a speed: run, jump, land without stripping the servos.",
 };
 const courseName = (i) => (COURSES[i] || "Flat").toUpperCase();
 const isJump = () => courseName(state.courseKind) === "JUMP";
@@ -1181,13 +1181,13 @@ function updateReadouts(t) {
     : fallen
     ? "RECOVERING"
     : airborne
-    ? "AIRBORNE"
+    ? t[L.T_TASK] > 0.5
+      ? "JUMPING"
+      : "AIRBORNE"
     : blocked
     ? "BLOCKED"
     : state.paused
     ? "HELD"
-    : isJump()
-    ? "HOPPING"
     : moving
     ? state.cmd.turn !== 0
       ? "TURNING"
@@ -1202,9 +1202,7 @@ function updateReadouts(t) {
   $("hudY").textContent = (t[L.T_POS + 1] >= 0 ? "+" : "") + fmt(t[L.T_POS + 1], 2);
   $("hudPhase").textContent = fmt(t[L.T_PHASE], 2);
   $("hudMargin").textContent = fmt(t[L.T_MARGIN], 2);
-  $("hudV").textContent = isJump()
-    ? fmt(t[L.T_VY], 2)
-    : fmt(Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]), 2);
+  $("hudV").textContent = fmt(Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]), 2);
   $("hudVc").textContent = fmt(t[L.T_CMD_SPEED], 2);
   $("hudW").textContent = fmt(t[L.T_STEER] * 1.1, 2);
   // Where it is being asked to go, and whether it is choosing that itself.
@@ -1237,19 +1235,13 @@ function updateReadouts(t) {
   const margin = t[L.T_MARGIN];
   drawDial($("dStab"), Math.max(0, margin), 0.7, margin.toFixed(2), margin < 0.08, "m", 0.08 / 0.7);
 
-  if (isJump()) {
-    const target = t[L.T_CMD_SPEED] || 0.22;
-    const apex = t[L.T_APEX];
-    $("mSpeedLabel").textContent = "Apex / commanded";
-    $("mSpeed").textContent = `${fmt(apex, 2)} / ${fmt(target, 2)} m`;
-    $("fSpeed").style.width = `${Math.min(100, (apex / Math.max(target, 1e-3)) * 100)}%`;
-  } else {
-    const target = t[L.T_CMD_SPEED] || 4;
-    const v = Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]);
-    $("mSpeedLabel").textContent = "Speed / commanded";
-    $("mSpeed").textContent = `${fmt(v, 2)} / ${fmt(target, 1)} m/s`;
-    $("fSpeed").style.width = `${Math.min(100, (v / target) * 100)}%`;
-  }
+  const target = t[L.T_CMD_SPEED] || 4;
+  const v = Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]);
+  $("mSpeedLabel").textContent = isJump()
+    ? `Speed / commanded · ${Math.round(t[L.T_JUMPS] || 0)} jumps`
+    : "Speed / commanded";
+  $("mSpeed").textContent = `${fmt(v, 2)} / ${fmt(target, 1)} m/s`;
+  $("fSpeed").style.width = `${Math.min(100, (v / target) * 100)}%`;
 
   // How much of the friction budget the gait is spending. 100% means the feet
   // are on the point of letting go; above it they are skidding.
@@ -1528,14 +1520,15 @@ function applyCourse() {
   $("tSummary").textContent =
     `${name} · seed ${state.seed} · ${api.hx_course_len()} obstacles · ${api.hx_route_len()} waypoints`;
   $("tNote").textContent = COURSE_NOTES[name] || "";
-  // The command dial is a speed on walking courses and a height on JUMP.
+  // The command dial is a speed. JUMP samples a faster band because the
+  // trenches are a running jump.
   const lo = api.hx_cruise_lo();
   const hi = api.hx_cruise_hi();
   const r = $("rCruise");
   r.min = lo;
   r.max = hi;
-  r.step = isJump() ? 0.01 : 0.1;
-  state.cruise = isJump() ? (lo + hi) / 2 : 4.0;
+  r.step = 0.1;
+  state.cruise = isJump() ? 4.5 : 4.0;
   r.value = state.cruise;
   api.hx_set_cruise(state.cruise);
   syncCruiseLabels();
@@ -1549,21 +1542,13 @@ function applyCourse() {
 function syncCruiseLabels() {
   const lo = api.hx_cruise_lo();
   const hi = api.hx_cruise_hi();
-  if (isJump()) {
-    $("cruiseTitle").textContent = "Commanded jump";
-    $("cruiseHold").textContent = "Hit this apex";
-    $("vCruise").textContent = `${state.cruise.toFixed(2)} m`;
-    $("cruiseNote").textContent = `trained over ${lo.toFixed(2)}–${hi.toFixed(2)} m`;
-    $("cruiseHelp").textContent =
-      "The reward is apex tracking, not max height, and the command is an input. Extra height past it earns nothing; a landing the servos cannot absorb ends the run. The seed hop is a small one — Train is how it gets higher.";
-  } else {
-    $("cruiseTitle").textContent = "Commanded speed";
-    $("cruiseHold").textContent = "Hold this cruise";
-    $("vCruise").textContent = `${state.cruise.toFixed(1)} m/s`;
-    $("cruiseNote").textContent = `trained over ${lo.toFixed(1)}–${hi.toFixed(1)} m/s`;
-    $("cruiseHelp").textContent =
-      "The reward is speed tracking, not distance, and the command is an input to the policy. Move it and watch the learned gait change its cycle time, stride and duty factor to keep up — the hand-tuned one cannot, because it has no feedback layer.";
-  }
+  $("cruiseTitle").textContent = "Commanded speed";
+  $("cruiseHold").textContent = "Hold this cruise";
+  $("vCruise").textContent = `${state.cruise.toFixed(1)} m/s`;
+  $("cruiseNote").textContent = `trained over ${lo.toFixed(1)}–${hi.toFixed(1)} m/s`;
+  $("cruiseHelp").textContent = isJump()
+    ? "The reward is still speed tracking. The trenches are wider than a stride, so the only way to hold the command is to jump them — and land without stripping the servos. The seed jumps when it sees a pit; Train is how it gets further."
+    : "The reward is speed tracking, not distance, and the command is an input to the policy. Move it and watch the learned gait change its cycle time, stride and duty factor to keep up — the hand-tuned one cannot, because it has no feedback layer.";
 }
 
 /* ------------------------------------------------------------------ boot */

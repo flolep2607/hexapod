@@ -16,7 +16,7 @@ use hexapod_core::ars::{ArsConfig, Trainer};
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
 use hexapod_core::math::{squash, unsquash};
-use hexapod_core::sim::{Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_DEFAULT, JUMP_MAX, JUMP_MIN};
+use hexapod_core::sim::{Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN};
 use hexapod_core::dynamics::Physics;
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
 use hexapod_core::terrain::{Course, Terrain, Z_MAX};
@@ -144,7 +144,7 @@ pub extern "C" fn hx_set_course(kind: u32, seed: u32) {
     a.course_buf = a.terrain.export();
     a.route_buf = a.terrain.export_route();
     a.cruise = if a.course.is_jump() {
-        JUMP_DEFAULT
+        JUMP_CRUISE_DEFAULT
     } else {
         CRUISE_DEFAULT
     };
@@ -362,13 +362,13 @@ pub extern "C" fn hx_set_servo(index: u32) -> u32 {
     1
 }
 
-/// Commanded cruise speed or jump height, clamped to the range training
-/// samples from on the current course.
+/// Commanded cruise speed, clamped to the range training samples from on
+/// the current course.
 #[no_mangle]
 pub extern "C" fn hx_set_cruise(v: f64) {
     let a = app();
     a.cruise = if a.course.is_jump() {
-        v.clamp(JUMP_MIN, JUMP_MAX)
+        v.clamp(JUMP_CRUISE_MIN, JUMP_CRUISE_MAX)
     } else {
         v.clamp(CRUISE_MIN, CRUISE_MAX)
     };
@@ -377,7 +377,7 @@ pub extern "C" fn hx_set_cruise(v: f64) {
 #[no_mangle]
 pub extern "C" fn hx_cruise_lo() -> f64 {
     if app().course.is_jump() {
-        JUMP_MIN
+        JUMP_CRUISE_MIN
     } else {
         CRUISE_MIN
     }
@@ -386,7 +386,7 @@ pub extern "C" fn hx_cruise_lo() -> f64 {
 #[no_mangle]
 pub extern "C" fn hx_cruise_hi() -> f64 {
     if app().course.is_jump() {
-        JUMP_MAX
+        JUMP_CRUISE_MAX
     } else {
         CRUISE_MAX
     }
@@ -555,16 +555,11 @@ impl App {
         // Steering goes back to the policy the moment nobody is asking for a
         // turn, so the route is followed by default and overridden on demand.
         let turn = turn.clamp(-1.0, 1.0);
-        let cmd = if self.course.is_jump() {
-            Cmd::jump(self.cruise)
-        } else {
-            Cmd {
-                fwd: fwd.clamp(-1.0, 1.0),
-                turn,
-                cruise: self.cruise,
-                nav: self.nav && turn.abs() < 0.02,
-                task: hexapod_core::Task::Walk,
-            }
+        let cmd = Cmd {
+            fwd: fwd.clamp(-1.0, 1.0),
+            turn,
+            cruise: self.cruise,
+            nav: self.nav && turn.abs() < 0.02,
         };
         let policy: &Policy = if self.mode == MODE_LEARNED && self.trained {
             &self.learned
@@ -720,7 +715,7 @@ impl App {
         t[T_BROKEN] = if s.broken { 1.0 } else { 0.0 };
         t[T_IMPACT] = s.impact_g as f32;
         t[T_JUMPS] = s.jumps as f32;
-        t[T_TASK] = if self.course.is_jump() { 1.0 } else { 0.0 };
+        t[T_TASK] = if s.jump_clock > 0.0 { 1.0 } else { 0.0 };
         t[T_CLEARANCE] = s.clearance as f32;
     }
 }

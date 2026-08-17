@@ -106,7 +106,7 @@ pub const T_HOP_APEX: usize = 380; // current/last hop
 pub const T_BROKEN: usize = 381;
 pub const T_IMPACT: usize = 382; // peak landing demand, g
 pub const T_JUMPS: usize = 383;
-pub const T_TASK: usize = 384; // 0 walk, 1 jump
+pub const T_TASK: usize = 384; // 1 while a hop is in progress
 pub const T_CLEARANCE: usize = 385;
 
 pub const T_LEN: usize = 392;
