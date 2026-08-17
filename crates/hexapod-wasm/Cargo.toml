@@ -12,3 +12,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 hexapod-core = { path = "../hexapod-core", features = ["rapier"] }
+
+[lints]
+workspace = true

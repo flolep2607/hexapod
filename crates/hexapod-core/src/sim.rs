@@ -219,7 +219,7 @@ fn hop_feedforward(clock: f64) -> (f64, f64) {
     };
     let crouch = bump(0.00, HOP_CROUCH + 0.02);
     let push = bump(0.05, 0.28);
-    let lift = if clock >= HOP_PUSH && clock < HOP_LIFT_END {
+    let lift = if (HOP_PUSH..HOP_LIFT_END).contains(&clock) {
         1.0
     } else {
         0.0

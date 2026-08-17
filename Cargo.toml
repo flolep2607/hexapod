@@ -1,11 +1,17 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/hexapod-core", "crates/hexapod-cli", "crates/hexapod-wasm"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+
+# This is numeric code: `for i in 0..3` indexing several parallel arrays at once
+# is the clear form, and the physics helpers genuinely take that many scalars.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
 
 # Dev loop profile: still optimised enough for the sim to run at speed, but
 # without the LTO / single-codegen-unit link that makes release rebuilds slow.

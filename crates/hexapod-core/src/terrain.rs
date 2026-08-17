@@ -392,11 +392,10 @@ impl Terrain {
             let mut best: Option<Obstacle> = None;
             for &i in &self.buckets[Self::bucket_of(z)] {
                 let ob = self.obstacles[i as usize];
-                if ob.contains(x, z) && ob.top - floor > max_step {
-                    if best.map(|b| ob.top > b.top).unwrap_or(true) {
+                if ob.contains(x, z) && ob.top - floor > max_step
+                    && best.map(|b| ob.top > b.top).unwrap_or(true) {
                         best = Some(ob);
                     }
-                }
             }
             let Some(ob) = best else {
                 return (x, z);
@@ -873,7 +872,7 @@ mod tests {
         // Off the course entirely, and behind the first obstacle.
         assert_eq!(t.grip(0.0, Z_MIN - 1.0), GRIP_GROUND);
         assert_eq!(t.grip(0.0, 0.0), GRIP_GROUND);
-        assert!(GRIP_RUBBLE < GRIP_GROUND);
+        const { assert!(GRIP_RUBBLE < GRIP_GROUND) };
     }
 
     #[test]
@@ -985,7 +984,7 @@ mod tests {
         let (cx, cz) = ((ice.x0 + ice.x1) * 0.5, (ice.z0 + ice.z1) * 0.5);
         assert_eq!(t.grip(cx, cz), GRIP_ICE);
         assert!(t.height(cx, cz) < 0.02, "ice is not a step");
-        assert!(GRIP_ICE < GRIP_RUBBLE);
+        const { assert!(GRIP_ICE < GRIP_RUBBLE) };
     }
 
     #[test]

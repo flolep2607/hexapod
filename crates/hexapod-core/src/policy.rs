@@ -217,7 +217,7 @@ impl Preset {
         // cycle is already exactly `p` leg-steps, so it never needs the nudge —
         // and neither does an odd pair count, which is why the three-pair
         // hexapod comes out identical to the original hand-written table.
-        let ripple_side = if frame.pairs() % 2 == 0 {
+        let ripple_side = if frame.pairs().is_multiple_of(2) {
             0.5 + 0.5 / p
         } else {
             0.5

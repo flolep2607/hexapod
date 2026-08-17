@@ -18,3 +18,6 @@ default = []
 # Rapier 0.32 plant: 3 revolute joints per leg plus ground friction. The
 # centroidal model stays the default so ARS can still train in the page.
 rapier = ["dep:rapier3d"]
+
+[lints]
+workspace = true

@@ -402,11 +402,13 @@ impl ArticulatedPlant {
             });
         }
 
-        let mut integration = IntegrationParameters::default();
-        integration.dt = crate::sim::DT as f32;
-        integration.num_solver_iterations = 12;
-        integration.num_internal_pgs_iterations = 2;
-        integration.length_unit = 1.0;
+        let integration = IntegrationParameters {
+            dt: crate::sim::DT as f32,
+            num_solver_iterations: 12,
+            num_internal_pgs_iterations: 2,
+            length_unit: 1.0,
+            ..Default::default()
+        };
 
         ArticulatedPlant {
             scale: s,
@@ -638,8 +640,7 @@ mod tests {
         let mut broad = BroadPhaseBvh::new();
         let mut narrow = NarrowPhase::new();
         let mut ccd = CCDSolver::new();
-        let mut integration = IntegrationParameters::default();
-        integration.dt = 0.01;
+        let integration = IntegrationParameters { dt: 0.01, ..Default::default() };
         let floor_h = 0.40f32;
         let floor = bodies.insert(RigidBodyBuilder::fixed().translation(Vector::new(0.0, -floor_h, 29.0)));
         colliders.insert_with_parent(
@@ -689,8 +690,7 @@ mod tests {
         let mut broad = BroadPhaseBvh::new();
         let mut narrow = NarrowPhase::new();
         let mut ccd = CCDSolver::new();
-        let mut integration = IntegrationParameters::default();
-        integration.dt = 0.01;
+        let integration = IntegrationParameters { dt: 0.01, ..Default::default() };
         let floor = bodies.insert(RigidBodyBuilder::fixed().translation(Vector::new(0.0, -0.5, 0.0)));
         colliders.insert_with_parent(
             ColliderBuilder::cuboid(20.0, 0.5, 20.0).friction(0.8),
