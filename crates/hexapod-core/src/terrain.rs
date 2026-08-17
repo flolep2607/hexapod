@@ -13,7 +13,7 @@
 //! the ones with something in the way it threads the gaps, which is the whole
 //! point of having it.
 
-use crate::math::Rng;
+use crate::math::{clamp, Rng, V3};
 
 /// Half-width of the walkable corridor, in metres. Also where the two
 /// invisible walls are: the robot cannot cross them, and neither can a rock.
@@ -95,7 +95,10 @@ pub const GRIP_ICE: f64 = 0.22;
 const ICE_THICK: f64 = 0.01;
 /// Height of a slalom wall. Well above anything a leg can reach, so it is not
 /// an obstacle to climb — it is somewhere the machine cannot go.
-const WALL_TOP: f64 = 1.8;
+pub const WALL_TOP: f64 = 1.8;
+/// Keep query points this far outside a solid so sitting on a face does not
+/// count as being inside it.
+const WALL_PAD: f64 = 0.02;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Obstacle {
@@ -114,6 +117,47 @@ impl Obstacle {
     fn contains(&self, x: f64, z: f64) -> bool {
         x >= self.x0 && x <= self.x1 && z >= self.z0 && z <= self.z1
     }
+
+    /// Closest point of the rectangle to `(x, z)` is within `r`. This is the
+    /// exact disc test; sampling the circumference misses the cardinal
+    /// extrema and any wall that sits between those six points.
+    #[inline]
+    fn intersects_disc(&self, x: f64, z: f64, r: f64) -> bool {
+        let qx = clamp(x, self.x0, self.x1);
+        let qz = clamp(z, self.z0, self.z1);
+        let dx = x - qx;
+        let dz = z - qz;
+        dx * dx + dz * dz <= r * r
+    }
+}
+
+/// Slab test: does the segment `a→b` overlap the AABB? `t` in `[0, 1]`.
+fn segment_hits_aabb(a: V3, b: V3, x0: f64, x1: f64, y0: f64, y1: f64, z0: f64, z1: f64) -> bool {
+    let p = a;
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let lo = [x0, y0, z0];
+    let hi = [x1, y1, z1];
+    let mut tmin = 0.0f64;
+    let mut tmax = 1.0f64;
+    for i in 0..3 {
+        if d[i].abs() < 1e-14 {
+            if p[i] < lo[i] || p[i] > hi[i] {
+                return false;
+            }
+            continue;
+        }
+        let mut t1 = (lo[i] - p[i]) / d[i];
+        let mut t2 = (hi[i] - p[i]) / d[i];
+        if t1 > t2 {
+            core::mem::swap(&mut t1, &mut t2);
+        }
+        tmin = tmin.max(t1);
+        tmax = tmax.min(t2);
+        if tmin > tmax {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Clone)]
@@ -280,16 +324,143 @@ impl Terrain {
     }
 
     /// Highest point under a disc — used for body-clearance checks.
+    ///
+    /// This is an exact disc-versus-AABB test, not a handful of sample
+    /// points. Six samples on the circumference sit at `0.866 r` along the
+    /// cardinals, so a wall the chassis has already overlapped by a tenth of
+    /// a metre used to be invisible, and a wall in the next Z-bucket was not
+    /// even a candidate.
     pub fn height_disc(&self, x: f64, z: f64, r: f64) -> f64 {
-        let mut h = self.height(x, z);
-        for k in 0..6 {
-            let a = k as f64 * core::f64::consts::TAU / 6.0;
-            let hh = self.height(x + r * a.cos(), z + r * a.sin());
-            if hh > h {
-                h = hh;
+        let r = r.max(0.0);
+        let mut h = 0.0f64;
+        let b0 = Self::bucket_of(z - r);
+        let b1 = Self::bucket_of(z + r);
+        for b in b0..=b1 {
+            for &i in &self.buckets[b] {
+                let ob = &self.obstacles[i as usize];
+                if ob.top <= h {
+                    continue;
+                }
+                if ob.intersects_disc(x, z, r) {
+                    h = ob.top;
+                }
             }
         }
-        h
+        if h > 0.0 {
+            h
+        } else {
+            self.height(x, z)
+        }
+    }
+
+    /// Is this column something a foot cannot stand on? Relative to `floor`
+    /// so a staircase the machine is already climbing does not turn into a
+    /// wall, and a slalom wall the machine is standing in front of does.
+    #[inline]
+    pub fn blocked_column(&self, x: f64, z: f64, floor: f64, max_step: f64) -> bool {
+        if x.abs() >= CORRIDOR_HALF {
+            return true;
+        }
+        self.height(x, z) - floor > max_step
+    }
+
+    /// Nearest point that is not inside an unclimbable column. A step aimed
+    /// at the middle of a slalom wall used to be left there, at a capped
+    /// height, which is how a foot (and then the whole support polygon) ended
+    /// up inside the block.
+    pub fn push_xz(&self, mut x: f64, mut z: f64, floor: f64, max_step: f64) -> (f64, f64) {
+        let limit = CORRIDOR_HALF - WALL_PAD;
+        x = clamp(x, -limit, limit);
+        for _ in 0..4 {
+            if !self.blocked_column(x, z, floor, max_step) {
+                return (x, z);
+            }
+            let mut best: Option<Obstacle> = None;
+            for &i in &self.buckets[Self::bucket_of(z)] {
+                let ob = self.obstacles[i as usize];
+                if ob.contains(x, z) && ob.top - floor > max_step {
+                    if best.map(|b| ob.top > b.top).unwrap_or(true) {
+                        best = Some(ob);
+                    }
+                }
+            }
+            let Some(ob) = best else {
+                return (x, z);
+            };
+            let left = x - ob.x0;
+            let right = ob.x1 - x;
+            let back = z - ob.z0;
+            let fwd = ob.z1 - z;
+            if left <= right && left <= back && left <= fwd {
+                x = ob.x0 - WALL_PAD;
+            } else if right <= back && right <= fwd {
+                x = ob.x1 + WALL_PAD;
+            } else if back <= fwd {
+                z = ob.z0 - WALL_PAD;
+            } else {
+                z = ob.z1 + WALL_PAD;
+            }
+            x = clamp(x, -limit, limit);
+        }
+        (x, z)
+    }
+
+    /// A 3-D point inside an unclimbable prism, or past the corridor fence.
+    /// Sitting on a face (within `WALL_PAD`) is contact, not penetration.
+    pub fn solid_at(&self, p: V3, floor: f64, max_step: f64) -> bool {
+        if p[1] <= 0.0 {
+            return false;
+        }
+        if p[0].abs() > CORRIDOR_HALF + WALL_PAD && p[1] < WALL_TOP {
+            return true;
+        }
+        if !self.blocked_column(p[0], p[2], floor, max_step) {
+            return false;
+        }
+        if p[1] >= self.height(p[0], p[2]) - WALL_PAD {
+            return false;
+        }
+        for (dx, dz) in [
+            (WALL_PAD, 0.0),
+            (-WALL_PAD, 0.0),
+            (0.0, WALL_PAD),
+            (0.0, -WALL_PAD),
+        ] {
+            if !self.blocked_column(p[0] + dx, p[2] + dz, floor, max_step) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Would this segment enter an unclimbable solid? Climbable terrain stays
+    /// a height field — only the foot catches on it — because treating a
+    /// staircase as a volume would stop the machine walking up it.
+    pub fn segment_hits_wall(&self, a: V3, b: V3, floor: f64, max_step: f64) -> bool {
+        if self.solid_at(a, floor, max_step) || self.solid_at(b, floor, max_step) {
+            return true;
+        }
+        let b0 = Self::bucket_of(a[2].min(b[2]));
+        let b1 = Self::bucket_of(a[2].max(b[2]));
+        for bucket in b0..=b1 {
+            for &i in &self.buckets[bucket] {
+                let ob = &self.obstacles[i as usize];
+                if ob.top <= 0.0 || ob.top - floor <= max_step {
+                    continue;
+                }
+                let x0 = ob.x0 + WALL_PAD;
+                let x1 = ob.x1 - WALL_PAD;
+                let z0 = ob.z0 + WALL_PAD;
+                let z1 = ob.z1 - WALL_PAD;
+                if x1 <= x0 || z1 <= z0 {
+                    continue;
+                }
+                if segment_hits_aabb(a, b, x0, x1, 0.0, ob.top, z0, z1) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn push(&mut self, x0: f64, x1: f64, z0: f64, z1: f64, top: f64, grip: f64) {
@@ -345,7 +516,14 @@ impl Terrain {
             // Plateau.
             let plateau = r.range(1.0, 2.4);
             let top_h = rise * n_up as f64;
-            self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + plateau, top_h, GRIP_STEP);
+            self.push(
+                -CORRIDOR_HALF,
+                CORRIDOR_HALF,
+                z,
+                z + plateau,
+                top_h,
+                GRIP_STEP,
+            );
             z += plateau;
             // Down.
             for k in (0..n_up).rev() {
@@ -459,10 +637,24 @@ impl Terrain {
             let reach = CORRIDOR_HALF - GATE_HALF - 0.75;
             let gate = side * r.range(reach * 0.70, reach);
             if gate - GATE_HALF > -CORRIDOR_HALF {
-                self.push(-CORRIDOR_HALF, gate - GATE_HALF, z, z + THICK, WALL_TOP, GRIP_STEP);
+                self.push(
+                    -CORRIDOR_HALF,
+                    gate - GATE_HALF,
+                    z,
+                    z + THICK,
+                    WALL_TOP,
+                    GRIP_STEP,
+                );
             }
             if gate + GATE_HALF < CORRIDOR_HALF {
-                self.push(gate + GATE_HALF, CORRIDOR_HALF, z, z + THICK, WALL_TOP, GRIP_STEP);
+                self.push(
+                    gate + GATE_HALF,
+                    CORRIDOR_HALF,
+                    z,
+                    z + THICK,
+                    WALL_TOP,
+                    GRIP_STEP,
+                );
             }
             // Approach and exit, so the machine lines up before the gap rather
             // than arriving at it sideways.
@@ -709,7 +901,10 @@ mod tests {
         let t = Terrain::new(Course::Slalom, 4);
         let (r, under) = (0.9, 0.7);
         assert!(!t.obstructed(0.0, 2.0, r, under), "open ground is blocked");
-        assert!(t.obstructed(CORRIDOR_HALF - 0.5, 2.0, r, under), "walked through the wall");
+        assert!(
+            t.obstructed(CORRIDOR_HALF - 0.5, 2.0, r, under),
+            "walked through the wall"
+        );
         assert!(t.obstructed(-CORRIDOR_HALF - 3.0, 2.0, r, under));
         let w = t.obstacles.iter().find(|o| o.top > 1.0).unwrap();
         assert!(t.obstructed((w.x0 + w.x1) * 0.5, (w.z0 + w.z1) * 0.5, r, under));
@@ -740,7 +935,10 @@ mod tests {
                 t.height(0.0, z)
             })
             .fold(0.0f64, f64::max);
-        assert!(climb > 0.5, "highest point on the ramps is only {climb:.2} m");
+        assert!(
+            climb > 0.5,
+            "highest point on the ramps is only {climb:.2} m"
+        );
         // And at least one section is banked: the two edges are at different
         // heights at the same z.
         let banked = (0..600).any(|i| {
@@ -748,5 +946,63 @@ mod tests {
             (t.height(-4.0, z) - t.height(4.0, z)).abs() > 0.25
         });
         assert!(banked, "no cross-slope anywhere on the ramps");
+    }
+
+    #[test]
+    fn a_disc_that_barely_overlaps_a_wall_is_obstructed() {
+        // Six samples on the circumference sit at 0.866 r along Z, so a 5 cm
+        // overlap used to be invisible. The chassis then walked into the block.
+        let t = Terrain::new(Course::Slalom, 3);
+        let wall = t.obstacles.iter().find(|o| o.top > 1.0).unwrap();
+        let r = 0.90;
+        let x = (wall.x0 + wall.x1) * 0.5;
+        let z = wall.z0 - r + 0.05;
+        assert!(
+            t.height(x, z) < 0.05,
+            "centre should still be in front of the wall"
+        );
+        assert!(
+            t.height_disc(x, z, r) > 1.0,
+            "disc overlaps a 1.8 m wall but height_disc missed it: {}",
+            t.height_disc(x, z, r)
+        );
+        assert!(t.obstructed(x, z, r, 0.7));
+    }
+
+    #[test]
+    fn push_xz_takes_a_point_out_of_a_wall_instead_of_leaving_it_inside() {
+        let t = Terrain::new(Course::Slalom, 3);
+        let wall = t.obstacles.iter().find(|o| o.top > 1.0).unwrap();
+        let (cx, cz) = ((wall.x0 + wall.x1) * 0.5, (wall.z0 + wall.z1) * 0.5);
+        assert!(t.height(cx, cz) > 1.0);
+        let (x, z) = t.push_xz(cx, cz, 0.0, 0.62);
+        assert!(
+            t.height(x, z) < 0.62,
+            "pushed to ({x:.3}, {z:.3}) which is still {:.2} m high",
+            t.height(x, z)
+        );
+        // Nearest face of a 0.7 m wall is the front or back, not metres away.
+        assert!((z - cz).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_leg_segment_through_a_wall_is_a_hit_and_one_in_front_is_not() {
+        let t = Terrain::new(Course::Slalom, 3);
+        let wall = t.obstacles.iter().find(|o| o.top > 1.0).unwrap();
+        let cx = (wall.x0 + wall.x1) * 0.5;
+        let through = t.segment_hits_wall(
+            [cx, 0.4, wall.z0 - 0.4],
+            [cx, 0.4, wall.z1 + 0.4],
+            0.0,
+            0.62,
+        );
+        assert!(through, "a tibia going through a slalom wall was missed");
+        let clear = t.segment_hits_wall(
+            [cx, 0.4, wall.z0 - 1.2],
+            [cx, 0.4, wall.z0 - 0.4],
+            0.0,
+            0.62,
+        );
+        assert!(!clear, "open ground in front of the wall is blocked");
     }
 }

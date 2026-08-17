@@ -193,15 +193,45 @@ class Stage {
     this._segment(p(t0), p(t1), r, color);
   }
 
-  /** Walls plus one horizontal face: the lid of a block, the floor of a pit. */
+  /** Walls plus one horizontal face: the lid of a block, the floor of a pit.
+   * Large faces are split so back-to-front sorting does not let a femur that
+   * is *in front* of the near edge of a six-metre wall paint on top of it. */
   _box(x0, x1, y0, y1, z0, z1, side, cap, pit) {
     const P = (x, y, z) => [x, y, z];
     const capY = pit ? y0 : y1;
-    this._quad(P(x0, capY, z0), P(x1, capY, z0), P(x1, capY, z1), P(x0, capY, z1), cap);
-    this._quad(P(x0, y0, z0), P(x0, y1, z0), P(x0, y1, z1), P(x0, y0, z1), side);
-    this._quad(P(x1, y0, z1), P(x1, y1, z1), P(x1, y1, z0), P(x1, y0, z0), side);
-    this._quad(P(x1, y0, z0), P(x1, y1, z0), P(x0, y1, z0), P(x0, y0, z0), side);
-    this._quad(P(x0, y0, z1), P(x0, y1, z1), P(x1, y1, z1), P(x1, y0, z1), side);
+    this._faceGrid(P(x0, capY, z0), P(x1, capY, z0), P(x1, capY, z1), P(x0, capY, z1), cap);
+    this._faceGrid(P(x0, y0, z0), P(x0, y1, z0), P(x0, y1, z1), P(x0, y0, z1), side);
+    this._faceGrid(P(x1, y0, z1), P(x1, y1, z1), P(x1, y1, z0), P(x1, y0, z0), side);
+    this._faceGrid(P(x1, y0, z0), P(x1, y1, z0), P(x0, y1, z0), P(x0, y0, z0), side);
+    this._faceGrid(P(x0, y0, z1), P(x0, y1, z1), P(x1, y1, z1), P(x1, y0, z1), side);
+  }
+
+  /** Split an axis-aligned quad into tiles so painter's algorithm can order
+   * them against nearby legs. */
+  _faceGrid(a, b, _c, d, color) {
+    const TILE = 0.7;
+    const w = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    const h = Math.hypot(d[0] - a[0], d[1] - a[1], d[2] - a[2]);
+    const nw = Math.max(1, Math.ceil(w / TILE));
+    const nh = Math.max(1, Math.ceil(h / TILE));
+    if (nw === 1 && nh === 1) {
+      this._quad(a, b, _c, d, color);
+      return;
+    }
+    const pt = (u, v) => [
+      a[0] + (b[0] - a[0]) * u + (d[0] - a[0]) * v,
+      a[1] + (b[1] - a[1]) * u + (d[1] - a[1]) * v,
+      a[2] + (b[2] - a[2]) * u + (d[2] - a[2]) * v,
+    ];
+    for (let i = 0; i < nw; i++) {
+      for (let j = 0; j < nh; j++) {
+        const u0 = i / nw;
+        const u1 = (i + 1) / nw;
+        const v0 = j / nh;
+        const v1 = (j + 1) / nh;
+        this._quad(pt(u0, v0), pt(u1, v0), pt(u1, v1), pt(u0, v1), color);
+      }
+    }
   }
 
   /** Chassis: an octagonal prism with a bevelled deck. */

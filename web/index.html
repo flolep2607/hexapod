@@ -327,14 +327,16 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             knows it is a hexapod.</p>
             <p class="note">The course is <b>fenced</b> by two invisible walls at the corridor edges, and
             some of what is inside cannot be climbed — a slalom wall is nearly twice the length of a leg.
-            Both are the same obstruction test. Hitting one takes the velocity component into it and keeps
-            the component along it, so a machine that arrives square stops and one that arrives at an angle
-            slides along and gets round; a step aimed at somewhere a leg cannot reach is deflected to the
-            nearest ground that it can.</p>
+            Both are the same obstruction test, and the legs answer it too: a femur that would enter a wall
+            stops the step the same way the chassis does. Hitting one takes the velocity component into it
+            and keeps the component along it, so a machine that arrives square stops and one that arrives
+            at an angle slides along and gets round; a step aimed at somewhere a leg cannot reach is
+            deflected to the nearest ground that it can.</p>
             <p class="note">What is still kinematic, stated plainly: links are rigid, contact is resolved
             once per tick rather than by an impulse solver, and the leg-inertia terms are the diagonal ones
             — each joint sees the mass below it, without the off-diagonal coupling or the Coriolis terms of
-            a full mass matrix. It is not a general articulated multibody engine.</p>
+            a full mass matrix. It is not a general articulated multibody engine, and it is not Bevy or
+            Rapier: a step has to stay cheap enough that the learner can run in the page.</p>
           </div>
           <div class="sec">
             <div class="sec-bar"><h2>The learner</h2></div>
