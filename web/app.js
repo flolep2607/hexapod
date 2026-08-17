@@ -66,6 +66,7 @@ let course = new Float32Array(0);
 
 const state = {
   paused: false,
+  timeScale: 1,
   training: false,
   mode: 0,
   courseKind: 4,
@@ -754,9 +755,6 @@ function afterMachineChange() {
   $("btnTrain").dataset.on = "false";
   $("btnTrain").textContent = "Train";
   setMode(0);
-  $("btnLearn").disabled = true;
-  $("policyNote").textContent =
-    "New machine — the previous policy was learned for a different one.";
   updateTrainingPanel();
   updateHardware();
   updateSystem();
@@ -1124,7 +1122,7 @@ let lastFrame = performance.now();
 let slowAcc = 0;
 
 function frame(now) {
-  const dt = Math.min(0.05, (now - lastFrame) / 1000);
+  const dt = Math.min(0.05, (now - lastFrame) / 1000) * state.timeScale;
   lastFrame = now;
 
   readKeys();
@@ -1139,11 +1137,6 @@ function frame(now) {
     const t0 = performance.now();
     api.hx_train(1);
     state.iterMs = performance.now() - t0;
-    if (telemetry()[L.T_TRAINED] > 0.5 && $("btnLearn").disabled) {
-      $("btnLearn").disabled = false;
-      $("policyNote").textContent =
-        "Switch between the hand-tuned gait and the learned policy on the same course.";
-    }
     drawCurve();
     updateTrainingPanel();
   }
@@ -1168,7 +1161,9 @@ function frame(now) {
 
 function updateReadouts(t) {
   const secs = t[L.T_TIME];
-  $("hClock").textContent = `${String(Math.floor(secs / 60)).padStart(2, "0")}:${fmt(secs % 60, 1).padStart(4, "0")}`;
+  $("hClock").textContent =
+    `${String(Math.floor(secs / 60)).padStart(2, "0")}:${fmt(secs % 60, 1).padStart(4, "0")}` +
+    (state.timeScale === 1 ? "" : ` · ${state.timeScale}×`);
   $("hCourse").textContent = courseName(state.courseKind);
   const hinges = Math.round(t[L.T_N_HINGES] || state.legs * 3);
   $("hSolver").textContent =
@@ -1303,6 +1298,12 @@ function updateTrainingPanel() {
     : t[L.T_ITER] > 0
     ? "stopped"
     : "idle";
+  const trained = t[L.T_TRAINED] > 0.5;
+  $("btnLearn").disabled = !trained;
+  $("policyNote").textContent = trained
+    ? "Switch between the hand-tuned gait and the learned policy on the same course."
+    : "Train a policy to enable the comparison.";
+  if (!trained && state.mode === 1) setMode(0);
   refreshGaitTable();
 }
 
@@ -1323,6 +1324,12 @@ function readKeys() {
   }
 }
 
+function setRate(x) {
+  state.timeScale = Math.min(4, Math.max(0.25, Math.round(x * 4) / 4));
+  $("rRate").value = state.timeScale;
+  $("vRate").textContent = `${state.timeScale}×`;
+}
+
 function wire() {
   document.querySelectorAll(".tab").forEach((b) =>
     b.addEventListener("click", () => setTab(b.dataset.tab))
@@ -1334,6 +1341,7 @@ function wire() {
     $("btnPause").textContent = state.paused ? "Resume" : "Pause";
     log(state.paused ? "sim.pause()" : "sim.resume()");
   });
+  $("rRate").addEventListener("input", () => setRate(+$("rRate").value));
   $("btnReset").addEventListener("click", () => {
     api.hx_reset_live();
     log("sim.reset()");
@@ -1354,7 +1362,6 @@ function wire() {
     $("btnTrain").dataset.on = "false";
     $("btnTrain").textContent = "Train";
     api.hx_reset_training();
-    $("btnLearn").disabled = true;
     setMode(0);
     drawCurve();
     updateTrainingPanel();
@@ -1385,7 +1392,6 @@ function wire() {
       document
         .querySelectorAll("[data-preset]")
         .forEach((b) => (b.dataset.on = String(+b.dataset.preset === state.preset)));
-      $("btnLearn").disabled = true;
       setMode(0);
       syncSliders();
       drawCurve();
@@ -1526,6 +1532,10 @@ function wire() {
       $("btnPause").click();
       e.preventDefault();
     }
+    if (k === "[" || k === "]") {
+      setRate(state.timeScale * (k === "]" ? 2 : 0.5));
+      e.preventDefault();
+    }
     const typing =
       e.target &&
       (e.target.tagName === "SELECT" ||
@@ -1551,7 +1561,6 @@ function applyCourse() {
   state.training = false;
   $("btnTrain").dataset.on = "false";
   $("btnTrain").textContent = "Train";
-  $("btnLearn").disabled = true;
   setMode(0);
   const name = courseName(state.courseKind);
   $("trCourse").textContent = name;
@@ -1612,12 +1621,72 @@ async function boot() {
   describeMachine();
 
   /* Hooks for the end-to-end test, which drives the real page rather than
-   * reimplementing any of it. Read-only, and nothing else uses them. */
+   * reimplementing any of it. Nothing else uses them. */
   window.__hxFalls = falls;
+  // Advance the actual WASM plant deterministically without waiting for wall
+  // time. The smoke suite still verifies the animation loop separately; long
+  // physics assertions use this to avoid sleeping through simulated seconds.
+  window.__hxStepSamples = (count) => {
+    const n = Math.min(1200, Math.max(0, Math.floor(count)));
+    let t = telemetry();
+    let hull = { n: 0, span: Infinity };
+    let speed = { closest: 0, error: Infinity };
+    for (let i = 0; i < n; i++) {
+      api.hx_step(1 / 60, state.cmd.fwd, state.cmd.turn);
+      t = telemetry();
+      const last = falls.t[falls.t.length - 1];
+      // A fallen run repeats its final instant until recovery. The real-time
+      // loop gets one duplicate per frame; a tight test loop can get hundreds.
+      if (last === undefined || t[L.T_TIME] !== last) {
+        falls.push(t[L.T_TIME], t, L, Math.round(t[L.T_LEGS]) || 6);
+      }
+      const hullN = Math.round(t[L.T_HULL_N]);
+      let hullSpan = 0;
+      for (let point = 0; point < hullN; point++) {
+        hullSpan = Math.max(
+          hullSpan,
+          Math.hypot(
+            t[L.T_HULL + point * 2] - t[L.T_POS],
+            t[L.T_HULL + point * 2 + 1] - t[L.T_POS + 2]
+          )
+        );
+      }
+      if (hullN >= 3 && hullSpan < hull.span) hull = { n: hullN, span: hullSpan };
+      const measuredSpeed = Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]);
+      const speedError = Math.abs(measuredSpeed - state.cruise);
+      if (speedError < speed.error) speed = { closest: measuredSpeed, error: speedError };
+    }
+    updateReadouts(t);
+    drawGaitDiagram(t);
+    return {
+      samples: falls.t.length,
+      time: t[L.T_TIME],
+      reached: t[L.T_REACHED],
+      cycle: falls.cycle(),
+      kind: falls.classify(),
+      hull,
+      speed,
+    };
+  };
   window.__hxRoute = () => api.hx_route_len();
   window.__hxDuty = () => {
     const t = telemetry();
     return { duty: t[L.T_DUTY_NOW], cycle: t[L.T_CYCLE_NOW] };
+  };
+  // Furthest support-polygon vertex from the drawn chassis: the overlays come
+  // out of the centroidal Sim, the body on screen is the Rapier one, so this
+  // catches the two frames parting company again.
+  window.__hxHullSpan = () => {
+    const t = telemetry();
+    const n = Math.round(t[L.T_HULL_N]);
+    let m = 0;
+    for (let i = 0; i < n; i++) {
+      m = Math.max(
+        m,
+        Math.hypot(t[L.T_HULL + i * 2] - t[L.T_POS], t[L.T_HULL + i * 2 + 1] - t[L.T_POS + 2])
+      );
+    }
+    return { n, span: m };
   };
   window.__hxSway = () => {
     const n = api.hx_route_len();

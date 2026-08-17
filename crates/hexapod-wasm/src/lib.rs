@@ -21,6 +21,7 @@ use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
 use hexapod_core::math::{squash, unsquash};
 use hexapod_core::plant::{foot_in_body, ArticulatedPlant};
 use hexapod_core::policy::{act_body_dh, n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
+use hexapod_core::robot::BODY_H;
 use hexapod_core::sim::{
     Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX,
     JUMP_CRUISE_MIN,
@@ -50,8 +51,9 @@ struct App {
 
     live: Sim,
     live_gait: Gait,
-    /// Rapier articulated plant. The live view is 18 revolute joints plus
-    /// ground friction; ARS still trains on the centroidal step.
+    /// Rapier articulated plant. The live view draws its body transforms;
+    /// ARS still trains on the centroidal step. Pose is never written back
+    /// into `Sim`.
     plant: Option<ArticulatedPlant>,
     mode: u32,
     since_fall: f64,
@@ -328,6 +330,9 @@ pub extern "C" fn hx_train(iters: u32) -> f64 {
     }
     a.trained = true;
     a.learned = a.trainer.best_policy();
+    // Publish here: the live view only calls `hx_step` while unpaused, and
+    // the dashboard reads these fields after `hx_train`.
+    a.publish();
     a.trainer.best_reward
 }
 
@@ -563,6 +568,7 @@ impl App {
         );
         self.trained = false;
         self.learned = self.baseline.clone();
+        self.publish();
     }
 
     fn step(&mut self, dt: f64, fwd: f64, turn: f64) {
@@ -590,7 +596,8 @@ impl App {
             &self.baseline
         };
         // Substep so a long frame cannot destabilise the integrator.
-        let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 6);
+        // 16 ticks covers 4× playback at a slow 30 Hz frame.
+        let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
         let h = dt / n as f64;
         for _ in 0..n {
             self.live
@@ -613,45 +620,59 @@ impl App {
                     q_cmd[i] = hexapod_core::robot::solve_ik(self.frame, i, target).q;
                     self.live.q_cmd[i] = q_cmd[i];
                 }
-                plant.drive(&q_cmd, &self.phys);
+                plant.drive(&q_cmd, &self.phys, h);
                 plant.step(h);
                 // Do not write Rapier q/pose back into `live`: a missed
                 // motor track would rewind the centroidal gait clock.
+                let (p, ..) = plant.chassis_pose();
+                if p[1] <= self.terrain.height(p[0], p[2]) + BODY_H * 0.45 {
+                    self.live.fallen = true;
+                }
             }
         }
     }
 
     fn publish(&mut self) {
         let n = self.frame.legs();
-        // Rapier hinge angles for the canvas only. The live `Sim` stays
-        // centroidal so a missed motor track cannot rewind gait-clock state.
-        let plant_q = self.plant.as_ref().map(|plant| {
+        // Canvas reads Rapier body transforms. `Sim` stays centroidal: writing
+        // plant pose back through the integrator rewinds the gait clock.
+        let plant_draw = self.plant.as_ref().map(|plant| {
+            let (pos, yaw, pitch, roll) = plant.chassis_pose();
             let mut q = [[0.0f64; 3]; MAX_LEGS];
+            let mut joints = [[[0.0f64; 3]; 4]; MAX_LEGS];
             for i in 0..n {
                 q[i] = plant.leg_q(i);
+                joints[i] = plant.leg_joints_world(i);
             }
-            q
+            (pos, yaw, pitch, roll, q, joints)
         });
 
         let t = &mut self.telemetry;
         let s = &self.live;
 
+        let (pos, yaw, pitch, roll) = match plant_draw.as_ref() {
+            Some((p, y, pi, r, _, _)) => (*p, *y, *pi, *r),
+            None => (s.pos, s.yaw, s.pitch, s.roll),
+        };
         for i in 0..3 {
-            t[T_POS + i] = s.pos[i] as f32;
+            t[T_POS + i] = pos[i] as f32;
         }
-        t[T_YAW] = s.yaw as f32;
-        t[T_PITCH] = s.pitch as f32;
-        t[T_ROLL] = s.roll as f32;
+        t[T_YAW] = yaw as f32;
+        t[T_PITCH] = pitch as f32;
+        t[T_ROLL] = roll as f32;
+
+        // Hull, touchdown targets and CoM come out of the centroidal `Sim`,
+        // whose world pose slowly parts company with the Rapier body the
+        // canvas actually draws. Rebase them into the drawn frame or they
+        // wander off across the terrain as the gap grows.
+        let rebase = |x: f64, z: f64| {
+            let d = hexapod_core::math::rot_y([x - s.pos[0], 0.0, z - s.pos[2]], yaw - s.yaw);
+            [pos[0] + d[0], pos[2] + d[2]]
+        };
 
         for leg in 0..n {
-            let (q_draw, joints) = match plant_q.as_ref() {
-                Some(pq) => {
-                    let q = pq[leg];
-                    let j = hexapod_core::robot::fk_world(
-                        s.frame, leg, q, s.pos, s.yaw, s.pitch, s.roll,
-                    );
-                    (q, j)
-                }
+            let (q_draw, joints) = match plant_draw.as_ref() {
+                Some((_, _, _, _, q, j)) => (q[leg], j[leg]),
                 None => (s.q[leg], s.joints[leg]),
             };
             for p in 0..4 {
@@ -664,16 +685,21 @@ impl App {
             t[T_LEGPHASE + leg] = s.feet[leg].leg_phase as f32;
             t[T_STEPH + leg] = s.feet[leg].step_h as f32;
             t[T_LEG_LOAD + leg] = s.feet[leg].load_frac as f32;
+            let td = s.feet[leg].td;
+            let td_draw = rebase(td[0], td[2]);
+            t[T_TD + leg * 3] = td_draw[0] as f32;
+            t[T_TD + leg * 3 + 1] = td[1] as f32;
+            t[T_TD + leg * 3 + 2] = td_draw[1] as f32;
             for c in 0..3 {
-                t[T_TD + leg * 3 + c] = s.feet[leg].td[c] as f32;
                 t[T_Q + leg * 3 + c] = q_draw[c] as f32;
                 t[T_QCMD + leg * 3 + c] = s.q_cmd[leg][c] as f32;
             }
         }
 
         for i in 0..MAX_LEGS {
-            t[T_HULL + i * 2] = s.hull[i][0] as f32;
-            t[T_HULL + i * 2 + 1] = s.hull[i][1] as f32;
+            let h = rebase(s.hull[i][0], s.hull[i][1]);
+            t[T_HULL + i * 2] = h[0] as f32;
+            t[T_HULL + i * 2 + 1] = h[1] as f32;
         }
         t[T_HULL_N] = s.hull_n as f32;
         t[T_LEGS] = n as f32;
@@ -688,8 +714,13 @@ impl App {
         t[T_FALLEN] = if s.fallen { 1.0 } else { 0.0 };
         t[T_BLOCKED] = if s.blocked { 1.0 } else { 0.0 };
         t[T_ADVANCE] = s.advance_frac as f32;
-        t[T_COM] = s.com_drift[0] as f32;
-        t[T_COM + 1] = s.com_drift[1] as f32;
+        // Renderer adds the drawn pos back, so only the drift rotates.
+        let cd = hexapod_core::math::rot_y(
+            [s.com_drift[0], 0.0, s.com_drift[1]],
+            yaw - s.yaw,
+        );
+        t[T_COM] = cd[0] as f32;
+        t[T_COM + 1] = cd[2] as f32;
         t[T_STUB] = s.stub_total as f32;
         t[T_COLLISIONS] = s.collisions as f32;
         for i in 0..3 {
@@ -927,4 +958,34 @@ pub extern "C" fn hx_solve_system(servo_idx: u32) -> *const f32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn hx_servo_count() -> u32 {
     hexapod_core::SERVOS.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tel() -> &'static [f32] {
+        unsafe { std::slice::from_raw_parts(hx_telemetry_ptr(), hx_telemetry_len() as usize) }
+    }
+
+    #[test]
+    fn train_publishes_stats_without_a_step() {
+        hx_init(1);
+        hx_set_train_cfg(2, 1, 0.025, 0.04, 2.0);
+        assert!(tel()[T_TRAINED] < 0.5);
+        assert_eq!(tel()[T_ITER], 0.0);
+
+        let reward = hx_train(1);
+        assert!(reward.is_finite(), "{reward}");
+        let t = tel();
+        assert!(t[T_TRAINED] > 0.5, "T_TRAINED={}", t[T_TRAINED]);
+        assert!(t[T_ITER] >= 1.0, "T_ITER={}", t[T_ITER]);
+        assert!(t[T_BASE_R].is_finite());
+        assert!(t[T_BEST_R].is_finite());
+
+        hx_reset_training();
+        let t = tel();
+        assert!(t[T_TRAINED] < 0.5, "T_TRAINED={}", t[T_TRAINED]);
+        assert_eq!(t[T_ITER], 0.0);
+    }
 }

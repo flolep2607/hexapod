@@ -12,7 +12,8 @@ server, no network, no dependencies.
 
 ```
 ./build.sh          # test, compile wasm, emit dist/hexapod-simulator.html
-node test/smoke.mjs # drive the built page in a real browser
+node test/smoke.mjs # run five browser scenarios in parallel
+SMOKE_SCREENSHOTS=1 node test/smoke.mjs # optionally save the 15 visual snapshots
 ```
 
 ## What it does

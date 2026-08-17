@@ -4,14 +4,23 @@
  * back-to-front. That is all this scene needs, and it gives exactly the
  * crisp technical look the panel is going for — no WebGL, no dependencies.
  *
- * Shadows are the same faces projected onto y=0 along the light direction and
- * filled at low alpha; overlapping limbs accumulate into a soft blob for free.
+ * Shadows are the same faces projected onto the local surface along the light
+ * and drawn as low-alpha quads in the depth pass so they sit on blocks.
  */
 
 const COL = {
   shell: [0.925, 0.925, 0.915],
   shellDark: [0.84, 0.84, 0.83],
+  carbon: [0.12, 0.13, 0.14],
+  carbonEdge: [0.22, 0.23, 0.24],
+  metal: [0.58, 0.60, 0.62],
+  metalLight: [0.78, 0.80, 0.81],
+  rubber: [0.10, 0.105, 0.11],
+  cable: [0.055, 0.06, 0.065],
+  lens: [0.06, 0.12, 0.15],
+  led: [0.18, 0.86, 0.52],
   accent: [0.898, 0.224, 0.114],
+  accentDark: [0.55, 0.105, 0.055],
   joint: [0.32, 0.32, 0.33],
   block: [0.88, 0.88, 0.865],
   blockTop: [0.95, 0.95, 0.94],
@@ -197,8 +206,9 @@ class Stage {
     this.faces.push({ p: [a, b, c], c: color });
   }
 
-  /** Box between two points, with a square cross-section of half-width r. */
-  _segment(a, b, r, color) {
+  /** Faceted cylinder between two points. Six sides are enough to read as a
+   * machined tube while keeping this dependency-free renderer inexpensive. */
+  _segment(a, b, r, color, sides = 6) {
     const ax = sub(b, a);
     const len = Math.hypot(ax[0], ax[1], ax[2]);
     if (len < 1e-6) return;
@@ -209,34 +219,116 @@ class Stage {
     const v = cross(axis, u);
 
     const c = [];
-    for (const [su, sv] of [
-      [1, 1],
-      [1, -1],
-      [-1, -1],
-      [-1, 1],
-    ]) {
+    for (let i = 0; i < sides; i++) {
+      const a0 = (i / sides) * Math.PI * 2 + Math.PI / sides;
+      const su = Math.cos(a0);
+      const sv = Math.sin(a0);
       c.push([
         [a[0] + (u[0] * su + v[0] * sv) * r, a[1] + (u[1] * su + v[1] * sv) * r, a[2] + (u[2] * su + v[2] * sv) * r],
         [b[0] + (u[0] * su + v[0] * sv) * r, b[1] + (u[1] * su + v[1] * sv) * r, b[2] + (u[2] * su + v[2] * sv) * r],
       ]);
     }
-    for (let i = 0; i < 4; i++) {
-      const j = (i + 1) % 4;
+    for (let i = 0; i < sides; i++) {
+      const j = (i + 1) % sides;
       this._quad(c[i][0], c[i][1], c[j][1], c[j][0], color);
     }
     // Caps keep the limbs from looking hollow at grazing angles.
-    this._quad(c[0][0], c[1][0], c[2][0], c[3][0], color);
-    this._quad(c[3][1], c[2][1], c[1][1], c[0][1], color);
+    this.faces.push({ p: c.map((x) => x[0]), c: color });
+    this.faces.push({ p: c.map((x) => x[1]).reverse(), c: color });
   }
 
-  /** Fraction [t0,t1] along a segment, drawn thicker — the accent collars. */
-  _collar(a, b, t0, t1, r, color) {
-    const p = (t) => [
-      a[0] + (b[0] - a[0]) * t,
-      a[1] + (b[1] - a[1]) * t,
-      a[2] + (b[2] - a[2]) * t,
+  /** Low-poly ellipsoid for bearings, servo bosses, feet and optical parts. */
+  _ellipsoid(center, radius, color, slices = 8, stacks = 4) {
+    const rx = Array.isArray(radius) ? radius[0] : radius;
+    const ry = Array.isArray(radius) ? radius[1] : radius;
+    const rz = Array.isArray(radius) ? radius[2] : radius;
+    const rings = [];
+    for (let j = 0; j <= stacks; j++) {
+      const lat = -Math.PI / 2 + (j / stacks) * Math.PI;
+      const ring = [];
+      for (let i = 0; i < slices; i++) {
+        const lon = (i / slices) * Math.PI * 2;
+        ring.push([
+          center[0] + Math.cos(lat) * Math.cos(lon) * rx,
+          center[1] + Math.sin(lat) * ry,
+          center[2] + Math.cos(lat) * Math.sin(lon) * rz,
+        ]);
+      }
+      rings.push(ring);
+    }
+    for (let j = 0; j < stacks; j++) {
+      for (let i = 0; i < slices; i++) {
+        const k = (i + 1) % slices;
+        this._quad(rings[j][i], rings[j + 1][i], rings[j + 1][k], rings[j][k], color);
+      }
+    }
+  }
+
+  /** Oriented box expressed in chassis-local coordinates. */
+  _localBox(xf, center, half, side, top = side) {
+    const [cx, cy, cz] = center;
+    const [hx, hy, hz] = half;
+    const p = (x, y, z) => xf([cx + x * hx, cy + y * hy, cz + z * hz]);
+    const nnn = p(-1, -1, -1);
+    const pnn = p(1, -1, -1);
+    const ppn = p(1, 1, -1);
+    const npn = p(-1, 1, -1);
+    const nnp = p(-1, -1, 1);
+    const pnp = p(1, -1, 1);
+    const ppp = p(1, 1, 1);
+    const npp = p(-1, 1, 1);
+    this._quad(nnn, pnn, ppn, npn, side);
+    this._quad(pnp, nnp, npp, ppp, side);
+    this._quad(nnp, nnn, npn, npp, side);
+    this._quad(pnn, pnp, ppp, ppn, side);
+    this._quad(npn, ppn, ppp, npp, top);
+    this._quad(nnp, pnp, pnn, nnn, side);
+  }
+
+  /** Box in an arbitrary orthonormal basis. Used for rectangular servo cases,
+   * where the output shaft must visibly define exactly one hinge axis. */
+  _basisBox(center, axes, half, side, top = side) {
+    const point = (sx, sy, sz) => [
+      center[0] + axes[0][0] * half[0] * sx + axes[1][0] * half[1] * sy + axes[2][0] * half[2] * sz,
+      center[1] + axes[0][1] * half[0] * sx + axes[1][1] * half[1] * sy + axes[2][1] * half[2] * sz,
+      center[2] + axes[0][2] * half[0] * sx + axes[1][2] * half[1] * sy + axes[2][2] * half[2] * sz,
     ];
-    this._segment(p(t0), p(t1), r, color);
+    const nnn = point(-1, -1, -1);
+    const pnn = point(1, -1, -1);
+    const ppn = point(1, 1, -1);
+    const npn = point(-1, 1, -1);
+    const nnp = point(-1, -1, 1);
+    const pnp = point(1, -1, 1);
+    const ppp = point(1, 1, 1);
+    const npp = point(-1, 1, 1);
+    this._quad(nnn, pnn, ppn, npn, side);
+    this._quad(pnp, nnp, npp, ppp, side);
+    this._quad(nnp, nnn, npn, npp, side);
+    this._quad(pnn, pnp, ppp, ppn, side);
+    this._quad(npn, ppn, ppp, npp, top);
+    this._quad(nnp, pnp, pnn, nnn, side);
+  }
+
+  /** One revolute actuator: one rectangular motor, one continuous shaft and
+   * one output horn. There are deliberately no spherical joint shapes here. */
+  _servo(p, axisHint, mountHint, r, hit) {
+    const axis = norm(axisHint);
+    const along = dot(mountHint, axis);
+    let mount = norm([
+      mountHint[0] - axis[0] * along,
+      mountHint[1] - axis[1] * along,
+      mountHint[2] - axis[2] * along,
+    ]);
+    if (Math.hypot(mount[0], mount[1], mount[2]) < 1e-4) {
+      mount = norm(cross(axis, [0, 1, 0]));
+    }
+    const upright = norm(cross(mount, axis));
+    const casing = hit ? COL.hit : COL.joint;
+    this._basisBox(p, [axis, upright, mount], [r * 0.56, r * 0.72, r * 0.88], casing, hit ? COL.hitTop : COL.carbonEdge);
+
+    const at = (d) => [p[0] + axis[0] * d, p[1] + axis[1] * d, p[2] + axis[2] * d];
+    this._segment(at(-r * 0.82), at(r * 0.82), r * 0.20, COL.metalLight, 8);
+    this._segment(at(r * 0.55), at(r * 0.68), r * 0.52, hit ? COL.hitTop : COL.accent, 10);
   }
 
   /** Walls plus one horizontal face: the lid of a block, the floor of a pit.
@@ -280,7 +372,8 @@ class Stage {
     }
   }
 
-  /** Chassis: an octagonal prism with a bevelled deck. */
+  /** Layered aluminium/carbon chassis with an electronics enclosure, service
+   * hatch, fasteners, cooling ribs and a forward stereo rangefinder. */
   _chassis(pos, yaw, pitch, roll, R, hit) {
     const H = 0.30;
     const sy = Math.sin(yaw);
@@ -298,28 +391,70 @@ class Stage {
       return [pos[0] + x * cyw - z * sy, pos[1] + y, pos[2] + x * sy + z * cyw];
     };
 
-    const ring = (r, y) => {
+    const ring = (r, y, zScale = 1.12) => {
       const out = [];
-      for (let i = 0; i < 8; i++) {
-        const a = (i / 8) * Math.PI * 2 + Math.PI / 8;
-        out.push(xf([Math.cos(a) * r, y, Math.sin(a) * r]));
+      for (let i = 0; i < 12; i++) {
+        const a = (i / 12) * Math.PI * 2 + Math.PI / 12;
+        out.push(xf([Math.cos(a) * r, y, Math.sin(a) * r * zScale]));
       }
       return out;
     };
 
     const shell = hit ? COL.hitTop : COL.shell;
     const dark = hit ? COL.hit : COL.shellDark;
-    const bot = ring(R * 0.9, -H * 0.5);
-    const mid = ring(R, H * 0.12);
-    const top = ring(R * 0.78, H * 0.5);
+    const bot = ring(R * 0.88, -H * 0.5);
+    const lower = ring(R, -H * 0.08);
+    const belt = ring(R * 1.01, H * 0.06);
+    const top = ring(R * 0.83, H * 0.5);
 
-    for (let i = 0; i < 8; i++) {
-      const j = (i + 1) % 8;
-      this._quad(bot[i], mid[i], mid[j], bot[j], dark);
-      this._quad(mid[i], top[i], top[j], mid[j], shell);
+    for (let i = 0; i < 12; i++) {
+      const j = (i + 1) % 12;
+      this._quad(bot[i], lower[i], lower[j], bot[j], hit ? dark : COL.carbonEdge);
+      this._quad(lower[i], belt[i], belt[j], lower[j], hit ? dark : COL.accentDark);
+      this._quad(belt[i], top[i], top[j], belt[j], shell);
     }
     this.faces.push({ p: top, c: shell });
-    this.faces.push({ p: bot.slice().reverse(), c: dark });
+    this.faces.push({ p: bot.slice().reverse(), c: hit ? dark : COL.carbon });
+
+    // Raised, gasketed electronics enclosure and battery/service hatch.
+    this._localBox(xf, [0, H * 0.78, -0.03], [R * 0.47, H * 0.28, R * 0.48], dark, shell);
+    this._localBox(xf, [0, H * 1.08, -0.08], [R * 0.36, 0.018, R * 0.35], COL.carbonEdge, COL.carbon);
+    this._localBox(xf, [0, H * 1.115, -0.08], [R * 0.29, 0.012, R * 0.015], COL.accentDark, COL.accent);
+
+    // Cooling ribs make the top read as a working power enclosure, not a
+    // featureless polygon. They are shallow enough not to affect silhouette.
+    for (let i = -2; i <= 2; i++) {
+      this._localBox(
+        xf,
+        [i * R * 0.105, H * 1.18, -R * 0.15],
+        [R * 0.025, 0.015, R * 0.12],
+        COL.carbon,
+        COL.metal
+      );
+    }
+
+    // Stainless deck fasteners.
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2 + Math.PI / 8;
+      const q = xf([Math.cos(a) * R * 0.67, H * 0.57, Math.sin(a) * R * 0.74]);
+      const q2 = xf([Math.cos(a) * R * 0.67, H * 0.63, Math.sin(a) * R * 0.74]);
+      this._segment(q, q2, 0.025, COL.metalLight, 8);
+    }
+
+    // Forward sensor bridge: stereo lenses, status LED and a short antenna.
+    const sensorZ = R * 0.88;
+    this._localBox(xf, [0, H * 0.64, sensorZ], [R * 0.29, 0.095, 0.085], COL.joint, COL.carbonEdge);
+    for (const sx of [-R * 0.16, R * 0.16]) {
+      const lens = xf([sx, H * 0.64, sensorZ + 0.095]);
+      const glass = xf([sx, H * 0.64, sensorZ + 0.14]);
+      this._segment(lens, glass, 0.064, COL.metal, 10);
+      this._ellipsoid(glass, [0.055, 0.055, 0.025], COL.lens, 10, 3);
+    }
+    this._ellipsoid(xf([0, H * 0.74, sensorZ + 0.11]), 0.025, COL.led, 8, 3);
+    const mast = xf([R * 0.29, H * 0.98, 0]);
+    const tip = xf([R * 0.29, H * 1.72, 0]);
+    this._segment(mast, tip, 0.015, COL.joint, 6);
+    this._ellipsoid(tip, 0.026, COL.rubber, 8, 3);
   }
 
   _legs(J, stance, legs, hitLegs) {
@@ -331,20 +466,41 @@ class Stage {
       const foot = [J[o + 9], J[o + 10], J[o + 11]];
       const shell = hitLegs && hitLegs[leg] ? COL.hit : COL.shell;
 
-      this._segment(hip, knee, 0.075, shell);
-      this._collar(hip, knee, 0.0, 0.34, 0.098, COL.accent);
-
-      this._segment(knee, ankle, 0.062, shell);
-      this._collar(knee, ankle, 0.0, 0.17, 0.088, COL.accent);
-      this._collar(knee, ankle, 0.8, 0.94, 0.072, COL.accent);
-
-      this._segment(ankle, foot, 0.046, shell);
-      this._collar(ankle, foot, 0.0, 0.14, 0.07, COL.accent);
-      this._collar(ankle, foot, 0.84, 1.0, 0.052, COL.accent);
-
-      if (stance[leg] > 0.5) {
-        this._collar(ankle, foot, 0.95, 1.04, 0.068, COL.accent);
+      const coxa = sub(knee, hip);
+      const femur = sub(ankle, knee);
+      const tibia = sub(foot, ankle);
+      let pitchAxis = cross(coxa, femur);
+      if (Math.hypot(pitchAxis[0], pitchAxis[1], pitchAxis[2]) < 1e-4) {
+        pitchAxis = cross(coxa, [0, 1, 0]);
       }
+
+      // The coxa rotates about one vertical shaft. Femur and tibia use one
+      // transverse pitch axis each; their parallel shafts make the 3-DOF
+      // serial chain explicit without implying ball-and-socket joints.
+      const hit = hitLegs && hitLegs[leg];
+      this._servo(hip, [0, 1, 0], coxa, 0.13, hit);
+      this._servo(knee, pitchAxis, femur, 0.12, hit);
+      this._servo(ankle, pitchAxis, tibia, 0.105, hit);
+
+      this._segment(hip, knee, 0.075, shell, 8);
+
+      this._segment(knee, ankle, 0.062, shell, 8);
+
+      this._segment(ankle, foot, 0.046, hitLegs && hitLegs[leg] ? COL.hit : COL.metal, 8);
+
+      // External loom follows the upper and lower links, as on a serviceable
+      // robot where each servo is daisy chained. Offset it slightly upward so
+      // it remains visible against the pale link tubes.
+      const up = (p) => [p[0], p[1] + 0.045, p[2]];
+      this._segment(up(hip), up(knee), 0.014, COL.cable, 5);
+      this._segment(up(knee), up(ankle), 0.012, COL.cable, 5);
+
+      // A compliant, broad rubber sole gives stance feet believable contact
+      // area instead of terminating in a sharp metal point.
+      this._ellipsoid([foot[0], foot[1] + 0.018, foot[2]], [0.12, 0.045, 0.105], COL.rubber, 10, 3);
+      this._ellipsoid([foot[0], foot[1] + 0.052, foot[2]], [0.052, 0.035, 0.052], COL.metal, 8, 3);
+
+      if (stance[leg] > 0.5) this._ellipsoid([foot[0], foot[1] + 0.024, foot[2]], [0.125, 0.022, 0.11], COL.accentDark, 10, 2);
     }
   }
 
@@ -379,7 +535,28 @@ class Stage {
     }
   }
 
-  /** Which obstacles the chassis disc or a joint is inside. */
+  _segmentHitsBox(a, b, x0, x1, y0, y1, z0, z1) {
+    const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const lo = [x0, y0, z0];
+    const hi = [x1, y1, z1];
+    let t0 = 0;
+    let t1 = 1;
+    for (let axis = 0; axis < 3; axis++) {
+      if (Math.abs(d[axis]) < 1e-10) {
+        if (a[axis] < lo[axis] || a[axis] > hi[axis]) return false;
+        continue;
+      }
+      let q0 = (lo[axis] - a[axis]) / d[axis];
+      let q1 = (hi[axis] - a[axis]) / d[axis];
+      if (q0 > q1) [q0, q1] = [q1, q0];
+      t0 = Math.max(t0, q0);
+      t1 = Math.min(t1, q1);
+      if (t0 > t1) return false;
+    }
+    return true;
+  }
+
+  /** Which obstacles the chassis disc or any part of a leg intersects. */
   _hits(pos, bodyR, joints, legs) {
     const ob = this.obstacles;
     const n = Math.floor(ob.length / 5);
@@ -404,13 +581,13 @@ class Stage {
       }
       for (let leg = 0; leg < legs; leg++) {
         const o = leg * 12;
-        for (let k = 0; k < 4; k++) {
-          const x = joints[o + k * 3];
-          const y = joints[o + k * 3 + 1];
-          const z = joints[o + k * 3 + 2];
-          if (x >= x0 && x <= x1 && z >= z0 && z <= z1 && y > 0.02 && y < top - 0.02) {
+        for (let k = 0; k < 3; k++) {
+          const a = [joints[o + k * 3], joints[o + k * 3 + 1], joints[o + k * 3 + 2]];
+          const b = [joints[o + (k + 1) * 3], joints[o + (k + 1) * 3 + 1], joints[o + (k + 1) * 3 + 2]];
+          if (this._segmentHitsBox(a, b, x0 + 0.02, x1 - 0.02, 0.02, top - 0.02, z0 + 0.02, z1 - 0.02)) {
             hitOb[i] = 1;
             hitLegs[leg] = 1;
+            break;
           }
         }
       }
@@ -580,66 +757,218 @@ class Stage {
     const lam = Math.max(0, -dot(n, LIGHT));
     const i = 0.56 + 0.44 * lam;
     const c = face.c;
-    return `rgb(${Math.round(Math.min(255, c[0] * i * 255))},${Math.round(
-      Math.min(255, c[1] * i * 255)
-    )},${Math.round(Math.min(255, c[2] * i * 255))})`;
+    return [
+      Math.round(Math.min(255, c[0] * i * 255)),
+      Math.round(Math.min(255, c[1] * i * 255)),
+      Math.round(Math.min(255, c[2] * i * 255)),
+    ];
   }
 
+  _geometryContext() {
+    if (this.geo) return this.geo;
+    const canvas = document.createElement("canvas");
+    canvas.className = "geometry-layer";
+    this.cv.insertAdjacentElement("afterend", canvas);
+    const gl = canvas.getContext("webgl", {
+      alpha: true,
+      antialias: true,
+      depth: true,
+      premultipliedAlpha: true,
+    });
+    if (!gl) return null;
+
+    const compile = (kind, source) => {
+      const shader = gl.createShader(kind);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error("geometry shader:", gl.getShaderInfoLog(shader));
+        return null;
+      }
+      return shader;
+    };
+    const vert = compile(
+      gl.VERTEX_SHADER,
+      "attribute vec3 p; attribute vec4 c; varying vec4 color; void main(){gl_Position=vec4(p,1.0);color=c;}"
+    );
+    const frag = compile(
+      gl.FRAGMENT_SHADER,
+      "precision mediump float; varying vec4 color; void main(){gl_FragColor=color;}"
+    );
+    if (!vert || !frag) return null;
+    const program = gl.createProgram();
+    gl.attachShader(program, vert);
+    gl.attachShader(program, frag);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error("geometry program:", gl.getProgramInfoLog(program));
+      return null;
+    }
+    this.geo = {
+      canvas,
+      gl,
+      program,
+      p: gl.getAttribLocation(program, "p"),
+      c: gl.getAttribLocation(program, "c"),
+      pb: gl.createBuffer(),
+      cb: gl.createBuffer(),
+    };
+    return this.geo;
+  }
+
+  /** Draw solid geometry through the GPU depth buffer. Average-depth painter
+   * sorting was visibly wrong wherever a long leg crossed a wall or detailed
+   * parts intersected. A real per-pixel depth test makes visibility exact and
+   * retains antialiasing without the cost of a JavaScript raster loop. */
   _paintFaces() {
     const ctx = this.ctx;
     const items = [];
+    const shadows = [];
 
     for (const f of this.faces) {
       const vs = f.p.map((p) => this._view(p));
-      let depth = 0;
       let visible = false;
       for (const v of vs) {
-        depth += v[2];
         if (v[2] > NEAR) visible = true;
       }
       if (!visible) continue;
-      items.push({ f, vs, d: depth / vs.length });
-    }
-    items.sort((a, b) => b.d - a.d);
-
-    for (const it of items) {
-      const poly = this._clipNear(it.vs);
+      const poly = this._clipNear(vs);
       if (poly.length < 3) continue;
-      const pts = poly.map((v) => this._project(v));
-
-      ctx.beginPath();
-      ctx.moveTo(pts[0][0], pts[0][1]);
-      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-      ctx.closePath();
-      ctx.fillStyle = this._shade(it.f);
-      ctx.fill();
-      ctx.lineWidth = 0.7 * this.dpr;
-      ctx.strokeStyle = "rgba(24,24,26,0.30)";
-      ctx.stroke();
+      if (f.a) shadows.push({ poly, color: [20, 20, 24], a: f.a });
+      else items.push({ poly, color: this._shade(f) });
     }
+
+    const geo = this._geometryContext();
+    if (!geo) {
+      // Old browsers without WebGL retain a conservative triangle painter.
+      const tris = [];
+      const push = (it, a) => {
+        for (let i = 1; i + 1 < it.poly.length; i++) {
+          const poly = [it.poly[0], it.poly[i], it.poly[i + 1]];
+          tris.push({ poly, color: it.color, a, z: (poly[0][2] + poly[1][2] + poly[2][2]) / 3 });
+        }
+      };
+      for (const it of items) push(it, 1);
+      for (const it of shadows) push(it, it.a);
+      tris.sort((a, b) => b.z - a.z);
+      for (const it of tris) {
+        const pts = it.poly.map((v) => this._project(v));
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        ctx.lineTo(pts[1][0], pts[1][1]);
+        ctx.lineTo(pts[2][0], pts[2][1]);
+        ctx.closePath();
+        ctx.fillStyle =
+          it.a < 1
+            ? `rgba(${it.color[0]},${it.color[1]},${it.color[2]},${it.a})`
+            : `rgb(${it.color[0]},${it.color[1]},${it.color[2]})`;
+        ctx.fill();
+      }
+      return;
+    }
+
+    const triP = [];
+    const triC = [];
+    const shP = [];
+    const shC = [];
+    const lineP = [];
+    const lineC = [];
+    const vertex = (v, out, edge = false) => {
+      const p = this._project(v);
+      out.push(
+        (p[0] / this.w) * 2 - 1,
+        1 - (p[1] / this.h) * 2,
+        1 - (2 * NEAR) / v[2] - (edge ? 0.00035 : 0)
+      );
+    };
+    const color = (c, out, alpha = 1) =>
+      out.push((c[0] / 255) * alpha, (c[1] / 255) * alpha, (c[2] / 255) * alpha, alpha);
+    const fan = (it, pos, col, alpha) => {
+      for (let i = 1; i + 1 < it.poly.length; i++) {
+        for (const v of [it.poly[0], it.poly[i], it.poly[i + 1]]) {
+          vertex(v, pos);
+          color(it.color, col, alpha);
+        }
+      }
+    };
+    for (const it of items) {
+      fan(it, triP, triC, 1);
+      for (let i = 0; i < it.poly.length; i++) {
+        const j = (i + 1) % it.poly.length;
+        vertex(it.poly[i], lineP, true);
+        vertex(it.poly[j], lineP, true);
+        color([24, 24, 26], lineC, 0.34);
+        color([24, 24, 26], lineC, 0.34);
+      }
+    }
+    for (const it of shadows) fan(it, shP, shC, it.a);
+
+    const { canvas, gl, program } = geo;
+    if (canvas.width !== this.w || canvas.height !== this.h) {
+      canvas.width = this.w;
+      canvas.height = this.h;
+    }
+    gl.viewport(0, 0, this.w, this.h);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clearDepth(1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(program);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.disable(gl.BLEND);
+
+    const upload = (buffer, attr, values, size) => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(values), gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(attr);
+      gl.vertexAttribPointer(attr, size, gl.FLOAT, false, 0, 0);
+    };
+    upload(geo.pb, geo.p, triP, 3);
+    upload(geo.cb, geo.c, triC, 4);
+    gl.depthMask(true);
+    gl.drawArrays(gl.TRIANGLES, 0, triP.length / 3);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    if (shP.length) {
+      upload(geo.pb, geo.p, shP, 3);
+      upload(geo.cb, geo.c, shC, 4);
+      gl.drawArrays(gl.TRIANGLES, 0, shP.length / 3);
+    }
+    upload(geo.pb, geo.p, lineP, 3);
+    upload(geo.cb, geo.c, lineC, 4);
+    gl.drawArrays(gl.LINES, 0, lineP.length / 3);
+    gl.depthMask(true);
+    gl.flush();
+  }
+
+  /** Light-ray hit on the highest obstacle top at that xz, else the floor. */
+  _shadowP(p) {
+    const ly = LIGHT[1];
+    let tHit = -p[1] / ly;
+    let yHit = 0;
+    const ob = this.obstacles;
+    for (let i = 0; i + 4 < ob.length; i += 5) {
+      const top = ob[i + 4];
+      if (top <= 0) continue;
+      const t = (top - p[1]) / ly;
+      if (t <= 0 || t >= tHit) continue;
+      const x = p[0] + LIGHT[0] * t;
+      const z = p[2] + LIGHT[2] * t;
+      if (x >= ob[i] && x <= ob[i + 1] && z >= ob[i + 2] && z <= ob[i + 3]) {
+        tHit = t;
+        yHit = top;
+      }
+    }
+    return [p[0] + LIGHT[0] * tHit, yHit + 0.004, p[2] + LIGHT[2] * tHit];
   }
 
   _paintShadows(from) {
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.fillStyle = "rgba(20,20,24,0.055)";
-    for (let i = from; i < this.faces.length; i++) {
-      const f = this.faces[i];
-      const flat = f.p.map((p) => {
-        const t = p[1] / -LIGHT[1];
-        return [p[0] + LIGHT[0] * t, 0.004, p[2] + LIGHT[2] * t];
-      });
-      const vs = flat.map((p) => this._view(p));
-      const poly = this._clipNear(vs);
-      if (poly.length < 3) continue;
-      const pts = poly.map((v) => this._project(v));
-      ctx.beginPath();
-      ctx.moveTo(pts[0][0], pts[0][1]);
-      for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
-      ctx.closePath();
-      ctx.fill();
+    const end = this.faces.length;
+    for (let i = from; i < end; i++) {
+      this.faces.push({ p: this.faces[i].p.map((p) => this._shadowP(p)), a: 0.055 });
     }
-    ctx.restore();
   }
 
   /* ---------------------------------------------------------------- frame */

@@ -3,9 +3,9 @@
 //!
 //! Gait, analytic IK and the servo torque-speed line stay in this crate. Rapier
 //! is the engine those three drive: a chassis, three links per leg, motors on
-//! every hinge, and a height-field for the course. The first milestone is a
-//! hexapod that stands on a plane and then walks a tripod gait — that already
-//! uses the engine; it does not require writing one.
+//! every hinge, and a height-field for the course. Links collide with terrain
+//! and the chassis; adjacent parent/child contacts stay off. The canvas reads
+//! Rapier body transforms and must not write them into `Sim`.
 
 use rapier3d::prelude::*;
 
@@ -17,8 +17,11 @@ use crate::robot::{
 };
 use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 
-const STIFF: f32 = 120.0;
-const DAMP: f32 = 16.0;
+/// Motor gains, as multiples of the joint's stall torque: an error of a sixth
+/// of a radian asks for stall. Tied to stall so they follow the plant's length
+/// scale instead of having to be retuned alongside it.
+const STIFF_PER_STALL: f32 = 6.1;
+const DAMP_PER_STALL: f32 = 0.82;
 const FOOT_R: f32 = 0.05;
 const LINK_R: f32 = 0.05;
 
@@ -58,7 +61,7 @@ fn hinge(
         .contacts_enabled(false)
         .limits(limits)
         .motor_model(MotorModel::ForceBased)
-        .motor_position(0.0, STIFF, DAMP)
+        .motor_position(0.0, STIFF_PER_STALL * stall, DAMP_PER_STALL * stall)
         .motor_max_force(stall)
         .build();
     joint.data.set_local_frame1(parent.inverse() * world);
@@ -84,13 +87,19 @@ struct Hinge {
     parent: RigidBodyHandle,
     child: RigidBodyHandle,
     q0: f32,
+    /// The servo's own setpoint, relative to `q0`. It slews toward the command
+    /// at the servo's no-load speed and is deliberately independent of where
+    /// the joint actually is: a setpoint clamped against the measured angle can
+    /// never build up an error, so the motor stays weak and the leg mushes.
+    set: f32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct LegBodies {
     _coxa: RigidBodyHandle,
     _femur: RigidBodyHandle,
-    _tibia: RigidBodyHandle,
-    _foot: ColliderHandle,
+    tibia: RigidBodyHandle,
+    foot: ColliderHandle,
     hinges: [Hinge; 3],
 }
 
@@ -118,8 +127,10 @@ impl ArticulatedPlant {
     pub fn standing(frame: Frame, gait: &Gait, phys: &Physics, terrain: &Terrain) -> Self {
         // Rapier is tuned for metre-scale objects. The gait already lives in
         // simulator metres (~2 m hexapod); we run the plant in that space so
-        // contacts are not 1.5 cm spheres. Servo stall is a real N·m for the
-        // 28 cm machine, so it is scaled by 1/scale to keep tau/(mgL).
+        // contacts are not 1.5 cm spheres.
+        //
+        // Servo stall is a real N·m for the 28 cm machine, so it is scaled by
+        // 1/scale to keep tau/(mgL).
         let s = 1.0f32;
         let stall_sim = phys.actuator.stall_nm as f32 / phys.scale as f32;
         let n = frame.legs();
@@ -129,7 +140,7 @@ impl ArticulatedPlant {
         let multibody_joints = MultibodyJointSet::new();
 
         let ground = terrain.height(0.0, 0.0);
-        let pos = [0.0, ground + gait.body_h + 0.22, 0.0];
+        let pos = [0.0, ground + gait.body_h, 0.0];
         let mut q0 = [[0.0f64; 3]; MAX_LEGS];
         for i in 0..n {
             let d = frame.dir(i);
@@ -140,16 +151,28 @@ impl ArticulatedPlant {
             q0[i] = q;
         }
 
+        // 1 = terrain, 2 = chassis, 3 = feet, 4 = links. Adjacent parent/child
+        // still skip via contacts_enabled(false) on the hinge.
         let groups_ground = InteractionGroups::new(
             Group::GROUP_1,
-            Group::GROUP_2 | Group::GROUP_3,
+            Group::GROUP_2 | Group::GROUP_3 | Group::GROUP_4,
             InteractionTestMode::And,
         );
-        let groups_chassis =
-            InteractionGroups::new(Group::GROUP_2, Group::GROUP_1, InteractionTestMode::And);
-        let groups_foot =
-            InteractionGroups::new(Group::GROUP_3, Group::GROUP_1, InteractionTestMode::And);
-        let groups_link = InteractionGroups::none();
+        let groups_chassis = InteractionGroups::new(
+            Group::GROUP_2,
+            Group::GROUP_1 | Group::GROUP_4,
+            InteractionTestMode::And,
+        );
+        let groups_foot = InteractionGroups::new(
+            Group::GROUP_3,
+            Group::GROUP_1 | Group::GROUP_3 | Group::GROUP_4,
+            InteractionTestMode::And,
+        );
+        let groups_link = InteractionGroups::new(
+            Group::GROUP_4,
+            Group::GROUP_1 | Group::GROUP_2 | Group::GROUP_3 | Group::GROUP_4,
+            InteractionTestMode::And,
+        );
 
         // --- course -----------------------------------------------------------
         let x0 = -CORRIDOR_HALF as f32 * s;
@@ -225,6 +248,7 @@ impl ArticulatedPlant {
                 .translation(v(pos, s))
                 .additional_mass(chassis_kg)
                 .can_sleep(false)
+                .ccd_enabled(true)
                 .linear_damping(0.15)
                 .angular_damping(0.40),
         );
@@ -296,6 +320,7 @@ impl ArticulatedPlant {
                     .rotation(tibia_rot.to_scaled_axis())
                     .additional_mass(tibia_kg)
                     .can_sleep(false)
+                    .ccd_enabled(true)
                     .linear_damping(0.15)
                     .angular_damping(0.40),
             );
@@ -345,30 +370,20 @@ impl ArticulatedPlant {
             let femur_pose = *bodies[femur].position();
             let tibia_pose = *bodies[tibia].position();
 
-            let coxa_joint = hinge(
-                &chassis_pose,
-                &coxa_pose,
-                hip,
-                Vector::Y,
-                [Q_LIMIT[0].0 as f32, Q_LIMIT[0].1 as f32],
-                stall,
-            );
-            let femur_joint = hinge(
-                &coxa_pose,
-                &femur_pose,
-                knee,
-                pitch_axis,
-                [Q_LIMIT[1].0 as f32, Q_LIMIT[1].1 as f32],
-                stall,
-            );
-            let tibia_joint = hinge(
-                &femur_pose,
-                &tibia_pose,
-                ankle,
-                pitch_axis,
-                [Q_LIMIT[2].0 as f32, Q_LIMIT[2].1 as f32],
-                stall,
-            );
+            // A hinge's zero is its spawn pose, so `Q_LIMIT` — which is in
+            // absolute joint angles — has to be shifted by q0. Feeding it raw
+            // put the band a whole radian off on the pitch joints and pinned
+            // the tibia against a bound it should never have reached, which is
+            // what made every leg twitch instead of step.
+            let lim = |k: usize| {
+                [
+                    (Q_LIMIT[k].0 - q0[i][k]) as f32,
+                    (Q_LIMIT[k].1 - q0[i][k]) as f32,
+                ]
+            };
+            let coxa_joint = hinge(&chassis_pose, &coxa_pose, hip, Vector::Y, lim(0), stall);
+            let femur_joint = hinge(&coxa_pose, &femur_pose, knee, pitch_axis, lim(1), stall);
+            let tibia_joint = hinge(&femur_pose, &tibia_pose, ankle, pitch_axis, lim(2), stall);
 
             let h_coxa = impulse_joints.insert(chassis, coxa, coxa_joint, true);
             let h_femur = impulse_joints.insert(coxa, femur, femur_joint, true);
@@ -377,26 +392,29 @@ impl ArticulatedPlant {
             legs[i] = Some(LegBodies {
                 _coxa: coxa,
                 _femur: femur,
-                _tibia: tibia,
-                _foot: foot_col,
+                tibia,
+                foot: foot_col,
                 hinges: [
                     Hinge {
                         joint: h_coxa,
                         parent: chassis,
                         child: coxa,
                         q0: q0[i][0] as f32,
+                        set: 0.0,
                     },
                     Hinge {
                         joint: h_femur,
                         parent: coxa,
                         child: femur,
                         q0: q0[i][1] as f32,
+                        set: 0.0,
                     },
                     Hinge {
                         joint: h_tibia,
                         parent: femur,
                         child: tibia,
                         q0: q0[i][2] as f32,
+                        set: 0.0,
                     },
                 ],
             });
@@ -430,33 +448,58 @@ impl ArticulatedPlant {
     }
 
     /// Drive every hinge toward `q_cmd` with the servo's stall torque as the cap.
-    pub fn drive(&mut self, q_cmd: &[[f64; 3]; MAX_LEGS], phys: &Physics) {
+    ///
+    /// `dt` is the step the caller is about to take: the target is rate-limited
+    /// to the servo's no-load speed over it. Without that the motor is asked to
+    /// cross a whole swing in one tick, the derate below sees a joint moving
+    /// past `omega_max`, and the force cap collapses to its floor exactly when
+    /// the leg needs to move — the whole machine ends up twitching in place
+    /// instead of walking. Rate-limiting first is what a servo actually does.
+    pub fn drive(&mut self, q_cmd: &[[f64; 3]; MAX_LEGS], phys: &Physics, dt: f64) {
         let stall = phys.actuator.stall_nm as f32 / phys.scale as f32;
         let omega_max = phys.actuator.omega_max as f32;
+        let max_step = omega_max * dt as f32;
         for i in 0..self.n {
-            let Some(leg) = self.legs[i].as_ref() else {
-                continue;
-            };
             for j in 0..3 {
+                let Some(leg) = self.legs[i].as_ref() else {
+                    continue;
+                };
                 let h = leg.hinges[j];
-                let target = wrap(q_cmd[i][j] as f32 - h.q0);
+                let at = self.joint_angle(h) - h.q0;
+                let want = wrap(q_cmd[i][j] as f32 - h.q0);
+                let target = h.set + wrap(want - h.set).clamp(-max_step, max_step);
+                if let Some(leg) = self.legs[i].as_mut() {
+                    leg.hinges[j].set = target;
+                }
                 let Some(joint) = self.impulse_joints.get_mut(h.joint, true) else {
                     continue;
                 };
                 let Some(rev) = joint.data.as_revolute_mut() else {
                     continue;
                 };
+                // The hinge is joint-local X, so the world axis is the parent's
+                // rotation applied to frame 1's X — not the parent's Y, which
+                // only matched the coxa and read chassis roll as femur speed,
+                // collapsing the torque cap to the 2% floor on every pitch
+                // joint.
+                let hinge_axis = rev.data.local_axis1();
                 let parent = &self.bodies[h.parent];
                 let child = &self.bodies[h.child];
                 let w = child.angvel() - parent.angvel();
-                let axis = {
-                    let p = *parent.rotation() * Vector::Y;
-                    // Approximate: use relative spin about the hinge.
-                    p
-                };
+                let axis = *parent.rotation() * hinge_axis;
                 let omega = w.dot(axis);
-                let avail = stall * (1.0 - (omega.abs() / omega_max).clamp(0.0, 1.0));
-                rev.set_motor_position(target, STIFF, DAMP);
+                // A motor loses torque only in the direction it is already
+                // spinning; braking or holding against the spin has its full
+                // stall available. Derating both ways left the joint with no
+                // torque to stop an overshoot, so the legs flailed past target
+                // and the body sagged.
+                let along = (target - at) * omega > 0.0;
+                let avail = if along {
+                    stall * (1.0 - (omega.abs() / omega_max).clamp(0.0, 1.0))
+                } else {
+                    stall
+                };
+                rev.set_motor_position(target, STIFF_PER_STALL * stall, DAMP_PER_STALL * stall);
                 rev.set_motor_max_force(avail.max(0.02 * stall));
             }
         }
@@ -495,9 +538,7 @@ impl ArticulatedPlant {
     }
 
     /// Rapier hinge angles for one leg, in the same coxa/femur/tibia order as
-    /// the centroidal plant. The dashboard overlays these on the gait-clock
-    /// body pose; it must not write them back into `Sim` or a missed motor
-    /// track (high speed, a quadruped tip) rewinds the integrator.
+    /// the centroidal plant. Telemetry may read these; `Sim` must not.
     pub fn leg_q(&self, i: usize) -> [f64; 3] {
         let Some(leg) = self.legs.get(i).and_then(|l| l.as_ref()) else {
             return [0.0; 3];
@@ -507,6 +548,49 @@ impl ArticulatedPlant {
             self.joint_angle(leg.hinges[1]) as f64,
             self.joint_angle(leg.hinges[2]) as f64,
         ]
+    }
+
+    fn hinge_world(&self, h: Hinge) -> Vector {
+        let Some(joint) = self.impulse_joints.get(h.joint) else {
+            return self.bodies[h.parent].translation();
+        };
+        let parent = &self.bodies[h.parent];
+        parent.translation() + *parent.rotation() * joint.data.local_anchor1()
+    }
+
+    fn to_sim(&self, p: Vector) -> V3 {
+        let s = self.scale as f64;
+        [p.x as f64 / s, p.y as f64 / s, p.z as f64 / s]
+    }
+
+    /// Hip, knee, ankle, foot in simulator world units, from Rapier bodies.
+    pub fn leg_joints_world(&self, i: usize) -> [V3; 4] {
+        let Some(leg) = self.legs.get(i).and_then(|l| l.as_ref()) else {
+            return [[0.0; 3]; 4];
+        };
+        let foot = self.colliders[leg.foot].position().translation;
+        [
+            self.to_sim(self.hinge_world(leg.hinges[0])),
+            self.to_sim(self.hinge_world(leg.hinges[1])),
+            self.to_sim(self.hinge_world(leg.hinges[2])),
+            self.to_sim(foot),
+        ]
+    }
+
+    /// Chassis translation and yaw/pitch/roll matching [`crate::math::body_to_world`].
+    /// Canvas-only: do not write this into `Sim`.
+    pub fn chassis_pose(&self) -> (V3, f64, f64, f64) {
+        let body = &self.bodies[self.chassis];
+        let pos = self.to_sim(body.translation());
+        let fwd = *body.rotation() * Vector::Z;
+        let yaw = (-fwd.x).atan2(fwd.z) as f64;
+        let pitch = -fwd.y.clamp(-1.0, 1.0).asin() as f64;
+        let right = *body.rotation() * Vector::X;
+        let (s, c) = yaw.sin_cos();
+        let rx = right.x as f64 * c + right.z as f64 * s;
+        let ry = right.y as f64;
+        let roll = ry.atan2(rx);
+        (pos, yaw, pitch, roll)
     }
 
     /// Chassis height in simulator units.
@@ -544,12 +628,12 @@ pub fn foot_in_body(
     let lp = frac(phase + gait.offsets[leg]);
     let (long, y) = if lp < duty {
         let u = lp / duty.max(1e-6);
-        (stride * (u - 0.5), -body_h)
+        (stride * (u - 0.5), -body_h - 0.03)
     } else {
         let u = (lp - duty) / (1.0 - duty).max(1e-6);
         (
             stride * (0.5 - u),
-            -body_h + step_h * (core::f64::consts::PI * u).sin(),
+            -body_h - 0.03 + step_h * (core::f64::consts::PI * u).sin(),
         )
     };
     [d[0] * out, y, d[2] * out + long]
@@ -560,14 +644,33 @@ mod tests {
     use super::*;
     use crate::policy::{Policy, Preset};
     use crate::robot::Frame;
-    use crate::terrain::{Course, Terrain};
+    use crate::terrain::{Course, Obstacle, Terrain};
 
     fn hold(plant: &mut ArticulatedPlant, q: &[[f64; 3]; MAX_LEGS], phys: &Physics, secs: f64) {
         let n = (secs / crate::sim::DT).round() as usize;
         for _ in 0..n {
-            plant.drive(q, phys);
+            plant.drive(q, phys, crate::sim::DT);
             plant.step(crate::sim::DT);
         }
+    }
+
+    fn standing_q(frame: Frame, gait: &Gait) -> [[f64; 3]; MAX_LEGS] {
+        let mut q = [[0.0; 3]; MAX_LEGS];
+        for i in 0..frame.legs() {
+            let d = frame.dir(i);
+            let out = gait.stance_w * 0.5;
+            q[i] = solve_ik(frame, i, [d[0] * out, -gait.body_h, d[2] * out]).q;
+        }
+        q
+    }
+
+    fn in_core(p: V3, ob: &Obstacle, margin: f64) -> bool {
+        p[0] > ob.x0 + margin
+            && p[0] < ob.x1 - margin
+            && p[2] > ob.z0 + margin
+            && p[2] < ob.z1 - margin
+            && p[1] > margin
+            && p[1] < ob.top - margin
     }
 
     #[test]
@@ -578,12 +681,7 @@ mod tests {
         let terrain = Terrain::new(Course::Flat, 1);
         let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
 
-        let mut q = [[0.0; 3]; MAX_LEGS];
-        for i in 0..6 {
-            let d = frame.dir(i);
-            let out = gait.stance_w * 0.5;
-            q[i] = solve_ik(frame, i, [d[0] * out, -gait.body_h, d[2] * out]).q;
-        }
+        let q = standing_q(frame, &gait);
         let y0 = plant.chassis_y();
         hold(&mut plant, &q, &phys, 1.2);
         let y1 = plant.chassis_y();
@@ -618,7 +716,7 @@ mod tests {
                 );
                 q[i] = solve_ik(frame, i, target).q;
             }
-            plant.drive(&q, &phys);
+            plant.drive(&q, &phys, crate::sim::DT);
             plant.step(crate::sim::DT);
         }
         let dz = plant.chassis_z() - z0;
@@ -735,5 +833,155 @@ mod tests {
             hinges += plant.legs[i].as_ref().unwrap().hinges.len();
         }
         assert_eq!(hinges, 18);
+    }
+
+    /// Every leg has to actually sweep when the gait leaves the servo room to
+    /// track it. Absolute joint limits on a hinge whose zero is the spawn pose
+    /// pinned the tibia, and a setpoint clamped against the measured angle left
+    /// the motor too weak to move: both showed up here as legs twitching over a
+    /// few degrees instead of stepping.
+    #[test]
+    fn legs_sweep_when_the_servo_can_keep_up() {
+        let frame = Frame::new(6);
+        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
+        gait.cycle *= 2.0; // the default clock outruns the default servo
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+
+        let mut lo = [[9.0f64; 3]; MAX_LEGS];
+        let mut hi = [[-9.0f64; 3]; MAX_LEGS];
+        let mut phase = 0.0;
+        for k in 0..800 {
+            let mut q = [[0.0f64; 3]; MAX_LEGS];
+            for i in 0..frame.legs() {
+                let foot = foot_in_body(
+                    frame, &gait, i, phase, gait.stride, gait.duty, gait.body_h, gait.step_h,
+                );
+                q[i] = solve_ik(frame, i, foot).q;
+            }
+            plant.drive(&q, &phys, crate::sim::DT);
+            plant.step(crate::sim::DT);
+            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
+            if k > 200 {
+                for i in 0..frame.legs() {
+                    let m = plant.leg_q(i);
+                    for j in 0..3 {
+                        lo[i][j] = lo[i][j].min(m[j]);
+                        hi[i][j] = hi[i][j].max(m[j]);
+                    }
+                }
+            }
+        }
+        for i in 0..frame.legs() {
+            let sweep = [
+                hi[i][0] - lo[i][0],
+                hi[i][1] - lo[i][1],
+                hi[i][2] - lo[i][2],
+            ];
+            assert!(sweep[0] > 0.5, "leg {i} coxa barely moved: {sweep:?}");
+            assert!(sweep[1] > 0.3, "leg {i} femur barely moved: {sweep:?}");
+            assert!(sweep[2] > 0.3, "leg {i} tibia barely moved: {sweep:?}");
+        }
+    }
+
+    #[test]
+    fn chassis_and_feet_use_ccd() {
+        let frame = Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        assert!(plant.bodies[plant.chassis].is_ccd_enabled());
+        for i in 0..6 {
+            let tibia = plant.legs[i].as_ref().unwrap().tibia;
+            assert!(plant.bodies[tibia].is_ccd_enabled(), "leg {i} tibia");
+        }
+    }
+
+    #[test]
+    fn a_tibia_does_not_occupy_a_block() {
+        let frame = Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let phys = Physics::default();
+        let mut terrain = Terrain::new(Course::Flat, 1);
+        // Right-side stance: a prism the standing tibia would thread if links
+        // still belonged to no collision group.
+        let wall = Obstacle {
+            x0: 0.55,
+            x1: 2.20,
+            z0: -0.55,
+            z1: 0.55,
+            top: 0.70,
+            grip: 1.0,
+        };
+        terrain.obstacles.push(wall);
+        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let q = standing_q(frame, &gait);
+        hold(&mut plant, &q, &phys, 0.8);
+
+        let mut inside = Vec::new();
+        for i in 0..6 {
+            let j = plant.leg_joints_world(i);
+            for (name, p) in [("knee", j[1]), ("ankle", j[2]), ("foot", j[3])] {
+                if in_core(p, &wall, 0.12) {
+                    inside.push(format!("L{i} {name} {:?}", p));
+                }
+            }
+        }
+        assert!(
+            inside.is_empty(),
+            "link still occupies the block: {}",
+            inside.join("; ")
+        );
+        assert!(
+            plant.chassis_y().is_finite() && plant.pitch_abs() < 1.2,
+            "plant exploded: y={} pitch={}",
+            plant.chassis_y(),
+            plant.pitch_abs()
+        );
+    }
+
+    #[test]
+    fn a_four_leg_trot_keeps_stepping() {
+        let frame = Frame::new(4);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let mut phase = 0.0;
+        let ticks = (2.0 / crate::sim::DT) as usize;
+        for _ in 0..ticks {
+            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
+            let mut q = [[0.0; 3]; MAX_LEGS];
+            for i in 0..4 {
+                let target = foot_in_body(
+                    frame, &gait, i, phase, gait.stride, gait.duty, gait.body_h, gait.step_h,
+                );
+                q[i] = solve_ik(frame, i, target).q;
+            }
+            plant.drive(&q, &phys, crate::sim::DT);
+            plant.step(crate::sim::DT);
+        }
+        assert!(
+            plant.chassis_y().is_finite() && plant.pitch_abs().is_finite(),
+            "plant reset or exploded: y={} pitch={}",
+            plant.chassis_y(),
+            plant.pitch_abs()
+        );
+    }
+
+    #[test]
+    fn canvas_pose_comes_from_rapier_bodies() {
+        let frame = Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let (pos, yaw, pitch, roll) = plant.chassis_pose();
+        assert!((pos[1] - plant.chassis_y()).abs() < 1e-5);
+        assert!(yaw.abs() < 0.2 && pitch.abs() < 0.4 && roll.abs() < 0.4);
+        let foot = plant.leg_joints_world(0)[3];
+        assert!(foot[1] < pos[1], "foot should be below chassis {foot:?} {pos:?}");
     }
 }

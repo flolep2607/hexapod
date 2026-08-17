@@ -92,7 +92,7 @@
           <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
 GAIT <b id="hudGait">TRIPOD</b> · DUTY <b id="hudDuty">0.50</b></div>
           <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
-SCROLL TO ZOOM · WASD / QE
+SCROLL TO ZOOM · WASD / QE · [ ] SPEED
 <b id="hudHit"></b></div>
           <div class="hud bl">BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm</div>
@@ -427,6 +427,8 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn primary" id="btnPause" data-on="false">Pause</button>
           <button class="btn" id="btnReset">Reset</button>
         </div>
+        <label class="slider"><span class="hd"><span class="k">Sim speed</span><b id="vRate">1×</b></span>
+          <input type="range" id="rRate" min="0.25" max="4" step="0.25" value="1"></label>
       </div>
 
       <div class="sec">

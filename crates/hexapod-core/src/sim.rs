@@ -347,7 +347,6 @@ pub struct Sim {
     /// Centre-of-mass excursion away from the geometric centre.
     pub com_drift: [f64; 2],
     com_vel: [f64; 2],
-    unstable_for: f64,
     /// Load-weighted stance tracking error carried over from the last tick.
     /// Only the *change* in it moves the chassis: a steady tracking error is a
     /// steady offset, not a continuous drag.
@@ -460,7 +459,6 @@ impl Default for Sim {
             margin: 0.0,
             com_drift: [0.0; 2],
             com_vel: [0.0; 2],
-            unstable_for: 0.0,
             prev_track_err: [0.0; 3],
             legs: LegState::default(),
             jump_clock: 0.0,
@@ -1278,32 +1276,13 @@ impl Sim {
             self.com_drift[1] *= 0.982;
         }
 
-        if self.airborne {
-            // An empty support polygon is the point of being in the air, not
-            // a fall. Tumble or hit the ground with the chassis and it is.
-            self.unstable_for = 0.0;
-            if self.pitch.abs() > 0.75
-                || self.roll.abs() > 0.75
-                || self.pos[1] < self.plane_y(self.pos[0], self.pos[2]) - 0.15
-            {
-                self.fallen = true;
-            }
-        } else {
-            if self.margin < 0.0 {
-                self.unstable_for += dt;
-            } else {
-                self.unstable_for = (self.unstable_for - dt * 2.0).max(0.0);
-            }
-
-            let drift_mag = hypot2(self.com_drift[0], self.com_drift[1]);
-            if self.unstable_for > 0.28
-                || drift_mag > 0.95
-                || self.pitch.abs() > 0.75
-                || self.roll.abs() > 0.75
-                || self.pos[1] < self.plane_y(self.pos[0], self.pos[2]) - 0.15
-            {
-                self.fallen = true;
-            }
+        // A two-foot support is a line, not a fall. Chassis on the ground
+        // or a tumble is.
+        if self.pitch.abs() > 0.75
+            || self.roll.abs() > 0.75
+            || self.pos[1] < self.plane_y(self.pos[0], self.pos[2]) - 0.15
+        {
+            self.fallen = true;
         }
 
         // --- bookkeeping -------------------------------------------------------
@@ -1545,20 +1524,18 @@ impl Sim {
         if dx.abs() < 1e-15 && dz.abs() < 1e-15 {
             return true;
         }
-        let floor = self.plane_y(x, z);
-        let now_floor = self.plane_y(self.pos[0], self.pos[2]);
         let n = self.frame.legs();
         for i in 0..n {
             let j = self.joints[i];
             for k in 0..3 {
                 let a = j[k];
                 let b = j[k + 1];
-                if terrain.segment_hits_wall(a, b, now_floor, MAX_FOOTHOLD) {
+                if terrain.segment_hits_solid(a, b) {
                     continue;
                 }
                 let a2 = [a[0] + dx, a[1], a[2] + dz];
                 let b2 = [b[0] + dx, b[1], b[2] + dz];
-                if terrain.segment_hits_wall(a2, b2, floor, MAX_FOOTHOLD) {
+                if terrain.segment_hits_solid(a2, b2) {
                     return false;
                 }
             }
@@ -1566,13 +1543,13 @@ impl Sim {
         true
     }
 
-    fn links_hit_wall(&self, terrain: &Terrain, joints: &[V3; 4], floor: f64) -> bool {
-        (0..3).any(|k| terrain.segment_hits_wall(joints[k], joints[k + 1], floor, MAX_FOOTHOLD))
+    fn links_hit_solid(&self, terrain: &Terrain, joints: &[V3; 4]) -> bool {
+        (0..3).any(|k| terrain.segment_hits_solid(joints[k], joints[k + 1]))
     }
 
     /// Pull a foot toward its hip until the kinematic pose no longer threads
-    /// an unclimbable solid. Eight steps of 22 % is enough to collapse a
-    /// fully extended tibia back onto the chassis side of a 0.7 m wall.
+    /// a terrain solid. Eight steps of 22 % is enough to collapse a fully
+    /// extended tibia back onto the chassis side of a 0.7 m wall.
     fn clear_foot(&self, terrain: &Terrain, leg: usize, mut p: V3) -> V3 {
         let floor = self.plane_y(self.pos[0], self.pos[2]);
         let hip = self.joints[leg][0];
@@ -1589,7 +1566,7 @@ impl Sim {
             let j = fk_world(
                 self.frame, leg, q, self.pos, self.yaw, self.pitch, self.roll,
             );
-            if !self.links_hit_wall(terrain, &j, floor) {
+            if !self.links_hit_solid(terrain, &j) {
                 return p;
             }
             p[0] += 0.22 * (hip[0] - p[0]);
@@ -2479,32 +2456,27 @@ mod tests {
 
     #[test]
     fn a_trotting_quadruped_is_not_statically_stable() {
-        // Two diagonal feet are a line, not a polygon, so the margin goes
-        // negative and the robot goes over. Real quadrupeds trot because a
-        // trot is dynamically stable — this simulator judges stability
-        // statically, and says so rather than quietly getting it wrong.
+        // Two diagonal feet are a line, so the margin is negative. That is
+        // not a fall: the chassis is still up. Fallen only after it hits
+        // the ground.
         let t = Terrain::new(Course::Flat, 1);
         let f = Frame::new(4);
+        let p = Policy::seeded(Preset::Tripod, f);
+        let g = p.gait();
         let phys = Physics::default();
-        let trot = rollout(
-            &t,
-            &Policy::seeded(Preset::Tripod, f),
-            &phys,
-            8.0,
-            Cmd::at(3.0),
-            None,
-        );
-        let crawl = rollout(
-            &t,
-            &Policy::seeded(Preset::Wave, f),
-            &phys,
-            8.0,
-            Cmd::at(3.0),
-            None,
-        );
-        assert!(trot.fell, "a two-foot support polygon held the robot up");
-        assert!(!crawl.fell, "the crawl should keep three feet down");
-        assert!(crawl.reward > trot.reward);
+        let mut s = Sim::default();
+        s.reset(&t, &g, &phys);
+        let mut saw_neg = false;
+        for _ in 0..(1.0 / DT).round() as usize {
+            s.step(&t, &p, &g, DT, Cmd::at(3.0));
+            saw_neg |= s.margin < 0.0;
+            assert!(!s.fallen, "trot fell in the first second at t={:.3}", s.t);
+        }
+        assert!(saw_neg, "trot never went statically unstable");
+
+        s.pos[1] = s.plane_y(s.pos[0], s.pos[2]) - 2.0;
+        s.step(&t, &p, &g, DT, Cmd::at(3.0));
+        assert!(s.fallen, "chassis on the ground should be a fall");
     }
 
     #[test]
