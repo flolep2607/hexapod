@@ -390,7 +390,7 @@ check("footfalls are recorded, not assumed", gait && gait.n > 60, `${gait && gai
 check(
   "the pattern is classified from the footfalls, not the label",
   gait && gait.kind === "TRIPOD",
-  `${gait && gait.kind}, offsets ${gait && gait.offsets.map((o) => o.toFixed(2)).join(" ")}`
+  `${gait && gait.kind}, offsets ${gait && gait.offsets && gait.offsets.map((o) => o.toFixed(2)).join(" ")}`
 );
 check(
   "measured cycle matches the one the clock was set to",
@@ -473,6 +473,8 @@ check("the autopilot can be switched off", manual === "MANUAL", manual);
 await page.click("#btnNav");
 await wait(400);
 
+await page.click('[data-tab="terrain"]');
+await wait(200);
 await page.click('[data-course="4"]');
 await wait(1200);
 await page.click('[data-tab="kinematics"]');
