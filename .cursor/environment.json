@@ -1,0 +1,12 @@
+{
+  "name": "Hexapod Gait Lab",
+  "user": "ubuntu",
+  "install": "./.cursor/install.sh",
+  "terminals": [
+    {
+      "name": "dashboard",
+      "command": "test -f dist/hexapod-simulator.html || ./build.sh; python3 -m http.server 8000 --bind 0.0.0.0 --directory dist"
+    }
+  ],
+  "ports": [8000]
+}
