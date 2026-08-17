@@ -33,7 +33,7 @@ web = root / "web"
 wasm = pathlib.Path(sys.argv[1]).read_bytes()
 
 # Telemetry offsets straight out of the Rust that defines them.
-layout_src = (root / "crates/hexapod-wasm/src/layout.rs").read_text()
+layout_src = (root / "crates/hexapod-wasm/src/layout.rs").read_text(encoding="utf-8")
 layout = {
     m.group(1): int(m.group(2))
     for m in re.finditer(r"pub const ([TS]_\w+): usize = (\d+);", layout_src)
@@ -42,19 +42,28 @@ for req in ("T_LEN", "S_LEN"):
     if req not in layout:
         raise SystemExit(f"layout.rs: {req} missing")
 
-servos = json.loads((web / "servos.gen.json").read_text())
-parts = json.loads((web / "parts.gen.json").read_text())
-courses = json.loads((web / "courses.gen.json").read_text())["courses"]
+servos = json.loads((web / "servos.gen.json").read_text(encoding="utf-8"))
+parts = json.loads((web / "parts.gen.json").read_text(encoding="utf-8"))
+courses = json.loads((web / "courses.gen.json").read_text(encoding="utf-8"))["courses"]
 
-html = (web / "index.html").read_text()
+html = (web / "index.html").read_text(encoding="utf-8")
 title, body = html.split("\n", 1)
 if not title.startswith("<title>"):
     raise SystemExit("index.html must start with its <title>")
 
+# Charset has to be in the first 1024 bytes or a Windows/Latin-1 default
+# turns em dashes and middle dots into â€” / Â· in the gait table.
 parts = [
-    title,
-    "<style>\n" + (web / "style.css").read_text() + "\n</style>",
-    body,
+    "<!DOCTYPE html>",
+    '<html lang="en">',
+    "<head>",
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    title.strip(),
+    "<style>\n" + (web / "style.css").read_text(encoding="utf-8") + "\n</style>",
+    "</head>",
+    "<body>",
+    body.rstrip("\n"),
     "<script>\n"
     f"window.HX_LAYOUT={json.dumps(layout, separators=(',', ':'))};\n"
     f"window.HX_SERVOS={json.dumps(servos, separators=(',', ':'))};\n"
@@ -64,12 +73,14 @@ parts = [
     "</script>",
     # Each module is wrapped so the two inlined scripts cannot collide in the
     # shared global scope; they talk to each other only through `window`.
-    "<script>\n(function(){\n" + (web / "render.js").read_text() + "\n})();\n</script>",
-    "<script>\n(function(){\n" + (web / "app.js").read_text() + "\n})();\n</script>",
+    "<script>\n(function(){\n" + (web / "render.js").read_text(encoding="utf-8") + "\n})();\n</script>",
+    "<script>\n(function(){\n" + (web / "app.js").read_text(encoding="utf-8") + "\n})();\n</script>",
+    "</body>",
+    "</html>",
 ]
 
 out = root / "dist/hexapod-simulator.html"
-out.write_text("\n".join(parts))
+out.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 kb = out.stat().st_size / 1024
 print(f"    wasm    {len(wasm)/1024:8.1f} KB")

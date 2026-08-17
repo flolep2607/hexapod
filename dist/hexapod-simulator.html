@@ -1,3 +1,8 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hexapod Gait Lab</title>
 <style>
 /* Hexapod Gait Lab — instrument-panel styling.
@@ -794,6 +799,8 @@ a {
 }
 
 </style>
+</head>
+<body>
 
 <div class="app">
   <header class="hdr">
@@ -1288,7 +1295,6 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
     </aside>
   </main>
 </div>
-
 <script>
 window.HX_LAYOUT={"T_POS":0,"T_YAW":3,"T_PITCH":4,"T_ROLL":5,"T_JOINTS":8,"T_STANCE":128,"T_LOAD":138,"T_LEGPHASE":148,"T_STEPH":158,"T_TD":168,"T_Q":198,"T_QCMD":228,"T_LEG_LOAD":258,"T_HULL":268,"T_HULL_N":288,"T_LEGS":6,"T_BODY_R":7,"T_PHASE":289,"T_MARGIN":290,"T_DIST":291,"T_SPEED":292,"T_POWER":293,"T_TIME":294,"T_FALLEN":295,"T_BLOCKED":296,"T_ADVANCE":297,"T_COM":298,"T_STUB":300,"T_COLLISIONS":301,"T_PLANE":302,"T_GAIT":305,"T_OFFSETS":311,"T_ITER":321,"T_ROLLOUTS":322,"T_BEST_R":323,"T_BASE_R":324,"T_BEST_D":325,"T_BASE_D":326,"T_EVAL_R":327,"T_EVAL_D":328,"T_FEEDBACK":329,"T_CURVE_N":330,"T_MODE":331,"T_TRAINED":332,"T_EVAL_FELL":333,"T_EVAL_VERR":334,"T_EVAL_COT":335,"T_CMD_SPEED":336,"T_VEL":337,"T_ACCEL":339,"T_SLIP":341,"T_SLIP_RATE":342,"T_TRACTION":343,"T_SERVO_LOAD":344,"T_SERVO_LAG":345,"T_DROOP":346,"T_TORQUE_PEAK":347,"T_WORK":348,"T_COT":349,"T_CYCLE_NOW":350,"T_STRIDE_NOW":351,"T_DUTY_NOW":352,"T_MU":353,"T_STALL":354,"T_NOLOAD_RPM":355,"T_LEG_TORQUE":356,"T_LEG_REACT":357,"T_LEG_KG":360,"T_WP":361,"T_WP_I":363,"T_WP_N":364,"T_WP_DIST":365,"T_BEARING":366,"T_REACHED":367,"T_STEER":368,"T_NAV":369,"T_WALL_X":370,"T_SCAN":371,"T_VY":377,"T_AIRBORNE":378,"T_APEX":379,"T_HOP_APEX":380,"T_BROKEN":381,"T_IMPACT":382,"T_JUMPS":383,"T_TASK":384,"T_CLEARANCE":385,"T_LEN":392,"S_CONVERGED":0,"S_ALLUP":1,"S_SERVO_KG":2,"S_BATT_KG":3,"S_CHASSIS_KG":4,"S_ELEC_KG":5,"S_PEAK_TORQUE":6,"S_REQ_TORQUE":7,"S_SERVO_OK":8,"S_MEAN_A":9,"S_PEAK_A":10,"S_MEAN_SERVO_A":11,"S_PEAK_SERVO_A":12,"S_WATTS":13,"S_REQ_WH":14,"S_RUNTIME":15,"S_COST":16,"S_COST_SERVOS":17,"S_BATTERY_I":18,"S_REG_I":19,"S_DRIVER_I":20,"S_DRIVER_N":21,"S_COMPUTE_I":22,"S_RANGER_I":23,"S_SUPPORT_I":24,"S_IMU_I":25,"S_LOOKAHEAD":26,"S_RATE_HZ":27,"S_RES_MM":28,"S_RANGERS":29,"S_CONTACT_BUS":30,"S_ITERATIONS":31,"S_FAILURE":32,"S_JOINTS":33,"S_LEN":36};
 window.HX_SERVOS={"checked":"2026-08-16","servos":[{"part":"SG90","maker":"TowerPro","stall":1.8,"volts":4.8,"mass":9,"speed":0.1,"bus":"PWM","metal":false,"feedback":false,"low":0.8,"high":2.5,"vendor":null,"vendorName":"","source":"https://www.aliexpress.com/w/wholesale-sg90-servo.html","checked":false,"note":"Plastic gears strip under side load. Micro builds only."},{"part":"MG90S","maker":"TowerPro","stall":2.2,"volts":6,"mass":13.4,"speed":0.08,"bus":"PWM","metal":true,"feedback":false,"low":1.5,"high":3.5,"vendor":null,"vendorName":"","source":"https://www.aliexpress.com/w/wholesale-mg90s-servo.html","checked":false,"note":"Metal-gear SG90 upgrade. Fine for sub-kilogram machines."},{"part":"MG995","maker":"TowerPro","stall":10,"volts":6,"mass":62.4,"speed":0.16,"bus":"PWM","metal":true,"feedback":false,"low":3,"high":6,"vendor":19.95,"vendorName":"Adafruit","source":"https://www.adafruit.com/product/1142","checked":true,"note":"Coarse deadband; noticeably jittery holding a pose."},{"part":"MG996R","maker":"TowerPro","stall":11,"volts":6,"mass":55,"speed":0.14,"bus":"PWM","metal":true,"feedback":false,"low":3,"high":6.5,"vendor":10.95,"vendorName":"JSumo","source":"https://www.jsumo.com/mg996r-servo-motor-digital","checked":true,"note":"The default hexapod servo. Clone quality varies a lot."},{"part":"DS3218MG","maker":"DSServo","stall":20,"volts":6.8,"mass":60,"speed":0.16,"bus":"PWM","metal":true,"feedback":false,"low":8,"high":18,"vendor":null,"vendorName":"","source":"https://www.amazon.com/ANNIMOS-Digital-Waterproof-DS3218MG-Control/dp/B076CNKQX4","checked":false,"note":"IP66 digital. Big torque per dollar, but a current hog."},{"part":"LX-16A","maker":"Hiwonder","stall":17,"volts":6,"mass":52,"speed":0.22,"bus":"SERIAL BUS","metal":true,"feedback":true,"low":16,"high":22,"vendor":null,"vendorName":"","source":"https://www.hiwonder.com/products/lx-16a","checked":false,"note":"Daisy-chains; position and temperature feedback. 19.5 kg-cm at 7.4 V."},{"part":"STS3215","maker":"Feetech","stall":19.5,"volts":7.4,"mass":60,"speed":0.24,"bus":"SERIAL BUS","metal":true,"feedback":true,"low":18,"high":24,"vendor":21.99,"vendorName":"Seeed Studio","source":"https://www.seeedstudio.com/STS3215-19kg-cm-7-4V-Serial-Servo-p-6338.html","checked":true,"note":"12-bit magnetic encoder, 1:345 metal box. $20.99 each at 10+."},{"part":"AX-12A","maker":"Robotis Dynamixel","stall":15.3,"volts":12,"mass":54.6,"speed":0.17,"bus":"SERIAL BUS","metal":true,"feedback":true,"low":45,"high":60,"vendor":57.39,"vendorName":"Robotis","source":"https://www.robotis.us/dynamixel-ax-12a/","checked":true,"note":"What the PhantomX hexapod runs. Rated (not stall) torque is ~0.2 N-m."}]};
@@ -3480,3 +3486,5 @@ boot().catch((e) => {
 
 })();
 </script>
+</body>
+</html>

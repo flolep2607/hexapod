@@ -69,6 +69,17 @@ await page.screenshot({ path: path.join(SHOTS, "01-kinematics.png") });
 
 await page.click('[data-tab="training"]');
 await wait(200);
+check(
+  "the page is decoded as UTF-8",
+  (await page.evaluate(() => document.characterSet)) === "UTF-8",
+  await page.evaluate(() => document.characterSet)
+);
+const gait = (await page.textContent("#tblGait")) || "";
+check(
+  "gait table dashes are not mojibake",
+  /—/.test(gait) && /·/.test(gait) && !/â€/.test(gait) && !/Â·/.test(gait),
+  (gait.match(/Running now[^\n]*/)?.[0] || gait.slice(0, 120)).trim()
+);
 await page.screenshot({ path: path.join(SHOTS, "02-training-before.png") });
 
 await page.click("#btnTrain");
