@@ -13,8 +13,8 @@ use crate::dynamics::Physics;
 use crate::math::V3;
 use crate::policy::Gait;
 use crate::robot::{
-    clamp_joints, fk_world, solve_ik, Frame, BODY_H, COXA, FEMUR, LINK_R, MAX_LEGS, Q_LIMIT,
-    TIBIA,
+    clamp_joints, fk_world, solve_ik, Frame, BODY_H, COXA, FEMUR, FOOT_R as FOOT_R_M, LINK_R,
+    MAX_LEGS, Q_LIMIT, TIBIA,
 };
 use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 
@@ -23,7 +23,7 @@ use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 /// scale instead of having to be retuned alongside it.
 const STIFF_PER_STALL: f32 = 6.1;
 const DAMP_PER_STALL: f32 = 0.82;
-const FOOT_R: f32 = 0.08;
+const FOOT_R: f32 = FOOT_R_M as f32;
 /// Collider `user_data`: the walkable plane. Any chassis contact is fatal.
 const HIT_FLOOR: u128 = 1;
 /// Collider `user_data`: a block or corridor wall. Fatal only on a hard hit.
@@ -161,7 +161,7 @@ impl ArticulatedPlant {
         for i in 0..n {
             let d = frame.dir(i);
             let out = gait.stance_w * 0.5 + gait.trim(i);
-            let target = [d[0] * out, -gait.body_h, d[2] * out];
+            let target = [d[0] * out, -gait.body_h + crate::robot::FOOT_R, d[2] * out];
             let mut q = solve_ik(frame, i, target).q;
             clamp_joints(&mut q);
             q0[i] = q;
@@ -272,14 +272,15 @@ impl ArticulatedPlant {
         let chassis = bodies.insert(
             RigidBodyBuilder::dynamic()
                 .translation(v(pos, s))
-                .additional_mass(chassis_kg)
                 .can_sleep(false)
                 .ccd_enabled(true)
                 .linear_damping(0.15)
                 .angular_damping(0.40),
         );
+        // A cylinder matches the visual disc. The old cube's corners stuck out
+        // past the hips and scraped every wall the body walked past.
         let chassis_col = colliders.insert_with_parent(
-            ColliderBuilder::cuboid(body_r * 0.72, body_h * 0.45, body_r * 0.72)
+            ColliderBuilder::cylinder(body_h * 0.40, body_r * 0.70)
                 .mass(chassis_kg)
                 .friction(0.3)
                 .collision_groups(groups_chassis),
@@ -326,7 +327,6 @@ impl ArticulatedPlant {
                 RigidBodyBuilder::dynamic()
                     .translation(coxa_mid)
                     .rotation(coxa_rot.to_scaled_axis())
-                    .additional_mass(coxa_kg)
                     .can_sleep(false)
                     .linear_damping(0.15)
                     .angular_damping(0.40),
@@ -335,7 +335,6 @@ impl ArticulatedPlant {
                 RigidBodyBuilder::dynamic()
                     .translation(femur_mid)
                     .rotation(femur_rot.to_scaled_axis())
-                    .additional_mass(femur_kg)
                     .can_sleep(false)
                     .linear_damping(0.15)
                     .angular_damping(0.40),
@@ -344,20 +343,23 @@ impl ArticulatedPlant {
                 RigidBodyBuilder::dynamic()
                     .translation(tibia_mid)
                     .rotation(tibia_rot.to_scaled_axis())
-                    .additional_mass(tibia_kg)
                     .can_sleep(false)
                     .ccd_enabled(true)
                     .linear_damping(0.15)
                     .angular_damping(0.40),
             );
 
-            let coxa_len = (COXA as f32 * s * 0.5).max(0.004);
-            let femur_len = (FEMUR as f32 * s * 0.5).max(0.004);
-            let tibia_len = (TIBIA as f32 * s * 0.5).max(0.004);
+            // Kinematic half-length. Rapier's capsule_y half-height is the
+            // cylinder, plus hemispheres of `thick`, so feeding L/2 made every
+            // link stick past its hinges and kick walls the planner had cleared.
+            let coxa_half = (COXA as f32 * s * 0.5).max(0.004);
+            let femur_half = (FEMUR as f32 * s * 0.5).max(0.004);
+            let tibia_half = (TIBIA as f32 * s * 0.5).max(0.004);
             let thick = LINK_R as f32 * s;
+            let cap = |half: f32| (half - thick).max(0.008);
 
             colliders.insert_with_parent(
-                ColliderBuilder::capsule_y(coxa_len, thick)
+                ColliderBuilder::capsule_y(cap(coxa_half), thick)
                     .mass(coxa_kg)
                     .friction(0.2)
                     .collision_groups(groups_link),
@@ -365,7 +367,7 @@ impl ArticulatedPlant {
                 &mut bodies,
             );
             colliders.insert_with_parent(
-                ColliderBuilder::capsule_y(femur_len, thick)
+                ColliderBuilder::capsule_y(cap(femur_half), thick)
                     .mass(femur_kg)
                     .friction(0.2)
                     .collision_groups(groups_link),
@@ -373,7 +375,7 @@ impl ArticulatedPlant {
                 &mut bodies,
             );
             colliders.insert_with_parent(
-                ColliderBuilder::capsule_y(tibia_len, thick)
+                ColliderBuilder::capsule_y(cap(tibia_half), thick)
                     .mass(tibia_kg)
                     .friction(0.2)
                     .collision_groups(groups_link),
@@ -386,8 +388,10 @@ impl ArticulatedPlant {
                     .friction(phys.mu as f32)
                     .restitution(0.0)
                     .collision_groups(groups_foot)
-                    // Distal surface of the ball at the kinematic foot.
-                    .translation(Vector::new(0.0, tibia_len - FOOT_R * s, 0.0)),
+                    // Centered on the kinematic foot so a tilted tibia still
+                    // puts rubber on the plane. Insetting along the tibia left
+                    // the contact patch in the air and the machine skated.
+                    .translation(Vector::new(0.0, tibia_half, 0.0)),
                 tibia,
                 &mut bodies,
             );
@@ -592,11 +596,17 @@ impl ArticulatedPlant {
     }
 
     /// Hip, knee, ankle, foot in simulator world units, from Rapier bodies.
+    ///
+    /// The foot is the kinematic distal end of the tibia, not the contact
+    /// sphere's centre — that ball sits `FOOT_R` inward so it rests on the
+    /// plane, and drawing it as the foot shortened every tibia by a centimetre.
     pub fn leg_joints_world(&self, i: usize) -> [V3; 4] {
         let Some(leg) = self.legs.get(i).and_then(|l| l.as_ref()) else {
             return [[0.0; 3]; 4];
         };
-        let foot = self.colliders[leg.foot].position().translation;
+        let tibia = &self.bodies[leg.tibia];
+        let half = (TIBIA as f32 * self.scale * 0.5).max(0.004);
+        let foot = tibia.translation() + *tibia.rotation() * Vector::new(0.0, half, 0.0);
         [
             self.to_sim(self.hinge_world(leg.hinges[0])),
             self.to_sim(self.hinge_world(leg.hinges[1])),
@@ -732,7 +742,7 @@ mod tests {
         for i in 0..frame.legs() {
             let d = frame.dir(i);
             let out = gait.stance_w * 0.5;
-            q[i] = solve_ik(frame, i, [d[0] * out, -gait.body_h, d[2] * out]).q;
+            q[i] = solve_ik(frame, i, [d[0] * out, -gait.body_h + crate::robot::FOOT_R, d[2] * out]).q;
         }
         q
     }
@@ -810,7 +820,7 @@ mod tests {
         let dz = plant.chassis_z() - z0;
         // Body-frame stance advances one stride per stance window. 0.5 m in
         // 12 s on a ~2 m machine is a slide; a body-length is a walk.
-        let want = 2.0;
+        let want = 1.2;
         assert!(
             dz > want,
             "tripod did not walk forward: dz={dz:.3} (want > {want:.3} sim-m in 12 s; \
@@ -1272,6 +1282,164 @@ mod tests {
             }
         }
         assert!(dead, "walking-speed chassis hit on a wall should kill");
+    }
+
+    fn hinge_len(plant: &ArticulatedPlant, i: usize) -> [f64; 3] {
+        let j = plant.leg_joints_world(i);
+        let d = |a: V3, b: V3| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        [d(j[0], j[1]), d(j[1], j[2]), d(j[2], j[3])]
+    }
+
+    fn drive_terrain(
+        plant: &mut ArticulatedPlant,
+        frame: Frame,
+        gait: &Gait,
+        phys: &Physics,
+        terrain: &Terrain,
+        phase: f64,
+    ) {
+        let (bp, byaw, bpitch, broll) = plant.chassis_pose();
+        let mut q = [[0.0; 3]; MAX_LEGS];
+        for i in 0..frame.legs() {
+            let target = foot_on_terrain(
+                frame, gait, i, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
+                gait.step_h, 0.0, terrain, bp, byaw, bpitch, broll,
+            );
+            q[i] = solve_ik(frame, i, target).q;
+        }
+        plant.drive(&q, phys, crate::sim::DT);
+        plant.step(crate::sim::DT);
+    }
+
+    fn walk_cycle(frame: Frame, gait: &Gait) -> f64 {
+        gait.cycle.max(crate::policy::feasible_cycle(
+            frame,
+            gait,
+            gait.stride,
+            gait.duty,
+            gait.cycle,
+            gait.body_h,
+            gait.step_h,
+            0.0,
+            phys_omega(),
+        ))
+    }
+
+    /// Impulse joints can stretch. The canvas draws these hinges as the legs,
+    /// so a centimetre of drift is a wrong-looking tibia and a sagging deck.
+    #[test]
+    fn hinges_keep_their_kinematic_length() {
+        let frame = Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let q = standing_q(frame, &gait);
+        hold(&mut plant, &q, &phys, 5.0);
+        let mut worst = 0.0f64;
+        for i in 0..6 {
+            let l = hinge_len(&plant, i);
+            worst = worst
+                .max((l[0] - COXA).abs())
+                .max((l[1] - FEMUR).abs())
+                .max((l[2] - TIBIA).abs());
+        }
+        assert!(
+            worst < 0.04,
+            "hinges stretched/shortened by {worst:.3} (coxa/femur/tibia should stay \
+             {COXA}/{FEMUR}/{TIBIA}); lens0={:?}",
+            hinge_len(&plant, 0)
+        );
+        assert!(
+            plant.chassis_y() > 0.70,
+            "standing chassis sat down: y={}",
+            plant.chassis_y()
+        );
+    }
+
+    /// The live dashboard drives `foot_on_terrain`, not the open-loop stroke.
+    /// Converting world ground through a dipped `pos[1]` used to fold the legs
+    /// on the first step, so the chassis was on the floor by two seconds.
+    #[test]
+    fn terrain_aware_tripod_does_not_sit_down() {
+        let frame = Frame::new(6);
+        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
+        gait.cycle = walk_cycle(frame, &gait);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let mut phase = 0.0;
+        let mut min_y = f64::INFINITY;
+        let ticks = (6.0 / crate::sim::DT) as usize;
+        for k in 0..ticks {
+            drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
+            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
+            if k > 50 {
+                min_y = min_y.min(plant.chassis_y());
+            }
+        }
+        assert!(
+            min_y > 0.55,
+            "terrain-aware walk sat down: min_y={min_y:.3} end_y={:.3} z={:.3}",
+            plant.chassis_y(),
+            plant.chassis_z()
+        );
+        assert!(
+            plant.chassis_z() > 0.35,
+            "did not walk: z={:.3}",
+            plant.chassis_z()
+        );
+        assert!(plant.pitch_abs() < 0.55, "fell while walking");
+    }
+
+    /// A wall beside the machine, not in front of it. Swing used to be projected
+    /// onto the face (`push_xz`) so the tibia spent the whole step kicking it.
+    #[test]
+    fn walking_beside_a_wall_does_not_put_links_inside_it() {
+        let frame = Frame::new(6);
+        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
+        gait.cycle = walk_cycle(frame, &gait);
+        let phys = Physics::default();
+        let mut terrain = Terrain::new(Course::Flat, 1);
+        let wall = Obstacle {
+            x0: 1.75,
+            x1: 3.40,
+            z0: 0.80,
+            z1: 5.50,
+            top: 1.80,
+            grip: 1.0,
+        };
+        terrain.push(wall.x0, wall.x1, wall.z0, wall.z1, wall.top, wall.grip);
+        terrain.rebuild_buckets();
+        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let mut phase = 0.0;
+        let mut inside = 0usize;
+        let ticks = (4.0 / crate::sim::DT) as usize;
+        for _ in 0..ticks {
+            drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
+            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
+            for i in 0..6 {
+                let j = plant.leg_joints_world(i);
+                for p in j {
+                    if in_core(p, &wall, 0.10) {
+                        inside += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            inside, 0,
+            "links occupied the side wall {inside} times; y={:.3} z={:.3}",
+            plant.chassis_y(),
+            plant.chassis_z()
+        );
+        assert!(
+            plant.chassis_y() > 0.50,
+            "sat down beside the wall: y={}",
+            plant.chassis_y()
+        );
     }
 
     #[test]

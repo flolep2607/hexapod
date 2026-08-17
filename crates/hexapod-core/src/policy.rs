@@ -642,11 +642,96 @@ mod tests {
         n.apply(&probe, &mut out, no);
         assert!(out[..no].iter().all(|v| v.abs() < 0.25), "{out:?}");
     }
+
+    /// Converting a world ground point through a sagged `pos[1]` used to fold
+    /// every leg: the same foothold is closer in the body frame, IK shortens,
+    /// the chassis sits down. Stance has to keep asking for ride height.
+    #[test]
+    fn a_sagged_chassis_still_commands_ride_height() {
+        use crate::terrain::{Course, Terrain};
+        let frame = Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let pos = [0.0, 0.40, 0.0];
+        let mut shortest = 0.0f64;
+        for phase in [0.0, 0.1, 0.2, 0.3] {
+            for leg in 0..frame.legs() {
+                let t = foot_on_terrain(
+                    frame, &gait, leg, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
+                    gait.step_h, 0.0, &terrain, pos, 0.0, 0.0, 0.0,
+                );
+                shortest = shortest.min(t[1]);
+                let lp = crate::math::frac(phase + gait.offsets[leg]);
+                if lp < gait.duty {
+                    assert!(
+                        t[1] < -gait.body_h + 0.08,
+                        "stance leg {leg} folded under a sagged body: y={}",
+                        t[1]
+                    );
+                }
+            }
+        }
+        assert!(
+            shortest < -0.80,
+            "no stance target asked for ride height, shortest={shortest}"
+        );
+    }
+
+    #[test]
+    fn a_swing_into_a_wall_retracts_instead_of_scraping_the_face() {
+        use crate::terrain::{Course, Obstacle, Terrain};
+        let frame = Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let mut terrain = Terrain::new(Course::Flat, 1);
+        let wall = Obstacle {
+            x0: 0.85,
+            x1: 2.40,
+            z0: -0.40,
+            z1: 2.20,
+            top: 1.80,
+            grip: 1.0,
+        };
+        terrain.push(wall.x0, wall.x1, wall.z0, wall.z1, wall.top, wall.grip);
+        terrain.rebuild_buckets();
+        assert!(
+            terrain.blocked_column(1.20, 0.50, 0.0, 0.62),
+            "test wall never made it into the height field (h={})",
+            terrain.height(1.20, 0.50)
+        );
+        let pos = [0.0, gait.body_h, 0.0];
+        let mut inside = 0usize;
+        let mut retracted = 0usize;
+        for k in 0..40 {
+            let phase = k as f64 / 40.0;
+            for leg in 0..frame.legs() {
+                let t = foot_on_terrain(
+                    frame, &gait, leg, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
+                    gait.step_h, 0.0, &terrain, pos, 0.0, 0.0, 0.0,
+                );
+                let w = crate::math::body_to_world(t, 0.0, 0.0, 0.0);
+                let p = [pos[0] + w[0], pos[1] + w[1], pos[2] + w[2]];
+                let in_xz = p[0] > wall.x0 + 0.04
+                    && p[0] < wall.x1 - 0.04
+                    && p[2] > wall.z0 + 0.04
+                    && p[2] < wall.z1 - 0.04;
+                if in_xz && p[1] < wall.top - 0.05 && p[1] > 0.05 {
+                    inside += 1;
+                }
+                // Right-side legs only: left feet sit at x<0 and would pass
+                // `p[0] < wall.x0` without ever having seen the wall.
+                if leg % 2 == 1 && p[0] < wall.x0 - 0.01 {
+                    retracted += 1;
+                }
+            }
+        }
+        assert_eq!(inside, 0, "swing still aims into the wall {inside} times");
+        assert!(retracted > 0, "never produced a target on the hip side of the wall");
+    }
 }
 
-/// Body-frame foot target for an open-loop gait. Stance sweeps aft, swing
-/// returns with a sine lift. This is the whole walking programme: IK turns it
-/// into 18 joint angles, Rapier does the rest.
+/// Body-frame foot target for an open-loop gait. Stance sweeps along the body
+/// +Z axis, swing returns with a sine lift. This is the whole walking
+/// programme: IK turns it into 18 joint angles, Rapier does the rest.
 ///
 /// `turn` is the commanded yaw rate in rad/s. Over one stance the body turns
 /// through `turn * duty * cycle`, so the planted foot has to travel along an arc
@@ -669,18 +754,19 @@ pub fn foot_in_body(
     use crate::math::{frac, rot_y};
     let d = frame.dir(leg);
     let out = gait.stance_w * 0.5 + gait.trim(leg);
-    let neutral = [d[0] * out, -body_h - 0.03, d[2] * out];
+    let neutral = [d[0] * out, -body_h + crate::robot::FOOT_R - 0.03, d[2] * out];
     let lp = frac(phase + gait.offsets[leg]);
-    // `s` runs +0.5 at touchdown to -0.5 at lift-off. A planted foot travels
-    // aft, which is what carries the body forward; the swing takes it back to
-    // the front. Getting this backwards leaves the machine pushing against
-    // itself and creeping along on nothing but foot slip.
+    // `s` runs -0.5 at touchdown to +0.5 at lift-off. A planted foot travels
+    // *forward* in the body frame. That is the opposite of the usual "stance
+    // sweeps aft" cartoon, and it is what this plant actually pushes against:
+    // commanding the foot aft made the chassis walk backward the moment the
+    // feet gripped. The swing mirrors it so the stroke stays continuous.
     let (s, lift) = if lp < duty {
-        (0.5 - lp / duty.max(1e-6), 0.0)
+        (lp / duty.max(1e-6) - 0.5, 0.0)
     } else {
         let u = (lp - duty) / (1.0 - duty).max(1e-6);
         (
-            u - 0.5,
+            0.5 - u,
             step_h * (core::f64::consts::PI * u).sin(),
         )
     };
@@ -701,16 +787,23 @@ pub fn foot_in_body(
 ///   onto a kerb instead of kicking it;
 /// * a swinging foot rides `FOOT_CLEAR` above whatever it passes over, so it
 ///   crosses an obstacle rather than dragging through it;
-/// * a foot that would land inside something too tall to stand on is pushed out
-///   to the nearest face, so the leg is never asked to occupy a wall;
+/// * a swing that would go through something too tall to stand on is pulled in
+///   toward the hip, not glued to the wall face — `push_xz` on a swing is how
+///   a tibia spends the whole step scraping a slalom wall;
 /// * and the pose the whole leg would have to take is checked, not just the
 ///   foot: a target that puts the femur or the tibia through a block is pulled
 ///   in toward the hip until the links are clear, because a foot standing in
 ///   free air is no use if the knee is inside the crate.
 ///
+/// Stance height is a body-frame command (`-body_h` plus how much higher this
+/// foothold is than the ground under the chassis). Converting a world ground
+/// point through the *measured* body height folds the legs the moment the deck
+/// dips: the same world foot is closer in the body frame, IK shortens, and the
+/// chassis sits down. The open-loop standing pose does not do that, which is
+/// why a held pose stayed up while a walk collapsed.
+///
 /// `pos`/`yaw` are the body's *measured* pose, so the leg reacts to the rock
 /// that is actually in front of it.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn foot_on_terrain(
     frame: Frame,
@@ -726,10 +819,11 @@ pub fn foot_on_terrain(
     terrain: &Terrain,
     pos: V3,
     yaw: f64,
-    pitch: f64,
-    roll: f64,
+    _pitch: f64,
+    _roll: f64,
 ) -> V3 {
     use crate::math::{body_to_world, frac, world_to_body};
+    use crate::robot::{FOOT_R, LINK_R};
     use crate::sim::{FOOT_CLEAR, MAX_FOOTHOLD};
 
     // The stroke is laid out in a level frame at yaw: where the foot should go
@@ -740,45 +834,73 @@ pub fn foot_on_terrain(
     let w = body_to_world(base, yaw, 0.0, 0.0);
     let (mut x, mut z) = (pos[0] + w[0], pos[2] + w[2]);
 
-    // The plane the machine is standing on, as far as this leg is concerned:
-    // reach is measured from the body, not from sea level.
-    let plane = pos[1] - body_h;
-    let pushed = terrain.push_xz(x, z, plane, MAX_FOOTHOLD);
-    x = pushed.0;
-    z = pushed.1;
-    let ground = terrain.height(x, z).min(plane + MAX_FOOTHOLD);
-
-    // Vertically the target is referenced to the *terrain*, never to the body's
-    // measured height. Hanging it off the measured height closes a loop with the
-    // wrong sign — the deck dips, every target dips with it, the legs extend and
-    // shove it back past level — and the machine pogos itself off the map inside
-    // a minute. The ground does not move, so it is what the feet aim at.
-    //
-    // Taking the higher of the ground under the body and the ground under the
-    // foot is what makes the machine step *onto* a kerb rather than into its
-    // side, and it keeps a foot swinging over a block from dragging through it.
-    let under_body = terrain.height(pos[0], pos[2]);
-    let stand = under_body.max(ground);
+    // Ground under the chassis, not `pos[1] - body_h`: that second form is the
+    // sagged deck talking, and we refuse to listen to it for the ride height.
+    let plane = terrain.height(pos[0], pos[2]);
     let lp = frac(phase + gait.offsets[leg]);
-    let y = if lp < duty {
-        stand - PRESS
-    } else {
-        let u = (lp - duty) / (1.0 - duty).max(1e-6);
-        stand + FOOT_CLEAR + step_h * (core::f64::consts::PI * u).sin()
-    };
+    let stance = lp < duty;
 
-    let body = world_to_body([x - pos[0], y - pos[1], z - pos[2]], yaw, pitch, roll);
-    clear_links(frame, leg, body, terrain, pos, yaw)
+    if stance {
+        let pushed = terrain.push_xz(x, z, plane, MAX_FOOTHOLD);
+        x = pushed.0;
+        z = pushed.1;
+    } else if swing_blocked(terrain, x, z, plane, MAX_FOOTHOLD, LINK_R) {
+        // Pull the swing in toward the hip instead of sliding along a wall.
+        let hip = frame.hip(leg);
+        let hw = body_to_world(hip, yaw, 0.0, 0.0);
+        let (hx, hz) = (pos[0] + hw[0], pos[2] + hw[2]);
+        let (x0, z0) = (x, z);
+        let mut lo = 0.0;
+        let mut hi = 1.0;
+        for _ in 0..12 {
+            let m = 0.5 * (lo + hi);
+            let mx = x0 + (hx - x0) * m;
+            let mz = z0 + (hz - z0) * m;
+            if swing_blocked(terrain, mx, mz, plane, MAX_FOOTHOLD, LINK_R) {
+                lo = m;
+            } else {
+                hi = m;
+            }
+        }
+        let t = (hi + 0.12).min(1.0);
+        x = x0 + (hx - x0) * t;
+        z = z0 + (hz - z0) * t;
+    }
+
+    let ground = terrain.height(x, z).min(plane + MAX_FOOTHOLD);
+    let dy = ground - plane;
+
+    // Keep the gait's body-frame stroke (including its ride height). Only the
+    // horizontal point may have been pushed or retracted; `dy` is how much
+    // higher this foothold is than the ground under the chassis. Using the
+    // measured `pos[1]` for Y is what folded the legs when the deck dipped.
+    let horiz = world_to_body([x - pos[0], 0.0, z - pos[2]], yaw, 0.0, 0.0);
+    let mut target = [horiz[0], base[1] + dy, horiz[2]];
+    if !stance {
+        let u = (lp - duty) / (1.0 - duty).max(1e-6);
+        let lift = FOOT_CLEAR + step_h * (core::f64::consts::PI * u).sin();
+        let y_world = (ground + FOOT_R + lift) - pos[1];
+        target[1] = target[1].max(y_world);
+    }
+
+    clear_links(frame, leg, target, terrain, pos, yaw)
 }
 
-/// How far a standing foot is driven into its ground. A servo holding station
-/// needs some error to pull against; without it the leg hovers and the deck
-/// sinks onto whatever is left.
-const PRESS: f64 = 0.02;
+fn swing_blocked(terrain: &Terrain, x: f64, z: f64, floor: f64, max_step: f64, r: f64) -> bool {
+    use crate::terrain::CORRIDOR_HALF;
+    if x.abs() > CORRIDOR_HALF - r {
+        return true;
+    }
+    terrain.blocked_column(x, z, floor, max_step)
+        || terrain.blocked_column(x + r, z, floor, max_step)
+        || terrain.blocked_column(x - r, z, floor, max_step)
+        || terrain.blocked_column(x, z + r, floor, max_step)
+        || terrain.blocked_column(x, z - r, floor, max_step)
+}
 
 /// Pull a foot target in toward the hip until no link chords a wall.
 ///
-/// Five tries at 12% a step: enough to walk a leg out of a crate it was about
+/// Twelve tries at 20% a step: enough to walk a leg out of a crate it was about
 /// to reach through, and it gives up rather than folding the leg under the body
 /// when there is no clear pose at all — a stubbed step is better than a
 /// collapsed stance.
@@ -792,12 +914,12 @@ fn clear_links(
 ) -> V3 {
     let hip = frame.hip(leg);
     let mut t = target;
-    for _ in 0..5 {
+    for _ in 0..12 {
         if !leg_hits_block(frame, leg, t, terrain, pos, yaw) {
             return t;
         }
         for c in 0..3 {
-            t[c] += (hip[c] - t[c]) * 0.12;
+            t[c] += (hip[c] - t[c]) * 0.20;
         }
     }
     t
@@ -816,9 +938,28 @@ fn leg_hits_block(
     pos: V3,
     yaw: f64,
 ) -> bool {
+    use crate::robot::LINK_R;
+    use crate::sim::MAX_FOOTHOLD;
     let q = solve_ik(frame, leg, target).q;
     let j = fk_world(frame, leg, q, pos, yaw, 0.0, 0.0);
-    (0..3).any(|k| terrain.segment_hits_solid(j[k], j[k + 1]))
+    (0..3).any(|k| {
+        let (a, b) = (j[k], j[k + 1]);
+        if terrain.segment_hits_solid(a, b) {
+            return true;
+        }
+        // Capsules are LINK_R thick. A zero-radius chord can miss a wall the
+        // physical tibia still kicks, so offset the chord sideways for the
+        // unclimbable test only — thickening against a kerb would retract a
+        // legitimate step onto it.
+        let dx = b[0] - a[0];
+        let dz = b[2] - a[2];
+        let len = crate::math::hypot2(dx, dz).max(1e-6);
+        let nx = -dz / len * LINK_R;
+        let nz = dx / len * LINK_R;
+        let shift = |p: V3, s: f64| [p[0] + nx * s, p[1], p[2] + nz * s];
+        terrain.segment_hits_wall(shift(a, 1.0), shift(b, 1.0), 0.0, MAX_FOOTHOLD)
+            || terrain.segment_hits_wall(shift(a, -1.0), shift(b, -1.0), 0.0, MAX_FOOTHOLD)
+    })
 }
 
 /// Shortest cycle time this stroke can be run at without asking a joint to turn

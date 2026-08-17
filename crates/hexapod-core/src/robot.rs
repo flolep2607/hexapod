@@ -41,6 +41,11 @@ const SPREAD: f64 = 50.0 * DEG;
 /// this thick and the trajectory generator keeps them out of blocks.
 pub const LINK_R: f64 = 0.05;
 
+/// Rubber foot, simulator units. Centered on the kinematic foot so a tilted
+/// tibia still meets the plane; the gait aims the kinematic point this far
+/// above the ground so the ball kisses rather than tunnels.
+pub const FOOT_R: f64 = 0.05;
+
 pub const Q_LIMIT: [(f64, f64); 3] = [
     (-100.0 * DEG, 100.0 * DEG),
     (-110.0 * DEG, 110.0 * DEG),
