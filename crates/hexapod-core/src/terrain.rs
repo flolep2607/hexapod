@@ -238,7 +238,9 @@ impl Terrain {
         }
     }
 
-    fn rebuild_buckets(&mut self) {
+    /// Re-index after obstacles are added by hand — `height` and the sweep tests
+    /// read the buckets, so an obstacle that is not in them is invisible to them.
+    pub(crate) fn rebuild_buckets(&mut self) {
         for b in self.buckets.iter_mut() {
             b.clear();
         }
@@ -392,11 +394,10 @@ impl Terrain {
             let mut best: Option<Obstacle> = None;
             for &i in &self.buckets[Self::bucket_of(z)] {
                 let ob = self.obstacles[i as usize];
-                if ob.contains(x, z) && ob.top - floor > max_step {
-                    if best.map(|b| ob.top > b.top).unwrap_or(true) {
+                if ob.contains(x, z) && ob.top - floor > max_step
+                    && best.map(|b| ob.top > b.top).unwrap_or(true) {
                         best = Some(ob);
                     }
-                }
             }
             let Some(ob) = best else {
                 return (x, z);
@@ -477,7 +478,42 @@ impl Terrain {
         false
     }
 
-    fn push(&mut self, x0: f64, x1: f64, z0: f64, z1: f64, top: f64, grip: f64) {
+    /// Would a link pass through the interior of any positive-height terrain
+    /// prism? Unlike [`segment_hits_wall`], this includes climbable blocks.
+    /// A foot may rest on a top face, but a femur or tibia may not tunnel
+    /// through the volume merely because the block is short enough to climb.
+    pub fn segment_hits_solid(&self, a: V3, b: V3) -> bool {
+        for p in [a, b] {
+            if p[0].abs() > CORRIDOR_HALF + WALL_PAD && p[1] > WALL_PAD && p[1] < WALL_TOP - WALL_PAD {
+                return true;
+            }
+        }
+        let b0 = Self::bucket_of(a[2].min(b[2]));
+        let b1 = Self::bucket_of(a[2].max(b[2]));
+        for bucket in b0..=b1 {
+            for &i in &self.buckets[bucket] {
+                let ob = &self.obstacles[i as usize];
+                if ob.top <= WALL_PAD * 2.0 {
+                    continue;
+                }
+                let x0 = ob.x0 + WALL_PAD;
+                let x1 = ob.x1 - WALL_PAD;
+                let z0 = ob.z0 + WALL_PAD;
+                let z1 = ob.z1 - WALL_PAD;
+                let y0 = WALL_PAD;
+                let y1 = ob.top - WALL_PAD;
+                if x1 <= x0 || y1 <= y0 || z1 <= z0 {
+                    continue;
+                }
+                if segment_hits_aabb(a, b, x0, x1, y0, y1, z0, z1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn push(&mut self, x0: f64, x1: f64, z0: f64, z1: f64, top: f64, grip: f64) {
         self.obstacles.push(Obstacle {
             x0,
             x1,
@@ -873,7 +909,7 @@ mod tests {
         // Off the course entirely, and behind the first obstacle.
         assert_eq!(t.grip(0.0, Z_MIN - 1.0), GRIP_GROUND);
         assert_eq!(t.grip(0.0, 0.0), GRIP_GROUND);
-        assert!(GRIP_RUBBLE < GRIP_GROUND);
+        const { assert!(GRIP_RUBBLE < GRIP_GROUND) };
     }
 
     #[test]
@@ -985,7 +1021,7 @@ mod tests {
         let (cx, cz) = ((ice.x0 + ice.x1) * 0.5, (ice.z0 + ice.z1) * 0.5);
         assert_eq!(t.grip(cx, cz), GRIP_ICE);
         assert!(t.height(cx, cz) < 0.02, "ice is not a step");
-        assert!(GRIP_ICE < GRIP_RUBBLE);
+        const { assert!(GRIP_ICE < GRIP_RUBBLE) };
     }
 
     #[test]
@@ -1096,5 +1132,25 @@ mod tests {
             0.62,
         );
         assert!(!clear, "open ground in front of the wall is blocked");
+    }
+
+    #[test]
+    fn a_climbable_block_is_still_solid_to_leg_links() {
+        let mut t = Terrain::new(Course::Flat, 1);
+        t.push(-0.5, 0.5, 1.0, 2.0, 0.30, GRIP_STEP);
+        t.rebuild_buckets();
+
+        assert!(
+            t.segment_hits_solid([-0.8, 0.15, 1.5], [0.8, 0.15, 1.5]),
+            "a femur tunnels through a climbable step"
+        );
+        assert!(
+            !t.segment_hits_solid([-0.8, 0.32, 1.5], [0.8, 0.32, 1.5]),
+            "a link above the top face is reported inside"
+        );
+        assert!(
+            !t.segment_hits_solid([0.0, 0.30, 0.8], [0.0, 0.30, 1.5]),
+            "contact with the top face is penetration"
+        );
     }
 }

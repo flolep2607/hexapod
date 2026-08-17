@@ -3,14 +3,17 @@
 A legged-locomotion simulator with a policy-search trainer and a hardware
 sizer. Four legs to ten; six is the default and the one everything is tuned
 at. The simulator, the learner and the kinematics are Rust; the browser only
-draws.
+draws. The live robot is Rapier — a chassis plus three revolute joints per
+leg and ground friction. Gait, IK and the servo cap are written here. ARS
+still trains on the fast centroidal step so it can run in the page.
 
 Start it from `dist/hexapod-simulator.html` — one self-contained file, no
 server, no network, no dependencies.
 
 ```
 ./build.sh          # test, compile wasm, emit dist/hexapod-simulator.html
-node test/smoke.mjs # drive the built page in a real browser
+node test/smoke.mjs # run five browser scenarios in parallel
+SMOKE_SCREENSHOTS=1 node test/smoke.mjs # optionally save the 15 visual snapshots
 ```
 
 ## What it does
@@ -24,8 +27,10 @@ servo you pick there is the servo the simulator drives the joints with.
 
 ## The simulator
 
-A **centroidal rigid-body** model with Coulomb contact and actuator limits. Not
-a full articulated multibody engine, and the About tab says so in the page too.
+A **centroidal rigid-body** model with Coulomb contact and actuator limits
+trains the policy. The dashboard's live robot is the other plant: Rapier 0.32,
+one chassis, three revolute joints per leg, motors limited by the servo's stall
+torque. The About tab says so in the page too.
 
 **Contact.** A stance foot transmits at most `mu * N` horizontally. Past that it
 skids: the body keeps the momentum it already had, and the contact point moves

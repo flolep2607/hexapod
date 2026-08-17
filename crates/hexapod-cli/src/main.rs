@@ -769,7 +769,7 @@ fn system(
             s.cost_usd,
             verdict
         );
-        if s.converged && s.servo_ok && best.map_or(true, |b| s.cost_usd < b.0) {
+        if s.converged && s.servo_ok && best.is_none_or(|b| s.cost_usd < b.0) {
             best = Some((s.cost_usd, servo.part));
         }
     }
@@ -825,8 +825,8 @@ fn system(
     match s.regulator {
         Some(r) => line("REGULATOR", r.name, 1, r.unit_price(), r.note),
         None => println!(
-            "  {:<13} {:<30} {}",
-            "REGULATOR", "none", "pack voltage matches the servo bus"
+            "  {:<13} {:<30} pack voltage matches the servo bus",
+            "REGULATOR", "none"
         ),
     }
     if let Some(d) = s.driver {

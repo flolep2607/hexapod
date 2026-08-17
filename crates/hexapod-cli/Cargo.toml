@@ -11,3 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 hexapod-core = { path = "../hexapod-core" }
+
+[lints]
+workspace = true

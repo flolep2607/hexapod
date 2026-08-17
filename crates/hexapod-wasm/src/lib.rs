@@ -3,7 +3,9 @@
 //! No `wasm-bindgen`: the module exports plain `extern "C"` functions and a
 //! pointer to a flat `f32` buffer that JavaScript reads through a typed array
 //! view over the wasm linear memory. That keeps the toolchain to a plain
-//! `cargo build --target wasm32-unknown-unknown` and the artefact under 50 kB.
+//! `cargo build --target wasm32-unknown-unknown`. Rapier makes the artefact
+//! larger than the old ~158 kB centroidal-only module; the live robot is 18
+//! revolute joints, not a custom engine.
 //!
 //! All state is a single process-global. wasm32 here is single-threaded and
 //! JavaScript calls in one at a time, so there is no aliasing to worry about.
@@ -13,11 +15,13 @@ pub mod layout;
 use core::ptr::addr_of_mut;
 
 use hexapod_core::ars::{ArsConfig, Trainer};
-use hexapod_core::dynamics::Physics;
+use hexapod_core::dynamics::{robot_com, Physics};
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
-use hexapod_core::math::{squash, unsquash};
-use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
+use hexapod_core::math::{body_to_world, convex_hull_xz, polygon_margin, squash, unsquash};
+use hexapod_core::plant::ArticulatedPlant;
+use hexapod_core::policy::foot_on_terrain;
+use hexapod_core::policy::{act_body_dh, n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
 use hexapod_core::sim::{
     Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX,
     JUMP_CRUISE_MIN,
@@ -47,6 +51,11 @@ struct App {
 
     live: Sim,
     live_gait: Gait,
+    /// Rapier articulated plant. The live view draws its body transforms and
+    /// `live` is told the pose each tick so it plans footholds for the real
+    /// body; joint angles still never travel back. ARS trains on the
+    /// centroidal step alone, with no plant in the loop.
+    plant: Option<ArticulatedPlant>,
     mode: u32,
     since_fall: f64,
 
@@ -110,6 +119,7 @@ fn make(seed: u64) -> App {
         trained: false,
         live: Sim::default(),
         live_gait,
+        plant: None,
         mode: MODE_BASELINE,
         since_fall: 0.0,
         build,
@@ -133,13 +143,13 @@ fn make(seed: u64) -> App {
 
 // ---------------------------------------------------------------- lifecycle
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_init(seed: u32) {
     unsafe { APP = Some(make(seed as u64)) };
     app().reset_live();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_course(kind: u32, seed: u32) {
     let a = app();
     a.course = Course::from_u32(kind);
@@ -162,7 +172,7 @@ pub extern "C" fn hx_set_course(kind: u32, seed: u32) {
 ///
 /// A different leg count is a different machine with a different policy shape,
 /// so everything learned is discarded.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_legs(legs: u32) -> u32 {
     let a = app();
     let next = Frame::new(legs as usize);
@@ -184,45 +194,45 @@ pub extern "C" fn hx_set_legs(legs: u32) -> u32 {
 
 /// The gait preset in force. Changing the leg count can change it, because a
 /// frame that cannot stand on an alternating gait is moved to the crawl.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_preset() -> u32 {
     app().preset as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_legs() -> u32 {
     app().frame.legs() as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_legs_min() -> u32 {
     MIN_LEGS as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_legs_max() -> u32 {
     MAX_LEGS as u32
 }
 
 /// 1 when an alternating half-set gait keeps this frame statically stable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_alternating_is_stable() -> u32 {
     u32::from(app().frame.alternating_is_stable())
 }
 
 /// Number of parameters the policy carries on the current frame, and the shape
 /// of the feedback matrix that makes up most of them.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_theta_len() -> u32 {
     n_theta(app().frame) as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_n_obs() -> u32 {
     hexapod_core::policy::n_obs(app().frame) as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_n_act() -> u32 {
     hexapod_core::policy::n_act(app().frame) as u32
 }
@@ -232,18 +242,18 @@ pub extern "C" fn hx_n_act() -> u32 {
 /// The dashboard classifies a *measured* footfall pattern by matching it
 /// against these, so the named patterns it compares against are the ones the
 /// simulator actually defines rather than a second copy of the tables.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_preset_offset(preset: u32, leg: u32) -> f64 {
     let a = app();
     Preset::from_u32(preset).offsets(a.frame)[(leg as usize).min(MAX_LEGS - 1)]
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_preset_count() -> u32 {
     3
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_preset(p: u32) {
     let a = app();
     a.preset = Preset::from_u32(p);
@@ -252,7 +262,7 @@ pub extern "C" fn hx_set_preset(p: u32) {
     a.reset_live();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_mode(mode: u32) {
     let a = app();
     if a.mode != mode {
@@ -261,7 +271,7 @@ pub extern "C" fn hx_set_mode(mode: u32) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_reset_live() {
     app().reset_live();
 }
@@ -269,7 +279,7 @@ pub extern "C" fn hx_reset_live() {
 // ------------------------------------------------------------- manual gait
 
 /// Set gait scalar `idx` (0..6) on the hand-tuned policy.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_param(idx: u32, value: f64) {
     let a = app();
     let i = idx as usize;
@@ -282,7 +292,7 @@ pub extern "C" fn hx_set_param(idx: u32, value: f64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_get_param(idx: u32) -> f64 {
     let a = app();
     let i = idx as usize;
@@ -294,7 +304,7 @@ pub extern "C" fn hx_get_param(idx: u32) -> f64 {
 
 // ---------------------------------------------------------------- training
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_train_cfg(dirs: u32, top: u32, alpha: f64, sigma: f64, horizon: f64) {
     let a = app();
     a.trainer.cfg.n_dirs = (dirs as usize).clamp(2, 32);
@@ -304,13 +314,13 @@ pub extern "C" fn hx_set_train_cfg(dirs: u32, top: u32, alpha: f64, sigma: f64, 
     a.trainer.cfg.horizon = horizon.clamp(2.0, 30.0);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_reset_training() {
     app().reset_training();
 }
 
 /// Run `iters` ARS iterations. Returns the best reward so far.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_train(iters: u32) -> f64 {
     let a = app();
     if a.trainer.curve.is_empty() {
@@ -321,18 +331,28 @@ pub extern "C" fn hx_train(iters: u32) -> f64 {
     }
     a.trained = true;
     a.learned = a.trainer.best_policy();
+    // Drive the robot on screen with the gait ARS just scored. Clamp like
+    // reset_live so the servos can track; do not respawn the plant.
+    a.live_gait = a.learned.gait();
+    a.apply_live_gait_limits();
+    if a.mode != MODE_LEARNED {
+        a.mode = MODE_LEARNED;
+    }
+    // Publish here: the live view only calls `hx_step` while unpaused, and
+    // the dashboard reads these fields after `hx_train`.
+    a.publish();
     a.trainer.best_reward
 }
 
 /// Number of ARS iterations completed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_iterations() -> u32 {
     app().trainer.iter as u32
 }
 
 // ------------------------------------------------------------------- build
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_build(scale: f64, mass_kg: f64, safety: f64) {
     let a = app();
     let changed =
@@ -350,7 +370,7 @@ pub extern "C" fn hx_set_build(scale: f64, mass_kg: f64, safety: f64) {
 
 /// Choose the servo whose torque-speed line drives the joints. `0xFFFF_FFFF`
 /// restores the generic default. Returns 1 if the machine changed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_servo(index: u32) -> u32 {
     let a = app();
     let next = if (index as usize) < SERVOS.len() {
@@ -368,7 +388,7 @@ pub extern "C" fn hx_set_servo(index: u32) -> u32 {
 
 /// Commanded cruise speed, clamped to the range training samples from on
 /// the current course.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_cruise(v: f64) {
     let a = app();
     a.cruise = if a.course.is_jump() {
@@ -378,7 +398,7 @@ pub extern "C" fn hx_set_cruise(v: f64) {
     };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_cruise_lo() -> f64 {
     if app().course.is_jump() {
         JUMP_CRUISE_MIN
@@ -387,7 +407,7 @@ pub extern "C" fn hx_cruise_lo() -> f64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_cruise_hi() -> f64 {
     if app().course.is_jump() {
         JUMP_CRUISE_MAX
@@ -399,7 +419,7 @@ pub extern "C" fn hx_cruise_hi() -> f64 {
 /// Measure peak joint torques over one full gait cycle of the active policy.
 /// Writes `[coxa, femur, tibia, required, peak_foot_N, cycle_s, stance_mm, set_mass_kg]`
 /// in kg-cm where applicable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_measure_torque() -> *const f32 {
     let a = app();
     let policy: &Policy = if a.mode == MODE_LEARNED && a.trained {
@@ -446,7 +466,7 @@ pub extern "C" fn hx_measure_torque() -> *const f32 {
 
 // -------------------------------------------------------------------- step
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_step(dt: f64, fwd: f64, turn: f64) {
     let a = app();
     a.step(dt, fwd, turn);
@@ -455,61 +475,61 @@ pub extern "C" fn hx_step(dt: f64, fwd: f64, turn: f64) {
 
 // ------------------------------------------------------------ data access
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_telemetry_ptr() -> *const f32 {
     app().telemetry.as_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_telemetry_len() -> u32 {
     T_LEN as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_course_ptr() -> *const f32 {
     app().course_buf.as_ptr()
 }
 
 /// Number of obstacles; each is 5 floats `[x0, x1, z0, z1, top]`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_course_len() -> u32 {
     (app().course_buf.len() / 5) as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_route_ptr() -> *const f32 {
     app().route_buf.as_ptr()
 }
 
 /// Number of waypoints; each is two floats `[x, z]`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_route_len() -> u32 {
     (app().route_buf.len() / 2) as u32
 }
 
 /// Turn the route-following autopilot on or off. With it off the machine only
 /// turns when it is told to, which is what the arrow keys do anyway.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_nav(on: u32) {
     app().nav = on != 0;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_course_count() -> u32 {
     hexapod_core::terrain::COURSES.len() as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_curve_ptr() -> *const f32 {
     app().trainer.curve.as_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_curve_len() -> u32 {
     app().trainer.curve.len() as u32
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_dist_curve_ptr() -> *const f32 {
     app().trainer.dist_curve.as_ptr()
 }
@@ -523,9 +543,51 @@ impl App {
         }
     }
 
+    fn apply_live_gait_limits(&mut self) {
+        // The machine on screen is driven by real motors, so it does not get to
+        // run a clock its servos cannot track: past their no-load speed a joint
+        // has no torque left and simply stops following, which buys no speed and
+        // costs all of the accuracy. The trainer is deliberately left alone — it
+        // optimises the centroidal model, and narrowing its action space is a
+        // separate decision.
+        // And a leg is not thrown higher than a third of the ride height. The
+        // seeded 0.46 is over half of it: on the centroidal model that costs
+        // nothing, since its swing arc is decoration, but the articulated machine
+        // throws three legs that high every half cycle and spends the gait
+        // recovering from itself. Swept against the plant on both courses, at the
+        // clock below: 0.46 gives 0.26 m/s on the flat and 0.17 on the mixed
+        // course with 24 degrees of deck tilt, 0.28 gives 0.68 and 0.35 with the
+        // lateral drift down from 27% of forward travel to 4%. Obstacles are
+        // still cleared without the height — `foot_on_terrain` lifts the swing
+        // arc over whatever the foot is crossing, which is the job the hand-set
+        // height was doing badly.
+        self.live_gait.step_h = self.live_gait.step_h.min(0.32 * self.live_gait.body_h);
+
+        let g = self.live_gait;
+        let floor = hexapod_core::policy::feasible_cycle(
+            self.frame,
+            &g,
+            g.stride,
+            g.duty,
+            g.cycle,
+            g.body_h,
+            g.step_h,
+            0.0,
+            self.phys.actuator.omega_max,
+        );
+        self.live_gait.cycle = g.cycle.max(floor);
+    }
+
     fn reset_live(&mut self) {
         self.live_gait = self.active_gait();
+        self.apply_live_gait_limits();
         self.live.reset(&self.terrain, &self.live_gait, &self.phys);
+        self.plant = Some(ArticulatedPlant::standing(
+            self.frame,
+            &self.live_gait,
+            &self.phys,
+            &self.terrain,
+        ));
         self.since_fall = 0.0;
     }
 
@@ -550,6 +612,7 @@ impl App {
         );
         self.trained = false;
         self.learned = self.baseline.clone();
+        self.publish();
     }
 
     fn step(&mut self, dt: f64, fwd: f64, turn: f64) {
@@ -577,30 +640,121 @@ impl App {
             &self.baseline
         };
         // Substep so a long frame cannot destabilise the integrator.
-        let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 6);
+        // 16 ticks covers 4× playback at a slow 30 Hz frame.
+        let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
         let h = dt / n as f64;
         for _ in 0..n {
-            self.live
-                .step(&self.terrain, policy, &self.live_gait, h, cmd);
+            if self.plant.is_some() {
+                self.live
+                    .tick_gait(&self.terrain, policy, &self.live_gait, h, cmd);
+            } else {
+                self.live
+                    .step(&self.terrain, policy, &self.live_gait, h, cmd);
+            }
+            if let Some(plant) = self.plant.as_mut() {
+                let mut q_cmd = self.live.q_cmd;
+                let body_h = self.live_gait.body_h
+                    + 0.20 * self.live.act[act_body_dh(self.frame)];
+                // Each leg is given a foot position to reach, worked out against
+                // the terrain in front of the body Rapier is actually carrying;
+                // the joint motors are what get it there. The centroidal plan's
+                // own `q_cmd` cannot be used directly: its stance feet are
+                // anchored to world points, which is fine for a body that
+                // advances by fiat and gives the real plant nothing to push on.
+                let (bp, byaw, bpitch, broll) = plant.chassis_pose();
+                // Steering has to reach the legs, not just the centroidal
+                // integrator: the plan's yaw rate becomes an arc on every
+                // stance stroke, which is the only way the machine can hold a
+                // heading instead of drifting off on whatever the contacts give
+                // it. Plus a proportional pull back onto the planned heading,
+                // since the real body loses yaw to slip that the plan does not.
+                let turn = self.live.yaw_rate
+                    + 1.5 * hexapod_core::math::ang_diff(self.live.yaw - byaw);
+                for i in 0..self.frame.legs() {
+                    let target = foot_on_terrain(
+                        self.frame,
+                        &self.live_gait,
+                        i,
+                        self.live.phase,
+                        self.live.stride_now,
+                        self.live.duty_now,
+                        self.live.cycle_now,
+                        body_h,
+                        self.live.feet[i].step_h,
+                        turn,
+                        &self.terrain,
+                        bp,
+                        byaw,
+                        bpitch,
+                        broll,
+                    );
+                    q_cmd[i] = hexapod_core::robot::solve_ik(self.frame, i, target).q;
+                    self.live.q_cmd[i] = q_cmd[i];
+                    let w = body_to_world(target, byaw, bpitch, broll);
+                    self.live.feet[i].td = [bp[0] + w[0], bp[1] + w[1], bp[2] + w[2]];
+                }
+                plant.drive(&q_cmd, &self.phys, h);
+                let pre = plant.chassis_vel();
+                plant.step(h);
+                // Rapier's q is still never written back — a missed motor track
+                // would rewind the centroidal gait clock. The body pose is a
+                // different matter: the planner has to know where the machine
+                // really is, or it picks footholds around a ghost that has
+                // walked on ahead.
+                let (p, yaw, pitch, roll) = plant.chassis_pose();
+                let v = plant.chassis_vel();
+                self.live.observe_pose(p, yaw, pitch, roll, [v[0], v[2]]);
+                let slip_v = plant.foot_slip();
+                self.live.slip = slip_v * h;
+                self.live.slip_total += self.live.slip;
+                // ponytail: traction left 0 until we read Rapier contact impulses
+                self.live.traction = 0.0;
+                if plant.chassis_dead(pre) {
+                    self.live.fallen = true;
+                }
+            }
         }
     }
 
     fn publish(&mut self) {
+        let n = self.frame.legs();
+        // Canvas reads Rapier body transforms. `Sim` stays centroidal: writing
+        // plant pose back through the integrator rewinds the gait clock.
+        let plant_draw = self.plant.as_ref().map(|plant| {
+            let (pos, yaw, pitch, roll) = plant.chassis_pose();
+            let mut q = [[0.0f64; 3]; MAX_LEGS];
+            let mut joints = [[[0.0f64; 3]; 4]; MAX_LEGS];
+            for i in 0..n {
+                q[i] = plant.leg_q(i);
+                joints[i] = plant.leg_joints_world(i);
+            }
+            (pos, yaw, pitch, roll, q, joints)
+        });
+
         let t = &mut self.telemetry;
         let s = &self.live;
 
+        let (pos, yaw, pitch, roll) = match plant_draw.as_ref() {
+            Some((p, y, pi, r, _, _)) => (*p, *y, *pi, *r),
+            None => (s.pos, s.yaw, s.pitch, s.roll),
+        };
         for i in 0..3 {
-            t[T_POS + i] = s.pos[i] as f32;
+            t[T_POS + i] = pos[i] as f32;
         }
-        t[T_YAW] = s.yaw as f32;
-        t[T_PITCH] = s.pitch as f32;
-        t[T_ROLL] = s.roll as f32;
+        t[T_YAW] = yaw as f32;
+        t[T_PITCH] = pitch as f32;
+        t[T_ROLL] = roll as f32;
 
-        let n = self.frame.legs();
+        let mut world_j = [[[0.0f64; 3]; 4]; MAX_LEGS];
         for leg in 0..n {
+            let (q_draw, joints) = match plant_draw.as_ref() {
+                Some((_, _, _, _, q, j)) => (q[leg], j[leg]),
+                None => (s.q[leg], s.joints[leg]),
+            };
+            world_j[leg] = joints;
             for p in 0..4 {
                 for c in 0..3 {
-                    t[T_JOINTS + leg * 12 + p * 3 + c] = s.joints[leg][p][c] as f32;
+                    t[T_JOINTS + leg * 12 + p * 3 + c] = joints[p][c] as f32;
                 }
             }
             t[T_STANCE + leg] = if s.feet[leg].stance { 1.0 } else { 0.0 };
@@ -609,22 +763,47 @@ impl App {
             t[T_STEPH + leg] = s.feet[leg].step_h as f32;
             t[T_LEG_LOAD + leg] = s.feet[leg].load_frac as f32;
             for c in 0..3 {
-                t[T_TD + leg * 3 + c] = s.feet[leg].td[c] as f32;
-                t[T_Q + leg * 3 + c] = s.q[leg][c] as f32;
+                let td = match plant_draw.as_ref() {
+                    Some((_, _, _, _, _, j)) if s.feet[leg].stance => j[leg][3],
+                    _ => s.feet[leg].td,
+                };
+                t[T_TD + leg * 3 + c] = td[c] as f32;
+                t[T_Q + leg * 3 + c] = q_draw[c] as f32;
                 t[T_QCMD + leg * 3 + c] = s.q_cmd[leg][c] as f32;
             }
         }
 
-        for i in 0..MAX_LEGS {
-            t[T_HULL + i * 2] = s.hull[i][0] as f32;
-            t[T_HULL + i * 2 + 1] = s.hull[i][1] as f32;
+        // Hull of planted Rapier feet when the plant is live; centroidal
+        // otherwise. Grey TD rings for stance sit on the actual foot.
+        if plant_draw.is_some() {
+            let mut pts = [[0.0f64; 2]; MAX_LEGS];
+            let mut np = 0usize;
+            for i in 0..n {
+                if s.feet[i].stance {
+                    pts[np] = [world_j[i][3][0], world_j[i][3][2]];
+                    np += 1;
+                }
+            }
+            let mut hull = [[0.0f64; 2]; MAX_LEGS];
+            let hull_n = convex_hull_xz(&pts[..np], &mut hull);
+            for i in 0..MAX_LEGS {
+                t[T_HULL + i * 2] = hull[i][0] as f32;
+                t[T_HULL + i * 2 + 1] = hull[i][1] as f32;
+            }
+            t[T_HULL_N] = hull_n as f32;
+            t[T_MARGIN] = polygon_margin(&hull[..hull_n], [pos[0], pos[2]]) as f32;
+        } else {
+            for i in 0..MAX_LEGS {
+                t[T_HULL + i * 2] = s.hull[i][0] as f32;
+                t[T_HULL + i * 2 + 1] = s.hull[i][1] as f32;
+            }
+            t[T_HULL_N] = s.hull_n as f32;
+            t[T_MARGIN] = s.margin as f32;
         }
-        t[T_HULL_N] = s.hull_n as f32;
         t[T_LEGS] = n as f32;
         t[T_BODY_R] = self.frame.body_r() as f32;
 
         t[T_PHASE] = s.phase as f32;
-        t[T_MARGIN] = s.margin as f32;
         t[T_DIST] = s.dist as f32;
         t[T_SPEED] = s.speed as f32;
         t[T_POWER] = s.power as f32;
@@ -634,6 +813,14 @@ impl App {
         t[T_ADVANCE] = s.advance_frac as f32;
         t[T_COM] = s.com_drift[0] as f32;
         t[T_COM + 1] = s.com_drift[1] as f32;
+        let com = robot_com(pos, &world_j[..n], &self.phys);
+        t[T_COM3] = com[0] as f32;
+        t[T_COM3 + 1] = com[1] as f32;
+        t[T_COM3 + 2] = com[2] as f32;
+        if plant_draw.is_some() {
+            t[T_COM] = (com[0] - pos[0]) as f32;
+            t[T_COM + 1] = (com[2] - pos[2]) as f32;
+        }
         t[T_STUB] = s.stub_total as f32;
         t[T_COLLISIONS] = s.collisions as f32;
         for i in 0..3 {
@@ -727,6 +914,8 @@ impl App {
         t[T_JUMPS] = s.jumps as f32;
         t[T_TASK] = if s.jump_clock > 0.0 { 1.0 } else { 0.0 };
         t[T_CLEARANCE] = s.clearance as f32;
+        t[T_PLANT] = if self.plant.is_some() { 1.0 } else { 0.0 };
+        t[T_N_HINGES] = (self.frame.legs() * 3) as f32;
     }
 }
 
@@ -734,12 +923,12 @@ impl App {
 
 /// Lower bound of gait scalar `idx`, so the UI never has to duplicate the
 /// ranges declared in the core.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_param_lo(idx: u32) -> f64 {
     GAIT_BOUNDS.get(idx as usize).map(|b| b.0).unwrap_or(0.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_param_hi(idx: u32) -> f64 {
     GAIT_BOUNDS.get(idx as usize).map(|b| b.1).unwrap_or(1.0)
 }
@@ -747,7 +936,7 @@ pub extern "C" fn hx_param_hi(idx: u32) -> f64 {
 /// Gait value `idx` for a given policy: `0..6` are the scalars in
 /// `GAIT_BOUNDS` order, `6..12` are the per-leg phase offsets.
 /// `mode` 0 selects the hand-tuned policy, 1 the learned one.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_gait(mode: u32, idx: u32) -> f64 {
     let a = app();
     let g = if mode == MODE_LEARNED && a.trained {
@@ -768,7 +957,7 @@ pub extern "C" fn hx_gait(mode: u32, idx: u32) -> f64 {
 }
 
 /// Terrain height at a point, for drawing the elevation profile.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_height(x: f64, z: f64) -> f64 {
     app().terrain.height(x, z)
 }
@@ -793,7 +982,7 @@ fn part_index(p: Option<&'static Part>) -> f32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_set_sizing(chassis_kg: f64, runtime_min: f64, safety: f64) {
     let a = app();
     a.sizing.chassis_kg = chassis_kg.clamp(0.05, 40.0);
@@ -803,7 +992,7 @@ pub extern "C" fn hx_set_sizing(chassis_kg: f64, runtime_min: f64, safety: f64) 
 
 /// Size a whole machine around servo `servo_idx` and the active gait.
 /// Writes the `S_*` layout and returns a pointer to it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_solve_system(servo_idx: u32) -> *const f32 {
     let a = app();
     let servo = match hexapod_core::SERVOS.get(servo_idx as usize) {
@@ -866,7 +1055,49 @@ pub extern "C" fn hx_solve_system(servo_idx: u32) -> *const f32 {
     b.as_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn hx_servo_count() -> u32 {
     hexapod_core::SERVOS.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tel() -> &'static [f32] {
+        unsafe { std::slice::from_raw_parts(hx_telemetry_ptr(), hx_telemetry_len() as usize) }
+    }
+
+    #[test]
+    fn train_publishes_stats_without_a_step() {
+        hx_init(1);
+        hx_set_train_cfg(2, 1, 0.025, 0.04, 2.0);
+        assert!(tel()[T_TRAINED] < 0.5);
+        assert_eq!(tel()[T_ITER], 0.0);
+
+        let reward = hx_train(1);
+        assert!(reward.is_finite(), "{reward}");
+        let t = tel();
+        assert!(t[T_TRAINED] > 0.5, "T_TRAINED={}", t[T_TRAINED]);
+        assert!(t[T_ITER] >= 1.0, "T_ITER={}", t[T_ITER]);
+        assert_eq!(t[T_MODE], MODE_LEARNED as f32);
+        assert!(t[T_BASE_R].is_finite());
+        assert!(t[T_BEST_R].is_finite());
+
+        hx_reset_training();
+        let t = tel();
+        assert!(t[T_TRAINED] < 0.5, "T_TRAINED={}", t[T_TRAINED]);
+        assert_eq!(t[T_ITER], 0.0);
+    }
+
+    #[test]
+    fn a_second_train_keeps_learned_mode() {
+        hx_init(1);
+        hx_set_train_cfg(2, 1, 0.025, 0.04, 2.0);
+        hx_train(1);
+        assert_eq!(tel()[T_MODE], MODE_LEARNED as f32);
+        hx_train(1);
+        assert_eq!(tel()[T_MODE], MODE_LEARNED as f32);
+        assert!(tel()[T_TRAINED] > 0.5);
+    }
 }

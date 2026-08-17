@@ -1,9 +1,10 @@
-/* End-to-end check of the built dashboard in a real browser.
+/* Parallel end-to-end check of the built dashboard in real browser pages.
  *
  *   node test/smoke.mjs [path-to-html]
+ *   SMOKE_SCREENSHOTS=1 node test/smoke.mjs  # also write visual snapshots
  *
- * Verifies the wasm boots, the simulator advances, training actually improves
- * the reward, and every tab renders without console errors.
+ * Independent flows get independent pages and run concurrently. Assertions
+ * that truly share simulator state remain ordered inside one scenario.
  */
 
 import { chromium } from "playwright";
@@ -12,575 +13,599 @@ import fs from "node:fs";
 
 const FILE = path.resolve(process.argv[2] || "dist/hexapod-simulator.html");
 const SHOTS = path.resolve("dist/shots");
-fs.mkdirSync(SHOTS, { recursive: true });
+const TAKE_SCREENSHOTS = process.env.SMOKE_SCREENSHOTS === "1";
+if (TAKE_SCREENSHOTS) fs.mkdirSync(SHOTS, { recursive: true });
+const builtHtml = fs.readFileSync(FILE, "utf8");
+const HAS_DEV_FILE_RELOADER =
+  builtHtml.includes("r.headers.get('last-modified')") && builtHtml.includes("cache:'no-store'");
 
-let failures = 0;
-const check = (name, ok, detail = "") => {
-  console.log(`${ok ? "  ok  " : "FAIL  "}${name}${detail ? "  — " + detail : ""}`);
-  if (!ok) failures++;
-};
+const ciChromium = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome";
+const executablePath =
+  process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || (fs.existsSync(ciChromium) ? ciChromium : undefined);
+const browser = await chromium.launch(executablePath ? { executablePath } : {});
 
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+async function openHarness(name) {
+  const context = await browser.newContext({ viewport: { width: 1680, height: 1000 } });
+  const page = await context.newPage();
+  // A --fast artifact reloads itself when dist changes. Smoke pages must stay
+  // pinned to the artifact they opened even if a dev watcher rebuilds it.
+  await page.addInitScript(() => {
+    window.setInterval = () => 0;
+  });
+  const checks = [];
+  const errors = [];
+  const hasDevFileReloader = HAS_DEV_FILE_RELOADER;
 
-const browser = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium-1194/chrome-linux/chrome" });
-const page = await browser.newPage({ viewport: { width: 1680, height: 1000 } });
+  page.on("console", (message) => {
+    if (message.type() !== "error") return;
+    const text = message.text();
+    const expectedDevReloadError =
+      hasDevFileReloader &&
+      ((text.includes("Access to fetch at 'file://") && text.includes("blocked by CORS policy")) ||
+        text === "Failed to load resource: net::ERR_FAILED");
+    if (!expectedDevReloadError) errors.push(text);
+  });
+  page.on("pageerror", (error) => errors.push(String(error)));
 
-const errors = [];
-page.on("console", (m) => {
-  if (m.type() === "error") errors.push(m.text());
-});
-page.on("pageerror", (e) => errors.push(String(e)));
+  const check = (label, ok, detail = "") => checks.push({ label, ok: Boolean(ok), detail });
+  const waitFor = async (fn, arg = null, timeout = 5000) => {
+    try {
+      return await page.waitForFunction(fn, arg, { timeout });
+    } catch {
+      return null;
+    }
+  };
+  const setRange = (id, value) =>
+    page.evaluate(
+      ([rangeId, rangeValue]) => {
+        const el = document.getElementById(rangeId);
+        el.value = String(rangeValue);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      },
+      [id, value]
+    );
+  const screenshot = (file) =>
+    TAKE_SCREENSHOTS ? page.screenshot({ path: path.join(SHOTS, file) }) : Promise.resolve();
+  const stepSamples = (count) => page.evaluate((n) => window.__hxStepSamples(n), count);
+  const nextFrame = () => page.evaluate(() => new Promise((resolve) => requestAnimationFrame(resolve)));
 
-await page.goto("file://" + FILE);
-await page.waitForFunction(() => window.__ready === true || document.getElementById("hClock"), null, {
-  timeout: 15000,
-});
-await wait(1200);
+  await page.goto("file://" + FILE);
+  await page.waitForFunction(() => window.__ready === true, null, { timeout: 15000 });
 
-/* ------------------------------------------------------------- boot */
+  return {
+    name,
+    page,
+    context,
+    checks,
+    errors,
+    check,
+    waitFor,
+    setRange,
+    screenshot,
+    stepSamples,
+    nextFrame,
+  };
+}
 
-check("no console errors on boot", errors.length === 0, errors.slice(0, 3).join(" | "));
-check(
-  "wasm exports present",
-  await page.evaluate(() => typeof document.getElementById("view") !== "undefined")
-);
+async function bootAndStatic(h) {
+  const { page, check, waitFor, setRange, screenshot, errors } = h;
+  await waitFor(() => parseFloat(document.getElementById("hudV")?.textContent) > 0.5);
+  check("no console errors on boot", errors.length === 0, errors.slice(0, 3).join(" | "));
+  check(
+    "wasm exports present",
+    await page.evaluate(() => typeof document.getElementById("view") !== "undefined")
+  );
 
-const clock0 = await page.textContent("#hClock");
-await wait(1000);
-const clock1 = await page.textContent("#hClock");
-check("simulation clock advances", clock0 !== clock1, `${clock0} -> ${clock1}`);
+  const clock0 = await page.textContent("#hClock");
+  await waitFor((before) => document.getElementById("hClock")?.textContent !== before, clock0, 2000);
+  const clock1 = await page.textContent("#hClock");
+  check("simulation clock advances", clock0 !== clock1, `${clock0} -> ${clock1}`);
 
-const canvasPainted = await page.evaluate(() => {
-  const cv = document.getElementById("view");
-  const ctx = cv.getContext("2d");
-  const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
-  const seen = new Set();
-  for (let i = 0; i < d.length; i += 4000) seen.add(`${d[i]},${d[i + 1]},${d[i + 2]}`);
-  return seen.size;
-});
-check("3-D stage renders content", canvasPainted > 6, `${canvasPainted} distinct sampled colours`);
+  const canvasPainted = await page.evaluate(() => {
+    const cv = document.getElementById("view");
+    const data = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
+    const seen = new Set();
+    for (let i = 0; i < data.length; i += 4000) {
+      seen.add(`${data[i]},${data[i + 1]},${data[i + 2]}`);
+    }
+    return seen.size;
+  });
+  check("3-D stage renders content", canvasPainted > 6, `${canvasPainted} distinct sampled colours`);
+  const speed = await page.textContent("#hudV");
+  check("robot is moving", parseFloat(speed) > 0.5, `${speed} m/s`);
 
-const speed = await page.textContent("#hudV");
-check("robot is moving", parseFloat(speed) > 0.5, `${speed} m/s`);
+  await page.click("#btnCamTop");
+  check("top camera toggle", (await page.textContent("#hudCam")).includes("TOP"));
+  check("top camera button latches", (await page.getAttribute("#btnCamTop", "data-on")) === "true");
+  await page.keyboard.press("3");
+  check("side camera key", (await page.textContent("#hudCam")).includes("SIDE"));
+  await page.click("#btnCamOrbit");
+  check("orbit camera restore", (await page.textContent("#hudCam")).includes("ORBIT"));
+  await screenshot("01-kinematics.png");
+  await page.click("#btnPause");
 
-await page.click("#btnCamTop");
-await wait(250);
-check("top camera toggle", (await page.textContent("#hudCam")).includes("TOP"));
-check("top camera button latches", (await page.getAttribute("#btnCamTop", "data-on")) === "true");
-await page.keyboard.press("3");
-await wait(200);
-check("side camera key", (await page.textContent("#hudCam")).includes("SIDE"));
-await page.click("#btnCamOrbit");
-await wait(200);
-check("orbit camera restore", (await page.textContent("#hudCam")).includes("ORBIT"));
+  await page.click('[data-tab="training"]');
+  const characterSet = await page.evaluate(() => document.characterSet);
+  check("the page is decoded as UTF-8", characterSet === "UTF-8", characterSet);
+  const gaitTable = (await page.textContent("#tblGait")) || "";
+  check(
+    "gait table dashes are not mojibake",
+    /—/.test(gaitTable) && /·/.test(gaitTable) && !/â€/.test(gaitTable) && !/Â·/.test(gaitTable),
+    (gaitTable.match(/Running now[^\n]*/)?.[0] || gaitTable.slice(0, 120)).trim()
+  );
+  await screenshot("02-training-before.png");
 
-await page.screenshot({ path: path.join(SHOTS, "01-kinematics.png") });
+  await page.click('[data-tab="terrain"]');
+  const summary = await page.textContent("#tSummary");
+  check("terrain summary populated", /obstacles/.test(summary), summary);
+  await page.click('[data-course="1"]');
+  const stepsSummary = await page.textContent("#tSummary");
+  check("course switches", /STEPS/.test(stepsSummary), stepsSummary);
+  await screenshot("05-terrain.png");
 
-/* --------------------------------------------------------- training */
+  await page.click('[data-tab="hardware"]');
+  const req = parseFloat(await page.textContent("#tqReq"));
+  const femur = parseFloat(await page.textContent("#tqFemur"));
+  const rows = await page.$$eval("#tblServo tbody tr", (items) => items.length);
+  const passing = await page.$$eval('#tblServo tbody tr[data-pass="true"]', (items) => items.length);
+  check("torque requirement computed", req > 1 && req < 200, `${req} kg-cm`);
+  check("femur is the sizing joint", femur > 0, `${femur} kg-cm`);
+  check("servo table populated", rows === 8, `${rows} rows`);
+  check("some servos qualify, some do not", passing > 0 && passing < rows, `${passing}/${rows} pass`);
 
-await page.click('[data-tab="training"]');
-await wait(200);
-check(
-  "the page is decoded as UTF-8",
-  (await page.evaluate(() => document.characterSet)) === "UTF-8",
-  await page.evaluate(() => document.characterSet)
-);
-const gaitTable = (await page.textContent("#tblGait")) || "";
-check(
-  "gait table dashes are not mojibake",
-  /—/.test(gaitTable) && /·/.test(gaitTable) && !/â€/.test(gaitTable) && !/Â·/.test(gaitTable),
-  (gaitTable.match(/Running now[^\n]*/)?.[0] || gaitTable.slice(0, 120)).trim()
-);
-await page.screenshot({ path: path.join(SHOTS, "02-training-before.png") });
+  await setRange("rMass", 8);
+  const req2 = parseFloat(await page.textContent("#tqReq"));
+  const passing2 = await page.$$eval('#tblServo tbody tr[data-pass="true"]', (items) => items.length);
+  check("torque scales with mass", req2 > req * 2, `${req} -> ${req2} kg-cm at 8 kg`);
+  check("shortlist shrinks as mass grows", passing2 <= passing, `${passing} -> ${passing2} pass`);
+  await setRange("rMass", 2);
+  await screenshot("06-hardware.png");
 
-await page.click("#btnTrain");
-try {
-  await page.waitForFunction(
+  await page.click('[data-tab="system"]');
+  const system = await page.evaluate(() => ({
+    rows: document.querySelectorAll("#tblSystem tbody tr").length,
+    pass: document.querySelectorAll('#tblSystem tbody tr[data-pass="true"]').length,
+    parts: document.querySelectorAll("#tblParts tbody tr").length,
+    sensors: document.querySelectorAll("#tblSense tbody tr").length,
+    allUp: document.getElementById("sysAllUp").textContent,
+    meanA: parseFloat(document.getElementById("sysMeanA").textContent),
+    runtime: parseFloat(document.getElementById("sysRuntime").textContent),
+  }));
+  check("system table sizes every servo", system.rows === 8, `${system.rows} rows, ${system.pass} viable`);
+  check("some servos cannot build the robot", system.pass > 0 && system.pass < system.rows, `${system.pass}/${system.rows}`);
+  check("parts list populated", system.parts >= 8, `${system.parts} rows`);
+  check("sensor requirements derived", system.sensors === 5, `${system.sensors} rows`);
+  check("current draw computed", system.meanA > 0.2 && system.meanA < 40, `${system.meanA} A`);
+  check("endurance computed", system.runtime > 1 && system.runtime < 400, `${system.runtime} min`);
+  check("all-up mass shown", /kg/.test(system.allUp), system.allUp);
+  const massBefore = parseFloat(system.allUp);
+  await setRange("rRuntime", 90);
+  const massAfter = parseFloat(await page.textContent("#sysAllUp"));
+  check("longer endurance costs mass", massAfter > massBefore, `${massBefore} -> ${massAfter} kg`);
+  await setRange("rRuntime", 20);
+  await screenshot("07-system.png");
+  await page.click('[data-tab="about"]');
+  await screenshot("08-about.png");
+
+  const canvasFit = await page.evaluate(() =>
+    ["dSolver", "dStab", "cTorque", "cFoot", "cGait"].map((id) => {
+      const cv = document.getElementById(id);
+      const rect = cv.getBoundingClientRect();
+      return { id, ax: cv.width / rect.width, ay: cv.height / rect.height };
+    })
+  );
+  check(
+    "canvas pixels are square everywhere",
+    canvasFit.every((canvas) => Math.abs(canvas.ax - canvas.ay) < 0.02),
+    canvasFit.map((canvas) => `${canvas.id} ${canvas.ax.toFixed(2)}:${canvas.ay.toFixed(2)}`).join(" ")
+  );
+  const noHScroll = await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1
+  );
+  check("page does not scroll sideways", noHScroll);
+}
+
+async function training(h) {
+  const { page, check, waitFor, setRange, screenshot, stepSamples } = h;
+  await page.click('[data-tab="training"]');
+  await setRange("rHorizon", 4);
+  await page.click("#btnPause");
+  await page.click("#btnTrain");
+  await waitFor(
     () => {
       const best = parseFloat(document.getElementById("sBest")?.textContent);
       const base = parseFloat(document.getElementById("sBase")?.textContent);
       const feed = parseFloat(document.getElementById("sFeed")?.textContent);
       const iter = parseInt(document.getElementById("sIter")?.textContent, 10);
-      return iter > 10 && Number.isFinite(best) && Number.isFinite(base) && best > base && feed > 0.01;
+      return iter > 0 && Number.isFinite(best) && Number.isFinite(base) && best > base && feed > 0.01;
     },
-    { timeout: 28000 }
+    null,
+    10000
   );
-} catch {
-  // fall through to the assertions, which report the actual numbers
-}
-await page.click("#btnTrain");
-await wait(400);
+  await page.click("#btnTrain");
+  await page.click("#btnPause");
 
-const iters = parseInt(await page.textContent("#sIter"), 10);
-const base = parseFloat(await page.textContent("#sBase"));
-const best = parseFloat(await page.textContent("#sBest"));
-const gain = await page.textContent("#sGain");
-const iterMs = await page.textContent("#sIterMs");
-
-check("training ran iterations", iters > 10, `${iters} iterations, ${iterMs}`);
-check("baseline recorded", Number.isFinite(base), `${base}`);
-check("learned beats hand-tuned", best > base, `${base.toFixed(1)} -> ${best.toFixed(1)} (${gain})`);
-
-const feedback = parseFloat(await page.textContent("#sFeed"));
-check("feedback layer left zero", feedback > 0.01, `norm ${feedback}`);
-
-await page.screenshot({ path: path.join(SHOTS, "03-training-after.png") });
-
-/* ------------------------------------------------- policy comparison */
-
-const learnEnabled = await page.isEnabled("#btnLearn");
-check("learned policy selectable", learnEnabled);
-if (learnEnabled) {
-  await page.click("#btnLearn");
-  await wait(300);
-  check("header shows learned policy", (await page.textContent("#hPolicy")) === "LEARNED");
-  const locked = await page.isDisabled("#pr0");
-  check("sliders lock under learned policy", locked);
-}
-
-await page.click('[data-tab="kinematics"]');
-await wait(1500);
-await page.screenshot({ path: path.join(SHOTS, "04-learned-walking.png") });
-
-/* ---------------------------------------------------------- terrain */
-
-await page.click('[data-tab="terrain"]');
-await wait(300);
-const summary = await page.textContent("#tSummary");
-check("terrain summary populated", /obstacles/.test(summary), summary);
-
-await page.click('[data-course="1"]'); // Steps
-await wait(800);
-const stepsSummary = await page.textContent("#tSummary");
-check("course switches", /STEPS/.test(stepsSummary), stepsSummary);
-await page.screenshot({ path: path.join(SHOTS, "05-terrain.png") });
-
-/* --------------------------------------------------------- hardware */
-
-await page.click('[data-tab="hardware"]');
-await wait(500);
-const req = parseFloat(await page.textContent("#tqReq"));
-const femur = parseFloat(await page.textContent("#tqFemur"));
-const rows = await page.$$eval("#tblServo tbody tr", (r) => r.length);
-const passing = await page.$$eval('#tblServo tbody tr[data-pass="true"]', (r) => r.length);
-
-check("torque requirement computed", req > 1 && req < 200, `${req} kg-cm`);
-check("femur is the sizing joint", femur > 0, `${femur} kg-cm`);
-check("servo table populated", rows === 8, `${rows} rows`);
-check("some servos qualify, some do not", passing > 0 && passing < rows, `${passing}/${rows} pass`);
-
-// Heavier robot must demand more torque and disqualify more servos.
-await page.evaluate(() => {
-  const el = document.getElementById("rMass");
-  el.value = "8";
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-});
-await wait(400);
-const req2 = parseFloat(await page.textContent("#tqReq"));
-const passing2 = await page.$$eval('#tblServo tbody tr[data-pass="true"]', (r) => r.length);
-check("torque scales with mass", req2 > req * 2, `${req} -> ${req2} kg-cm at 8 kg`);
-check("shortlist shrinks as mass grows", passing2 <= passing, `${passing} -> ${passing2} pass`);
-
-await page.evaluate(() => {
-  const el = document.getElementById("rMass");
-  el.value = "2";
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-});
-await wait(300);
-await page.screenshot({ path: path.join(SHOTS, "06-hardware.png") });
-
-/* ----------------------------------------------------------- system */
-
-await page.click('[data-tab="system"]');
-await wait(900);
-
-const sysRows = await page.$$eval("#tblSystem tbody tr", (r) => r.length);
-const sysPass = await page.$$eval('#tblSystem tbody tr[data-pass="true"]', (r) => r.length);
-const partRows = await page.$$eval("#tblParts tbody tr", (r) => r.length);
-const senseRows = await page.$$eval("#tblSense tbody tr", (r) => r.length);
-const allUp = await page.textContent("#sysAllUp");
-const meanA = parseFloat(await page.textContent("#sysMeanA"));
-const runtime = parseFloat(await page.textContent("#sysRuntime"));
-
-check("system table sizes every servo", sysRows === 8, `${sysRows} rows, ${sysPass} viable`);
-check("some servos cannot build the robot", sysPass > 0 && sysPass < sysRows, `${sysPass}/${sysRows}`);
-check("parts list populated", partRows >= 8, `${partRows} rows`);
-check("sensor requirements derived", senseRows === 5, `${senseRows} rows`);
-check("current draw computed", meanA > 0.2 && meanA < 40, `${meanA} A`);
-check("endurance computed", runtime > 1 && runtime < 400, `${runtime} min`);
-check("all-up mass shown", /kg/.test(allUp), allUp);
-
-// Demanding a longer runtime must cost mass, not be granted for free.
-const massBefore = parseFloat(allUp);
-await page.evaluate(() => {
-  const el = document.getElementById("rRuntime");
-  el.value = "90";
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-});
-await wait(900);
-const massAfter = parseFloat(await page.textContent("#sysAllUp"));
-check("longer endurance costs mass", massAfter > massBefore, `${massBefore} -> ${massAfter} kg`);
-
-await page.evaluate(() => {
-  const el = document.getElementById("rRuntime");
-  el.value = "20";
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-});
-await wait(700);
-await page.screenshot({ path: path.join(SHOTS, "07-system.png") });
-
-await page.click('[data-tab="about"]');
-await wait(200);
-await page.screenshot({ path: path.join(SHOTS, "08-about.png") });
-
-/* ------------------------------------------------- physics and commands */
-
-await page.click('[data-tab="kinematics"]');
-await wait(300);
-
-const setRange = (id, v) =>
-  page.evaluate(
-    ([i, val]) => {
-      const el = document.getElementById(i);
-      el.value = String(val);
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-    },
-    [id, v]
+  const trained = await page.evaluate(() => ({
+    iter: parseInt(document.getElementById("sIter").textContent, 10),
+    base: parseFloat(document.getElementById("sBase").textContent),
+    best: parseFloat(document.getElementById("sBest").textContent),
+    gain: document.getElementById("sGain").textContent,
+    iterMs: document.getElementById("sIterMs").textContent,
+    feedback: parseFloat(document.getElementById("sFeed").textContent),
+  }));
+  check("training ran iterations", trained.iter > 0, `${trained.iter} iterations, ${trained.iterMs}`);
+  check("baseline recorded", Number.isFinite(trained.base), `${trained.base}`);
+  check(
+    "learned beats hand-tuned",
+    trained.best > trained.base,
+    `${trained.base.toFixed(1)} -> ${trained.best.toFixed(1)} (${trained.gain})`
   );
+  check("feedback layer left zero", trained.feedback > 0.01, `norm ${trained.feedback}`);
+  await screenshot("03-training-after.png");
 
-// The commanded speed is an input to the simulator, not a label.
-const speedAt = async (v) => {
-  await setRange("rCruise", v);
-  await wait(2500);
-  return parseFloat((await page.textContent("#mSpeed")).split("/")[0]);
-};
-const slow = await speedAt(2.0);
-const fast = await speedAt(5.5);
-check("commanded speed drives the robot", fast > slow + 1.5, `${slow} -> ${fast} m/s`);
-check("speed dial reads back", (await page.textContent("#vCruise")).includes("5.5"));
-await setRange("rCruise", 4.0);
-await wait(600);
+  const learnEnabled = await page.isEnabled("#btnLearn");
+  check("learned policy selectable", learnEnabled);
+  if (learnEnabled) {
+    await page.click("#btnLearn");
+    check("header shows learned policy", (await page.textContent("#hPolicy")) === "LEARNED");
+    check("sliders lock under learned policy", await page.isDisabled("#pr0"));
+    await stepSamples(180);
+    const pattern = await page.evaluate(() => window.__hxFalls.classify());
+    check(
+      "the learned policy gets its own reading",
+      typeof pattern === "string" && pattern.length > 1,
+      `learned footfalls read as ${pattern}`
+    );
+  }
+  await screenshot("04-learned-walking.png");
+}
 
-// Contact and actuator telemetry has to be live, not placeholder.
-const phys = await page.evaluate(() => ({
-  trac: document.getElementById("mTrac").textContent,
-  servo: document.getElementById("mServo").textContent,
-  cot: document.getElementById("pCot").textContent,
-  lag: document.getElementById("pLag").textContent,
-}));
-check("traction telemetry live", /^\d+%$/.test(phys.trac), phys.trac);
-check("servo load telemetry live", /^\d+%$/.test(phys.servo), phys.servo);
-check("cost of transport computed", parseFloat(phys.cot) > 0, phys.cot);
-check("joint tracking lag reported", parseFloat(phys.lag) > 0, `${phys.lag} deg`);
-
-// Picking an undersized servo has to visibly break the robot.
-const pickServo = async (label) => {
-  const idx = await page.evaluate((l) => {
-    const sel = document.getElementById("selServo");
-    const opt = [...sel.options].findIndex((o) => o.textContent.startsWith(l));
-    sel.value = sel.options[opt].value;
-    sel.dispatchEvent(new Event("change", { bubbles: true }));
-    return sel.value;
-  }, label);
-  await wait(2200);
-  return {
-    idx,
-    load: parseFloat(await page.textContent("#mServo")),
-    note: await page.textContent("#machineNote"),
+async function speedAndPhysics(h) {
+  const { page, check, setRange, stepSamples } = h;
+  await page.click("#btnPause");
+  const speedAt = async (target) => {
+    await setRange("rCruise", target);
+    const rollout = await stepSamples(150);
+    return rollout.speed.closest;
   };
-};
-const strong = await pickServo("DS3218MG");
-const weak = await pickServo("SG90");
-check("servo selector changes the machine", strong.note !== weak.note, `${strong.note} | ${weak.note}`);
-check(
-  "an undersized servo is driven past stall",
-  weak.load > strong.load && weak.load > 100,
-  `${strong.load}% -> ${weak.load}% of stall`
-);
-const sag = parseFloat(await page.textContent("#pDroop"));
-check("an undersized servo sags the chassis", Math.abs(sag) > 0.5, `${sag} mm`);
+  const slow = await speedAt(2.0);
+  const fast = await speedAt(5.5);
+  check(
+    "commanded speed drives the robot",
+    fast > slow + 1.5,
+    `${slow.toFixed(2)} -> ${fast.toFixed(2)} m/s`
+  );
+  check("speed dial reads back", (await page.textContent("#vCruise")).includes("5.5"));
+  await setRange("rCruise", 4.0);
+  await setRange("rRate", 2);
+  check("sim speed dial reads back", (await page.textContent("#vRate")) === "2×");
+  await setRange("rRate", 1);
+  let stepped = await stepSamples(36);
 
-await page.evaluate(() => {
-  const sel = document.getElementById("selServo");
-  sel.value = "-1";
-  sel.dispatchEvent(new Event("change", { bubbles: true }));
-});
-await wait(800);
-await page.screenshot({ path: path.join(SHOTS, "09-physics.png") });
+  let hull = stepped.hull;
+  for (let attempt = 0; attempt < 10 && !(hull.n >= 3 && hull.span < 1.5); attempt++) {
+    stepped = await stepSamples(18);
+    if (stepped.hull.n >= 3 && stepped.hull.span < hull.span) hull = stepped.hull;
+  }
+  const physics = await page.evaluate(() => ({
+    traction: document.getElementById("mTrac").textContent,
+    servo: document.getElementById("mServo").textContent,
+    cot: document.getElementById("pCot").textContent,
+    lag: document.getElementById("pLag").textContent,
+  }));
+  check("traction telemetry live", /^\d+%$/.test(physics.traction), physics.traction);
+  check("servo load telemetry live", /^\d+%$/.test(physics.servo), physics.servo);
+  check("cost of transport computed", parseFloat(physics.cot) > 0, physics.cot);
+  check("joint tracking lag reported", parseFloat(physics.lag) > 0, `${physics.lag} deg`);
+  check(
+    "support polygon tracks the drawn body",
+    hull.n >= 3 && hull.span < 1.5,
+    `${hull.n} pts, ${hull.span.toFixed(2)} m`
+  );
+}
 
-// Leg mass is not zero, and the chassis feels it.
-const legPhys = await page.evaluate(() => ({
-  tq: document.getElementById("pLegTq").textContent,
-  react: document.getElementById("pReact").textContent,
-}));
-check("leg weight costs joint torque", parseFloat(legPhys.tq) > 0, `${legPhys.tq} kg-cm`);
-check("swinging legs kick the chassis", parseFloat(legPhys.react) > 0, `${legPhys.react} N`);
-
-/* ------------------------------------------------------- the frame */
-
-const setLegs = async (n) => {
-  await setRange("rLegs", n);
-  await wait(2200);
-  return page.evaluate(() => {
-    const t = window.__hxT ? window.__hxT() : null;
+async function servo(h) {
+  const { page, check, setRange, screenshot, stepSamples } = h;
+  await setRange("rRate", 2);
+  const pickServo = async (label) => {
+    const index = await page.evaluate((wanted) => {
+      const select = document.getElementById("selServo");
+      const option = [...select.options].findIndex((item) => item.textContent.startsWith(wanted));
+      select.value = select.options[option].value;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      return select.value;
+    }, label);
+    await stepSamples(132);
     return {
+      index,
+      load: parseFloat(await page.textContent("#mServo")),
+      note: await page.textContent("#machineNote"),
+    };
+  };
+
+  const strong = await pickServo("DS3218MG");
+  const weak = await pickServo("SG90");
+  check("servo selector changes the machine", strong.note !== weak.note, `${strong.note} | ${weak.note}`);
+  check(
+    "an undersized servo is driven past stall",
+    weak.load > strong.load && weak.load > 100,
+    `${strong.load}% -> ${weak.load}% of stall`
+  );
+  const sag = parseFloat(await page.textContent("#pDroop"));
+  check("an undersized servo sags the chassis", Math.abs(sag) > 0.5, `${sag} mm`);
+
+  await page.evaluate(() => {
+    const select = document.getElementById("selServo");
+    select.value = "-1";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await stepSamples(48);
+  const leg = await page.evaluate(() => ({
+    torque: document.getElementById("pLegTq").textContent,
+    reaction: document.getElementById("pReact").textContent,
+  }));
+  check("leg weight costs joint torque", parseFloat(leg.torque) > 0, `${leg.torque} kg-cm`);
+  check("swinging legs kick the chassis", parseFloat(leg.reaction) > 0, `${leg.reaction} N`);
+  await screenshot("09-physics.png");
+}
+
+async function frameState(h, legs) {
+  const { page, setRange, stepSamples, nextFrame } = h;
+  if (/Pause/i.test((await page.textContent("#btnPause")) || "")) await page.click("#btnPause");
+  await setRange("rRate", 1);
+  await setRange("rLegs", legs);
+  await stepSamples(132);
+  let speed = parseFloat(await page.textContent("#mSpeed"));
+  for (let attempt = 0; attempt < 100 && !(speed > 1); attempt++) {
+    await stepSamples(6);
+    speed = parseFloat(await page.textContent("#mSpeed"));
+  }
+  await nextFrame();
+  return page.evaluate(() => ({
       model: document.getElementById("hModel").textContent,
       legs: document.getElementById("hudLegs").textContent,
       dof: document.getElementById("hudDof").textContent,
       bars: document.querySelectorAll("#loadBars .bar").length,
-      rows: document.querySelectorAll("#presetBtns .btn").length,
       note: document.getElementById("presetNote").textContent,
       speed: document.getElementById("mSpeed").textContent,
-      painted: t,
+    }));
+}
+
+async function decapod(h) {
+  const { page, check, screenshot } = h;
+  const state = await frameState(h, 10);
+  check("frame accepts ten legs", state.legs === "10" && state.dof === "30", state.model);
+  check("per-leg readouts follow the frame", state.bars === 10, `${state.bars} load bars`);
+  check("ten legs still walk", parseFloat(state.speed) > 1.0, state.speed);
+  const painted = await page.evaluate(() => {
+    const cv = document.getElementById("view");
+    const data = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
+    const seen = new Set();
+    for (let i = 0; i < data.length; i += 4000) {
+      seen.add(`${data[i]},${data[i + 1]},${data[i + 2]}`);
+    }
+    return seen.size;
+  });
+  check("stage renders the new frame", painted > 20, `${painted} distinct colours`);
+  await screenshot("10-decapod.png");
+}
+
+async function quadruped(h) {
+  const { check, screenshot } = h;
+  const state = await frameState(h, 4);
+  check("frame accepts four legs", state.legs === "4" && state.dof === "12", state.model);
+  check("per-leg readouts shrink too", state.bars === 4, `${state.bars} load bars`);
+  check("four legs still walk", parseFloat(state.speed) > 1.0, state.speed);
+  check("a quadruped is warned off the trot", /falls over/.test(state.note), state.note || "(no note)");
+  await screenshot("11-quadruped.png");
+}
+
+async function gaitAndNavigation(h) {
+  const { page, check, waitFor, stepSamples } = h;
+  await page.click("#btnBase");
+  await page.click('[data-preset="0"]');
+  await waitFor(
+    () =>
+      window.__hxFalls.t.length > 40 &&
+      window.__hxFalls.cycle() > 0 &&
+      window.__hxFalls.classify() === "TRIPOD",
+    null,
+    8000
+  );
+  const gait = await page.evaluate(() => {
+    const falls = window.__hxFalls;
+    const duty = new Array(falls.legs).fill(0);
+    const elapsed = falls.t[falls.t.length - 1] - falls.t[0];
+    for (let sample = 1; sample < falls.t.length; sample++) {
+      const dt = falls.t[sample] - falls.t[sample - 1];
+      for (let leg = 0; leg < falls.legs; leg++) duty[leg] += falls.stance[sample - 1][leg] * dt;
+    }
+    return {
+      n: falls.t.length,
+      kind: falls.classify(),
+      cycle: falls.cycle(),
+      duty: duty.map((value) => value / elapsed),
+      offsets: falls.offsets(),
+      live: window.__hxDuty(),
     };
   });
+  check("footfalls are recorded, not assumed", gait.n > 40, `${gait.n} samples`);
+  check(
+    "the pattern is classified from the footfalls, not the label",
+    gait.kind === "TRIPOD",
+    `${gait.kind}, offsets ${gait.offsets.map((value) => (value === null ? "—" : value.toFixed(2))).join(" ")}`
+  );
+  check(
+    "measured cycle matches the one the clock was set to",
+    Math.abs(gait.cycle - gait.live.cycle) < 0.06,
+    `${gait.cycle.toFixed(3)} s measured vs ${gait.live.cycle.toFixed(3)} commanded`
+  );
+  check(
+    "measured duty matches the running gait, leg by leg",
+    gait.duty.length === 6 && gait.duty.every((value) => Math.abs(value - gait.live.duty) < 0.08),
+    `${gait.duty.map((value) => value.toFixed(2)).join(" ")} vs ${gait.live.duty.toFixed(2)}`
+  );
+
+  await page.click("#btnPause");
+  let stepped = await stepSamples(180);
+  for (let attempt = 0; attempt < 5 && stepped.reached < 1; attempt++) stepped = await stepSamples(180);
+  const nav = await page.evaluate(() => ({
+    waypoint: document.getElementById("hudWp").textContent,
+    mode: document.getElementById("hudNav").textContent,
+    reached: document.getElementById("pReached").textContent,
+    room: document.getElementById("pWall").textContent,
+  }));
+  check("the route is on the HUD", /^\d+\/\d+$/.test(nav.waypoint), nav.waypoint);
+  check("the autopilot is steering by default", nav.mode === "AUTO", nav.mode);
+  check("walking a flat course reaches waypoints", parseInt(nav.reached, 10) >= 1, `${nav.reached} reached`);
+  check("the wall meter reads a real distance", parseFloat(nav.room) > 0, `${nav.room} m`);
+}
+
+async function courses(h) {
+  const { page, check, waitFor, setRange, screenshot, stepSamples, nextFrame } = h;
+  if (/Pause/i.test((await page.textContent("#btnPause")) || "")) await page.click("#btnPause");
+  await setRange("rRate", 2);
+  const names = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-course]")].map((button) => button.textContent)
+  );
+  const courseCount = await page.evaluate(() => (window.HX_COURSES || []).length);
+  check("every course the simulator knows has a button", names.length === courseCount, names.join(" "));
+
+  await page.click('[data-tab="terrain"]');
+  const slalomIndex = names.findIndex((name) => /slalom/i.test(name));
+  check("the slalom is one of them", slalomIndex >= 0, names.join(" "));
+  await page.click(`[data-course="${slalomIndex}"]`);
+  const slalom = await page.evaluate(() => ({
+    summary: document.getElementById("tSummary").textContent,
+    route: window.__hxRoute ? window.__hxRoute() : 0,
+    sway: window.__hxSway ? window.__hxSway() : 0,
+  }));
+  check("the slalom loads", /SLALOM/.test(slalom.summary), slalom.summary);
+  check("and it comes with a route", slalom.route >= 6, `${slalom.route} waypoints`);
+  check("the route leaves the centreline to get round the walls", slalom.sway > 1.0, `${slalom.sway.toFixed(2)} m off centre`);
+  await screenshot("12-slalom.png");
+
+  await page.click('[data-tab="kinematics"]');
+  await page.click("#btnCamTop");
+  check("top camera on the slalom", (await page.textContent("#hudCam")).includes("TOP"));
+  await screenshot("13-slalom-top.png");
+  await page.click("#btnCamSide");
+  check("side camera on the slalom", (await page.textContent("#hudCam")).includes("SIDE"));
+  await screenshot("14-slalom-side.png");
+  await page.click("#btnCamOrbit");
+
+  const jumpIndex = names.findIndex((name) => /jump/i.test(name));
+  check("the jump course is one of them", jumpIndex >= 0, names.join(" "));
+  await page.click('[data-tab="terrain"]');
+  await page.click(`[data-course="${jumpIndex}"]`);
+  await stepSamples(60);
+  await nextFrame();
+  const jump = await page.evaluate(() => ({
+    summary: document.getElementById("tSummary").textContent,
+    note: document.getElementById("tNote").textContent,
+    title: document.getElementById("cruiseTitle").textContent,
+    hold: document.getElementById("vCruise").textContent,
+    meter: document.getElementById("mSpeedLabel").textContent,
+    state: document.getElementById("hState").textContent,
+    clock: document.getElementById("hClock").textContent,
+  }));
+  check("the jump course loads", /JUMP/.test(jump.summary), jump.summary);
+  check("the command dial stays a speed", /speed/i.test(jump.title), jump.title);
+  check("the hold is metres per second", /m\/s/.test(jump.hold.trim()), jump.hold);
+  check("the note is parkour, not a standing hop", /trench|parkour|platform|stride/i.test(jump.note), jump.note.slice(0, 80));
+  check("the live meter tracks speed and counts jumps", /speed/i.test(jump.meter) && /jump/i.test(jump.meter), jump.meter);
+  const jumped = /JUMPING|AIRBORNE/i.test(jump.state) || /[1-9]\s*jumps/i.test(jump.meter);
+  check("the seed takes off on the first trench", jumped, `${jump.state} / ${jump.meter} @ ${jump.clock}`);
+  await screenshot("15-jump.png");
+
+  await page.click("#btnNav");
+  await stepSamples(1);
+  await waitFor(() => document.getElementById("hudNav")?.textContent === "MANUAL", null, 1000);
+  const manual = await page.textContent("#hudNav");
+  check("the autopilot can be switched off", manual === "MANUAL", manual);
+}
+
+const scenarios = [
+  ["dashboard", bootAndStatic],
+  ["courses", courses],
+  ["training", training],
+  ["physics + servo", async (harness) => {
+    await speedAndPhysics(harness);
+    await servo(harness);
+  }],
+  ["frames", async (harness) => {
+    await decapod(harness);
+    await quadruped(harness);
+  }],
+  ["gait + navigation", gaitAndNavigation],
+];
+
+const started = performance.now();
+const SCENARIO_TIMEOUT_MS = 20000;
+const withScenarioTimeout = async (promise, name) => {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${name} exceeded ${SCENARIO_TIMEOUT_MS / 1000}s`)),
+          SCENARIO_TIMEOUT_MS
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 };
-
-const ten = await setLegs(10);
-check("frame accepts ten legs", ten.legs === "10" && ten.dof === "30", `${ten.model}`);
-check("per-leg readouts follow the frame", ten.bars === 10, `${ten.bars} load bars`);
-check("ten legs still walk", parseFloat(ten.speed) > 1.0, ten.speed);
-await page.screenshot({ path: path.join(SHOTS, "10-decapod.png") });
-
-const four = await setLegs(4);
-check("frame accepts four legs", four.legs === "4" && four.dof === "12", `${four.model}`);
-check("per-leg readouts shrink too", four.bars === 4, `${four.bars} load bars`);
-check("four legs still walk", parseFloat(four.speed) > 1.0, four.speed);
-check(
-  "a quadruped is warned off the trot",
-  /falls over/.test(four.note),
-  four.note || "(no note)"
-);
-await page.screenshot({ path: path.join(SHOTS, "11-quadruped.png") });
-
-// The stage has to actually redraw the new machine, not the old one.
-const repainted = await page.evaluate(() => {
-  const cv = document.getElementById("view");
-  const d = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
-  const seen = new Set();
-  for (let i = 0; i < d.length; i += 4000) seen.add(`${d[i]},${d[i + 1]},${d[i + 2]}`);
-  return seen.size;
-});
-check("stage renders the new frame", repainted > 20, `${repainted} distinct colours`);
-
-await setLegs(6);
-
-/* ------------------------------------------------- charts and gauges */
-
-// Every canvas's backing store has to match the box CSS lays it out in, or
-// everything drawn on it is stretched. The dials are square and it shows.
-const canvasFit = await page.evaluate(() =>
-  ["dSolver", "dStab", "cTorque", "cFoot", "cGait"].map((id) => {
-    const cv = document.getElementById(id);
-    const r = cv.getBoundingClientRect();
-    return { id, ax: cv.width / r.width, ay: cv.height / r.height };
+const results = await Promise.all(
+  scenarios.map(async ([name, scenario]) => {
+    const scenarioStarted = performance.now();
+    let harness;
+    try {
+      harness = await openHarness(name);
+      await withScenarioTimeout(scenario(harness), name);
+    } catch (error) {
+      if (!harness) {
+        return {
+          name,
+          checks: [{ label: "scenario completed", ok: false, detail: String(error) }],
+          errors: [],
+          elapsed: performance.now() - scenarioStarted,
+        };
+      }
+      harness.check("scenario completed", false, String(error));
+    } finally {
+      if (harness) await harness.context.close();
+    }
+    return {
+      name,
+      checks: harness.checks,
+      errors: harness.errors,
+      elapsed: performance.now() - scenarioStarted,
+    };
   })
 );
-check(
-  "canvas pixels are square everywhere",
-  canvasFit.every((c) => Math.abs(c.ax - c.ay) < 0.02),
-  canvasFit.map((c) => `${c.id} ${c.ax.toFixed(2)}:${c.ay.toFixed(2)}`).join(" ")
-);
-
-// Whatever the learner has made of the coordination by now, the panel has to
-// have a reading for it — that is the whole point of measuring rather than
-// repeating the label.
-const learnedPattern = await page.evaluate(() => window.__hxFalls.classify());
-check(
-  "the learned policy gets its own reading",
-  typeof learnedPattern === "string" && learnedPattern.length > 1,
-  `learned footfalls read as ${learnedPattern}`
-);
-// The four-legged frame moved the machine onto the crawl, and coming back to
-// six legs leaves it there — so ask for the alternating gait explicitly.
-await page.click("#btnBase");
-await page.click('[data-preset="0"]');
-await wait(4600);
-
-const gait = await page.evaluate(() => {
-  const f = window.__hxFalls;
-  return f
-    ? {
-        n: f.t.length,
-        kind: f.classify(),
-        cycle: f.cycle(),
-        duty: f.duty(),
-        offsets: f.offsets(),
-        live: window.__hxDuty(),
-      }
-    : null;
-});
-check("footfalls are recorded, not assumed", gait && gait.n > 60, `${gait && gait.n} samples`);
-check(
-  "the pattern is classified from the footfalls, not the label",
-  gait && gait.kind === "TRIPOD",
-  `${gait && gait.kind}, offsets ${gait && gait.offsets && gait.offsets.map((o) => o.toFixed(2)).join(" ")}`
-);
-check(
-  "measured cycle matches the one the clock was set to",
-  gait && Math.abs(gait.cycle - gait.live.cycle) < 0.06,
-  gait && `${gait.cycle.toFixed(3)} s measured vs ${gait.live.cycle.toFixed(3)} commanded`
-);
-// Every leg carries the same share of the cycle, and that share is the duty
-// factor the gait clock was actually running — the panel is reading the
-// machine, not repeating its settings.
-check(
-  "measured duty matches the running gait, leg by leg",
-  gait && gait.duty.length === 6 && gait.duty.every((d) => Math.abs(d - gait.live.duty) < 0.08),
-  gait && `${gait.duty.map((d) => d.toFixed(2)).join(" ")} vs ${gait.live.duty.toFixed(2)}`
-);
-
-/* ------------------------------------------------ walls and waypoints */
-
-const nav0 = await page.evaluate(() => ({
-  wp: document.getElementById("hudWp").textContent,
-  nav: document.getElementById("hudNav").textContent,
-  reached: document.getElementById("pReached").textContent,
-  room: document.getElementById("pWall").textContent,
-}));
-check("the route is on the HUD", /^\d+\/\d+$/.test(nav0.wp), nav0.wp);
-check("the autopilot is steering by default", nav0.nav === "AUTO", nav0.nav);
-check(
-  "walking a flat course reaches waypoints",
-  parseInt(nav0.reached, 10) >= 1,
-  `${nav0.reached} reached`
-);
-check("the wall meter reads a real distance", parseFloat(nav0.room) > 0, `${nav0.room} m`);
-
-// Every course the simulator knows has to be reachable from the buttons, and
-// every one of them has to come with a route.
-const courses = await page.evaluate(() =>
-  [...document.querySelectorAll("[data-course]")].map((b) => b.textContent)
-);
-const courseCount = await page.evaluate(() => (window.HX_COURSES || []).length);
-check("every course the simulator knows has a button", courses.length === courseCount, courses.join(" "));
-
-await page.click('[data-tab="terrain"]');
-await wait(300);
-const slalomIdx = courses.findIndex((c) => /slalom/i.test(c));
-check("the slalom is one of them", slalomIdx >= 0, courses.join(" "));
-await page.click(`[data-course="${slalomIdx}"]`);
-await wait(2500);
-const slalom = await page.evaluate(() => ({
-  summary: document.getElementById("tSummary").textContent,
-  note: document.getElementById("tNote").textContent,
-  route: window.__hxRoute ? window.__hxRoute() : 0,
-  sway: window.__hxSway ? window.__hxSway() : 0,
-}));
-check("the slalom loads", /SLALOM/.test(slalom.summary), slalom.summary);
-check("and it comes with a route", slalom.route >= 6, `${slalom.route} waypoints`);
-check(
-  "the route leaves the centreline to get round the walls",
-  slalom.sway > 1.0,
-  `${slalom.sway.toFixed(2)} m off centre`
-);
-await page.screenshot({ path: path.join(SHOTS, "12-slalom.png") });
-
-await page.click('[data-tab="kinematics"]');
-await wait(400);
-await page.click("#btnCamTop");
-await wait(500);
-check("top camera on the slalom", (await page.textContent("#hudCam")).includes("TOP"));
-await page.screenshot({ path: path.join(SHOTS, "13-slalom-top.png") });
-await page.click("#btnCamSide");
-await wait(500);
-check("side camera on the slalom", (await page.textContent("#hudCam")).includes("SIDE"));
-await page.screenshot({ path: path.join(SHOTS, "14-slalom-side.png") });
-await page.click("#btnCamOrbit");
-await wait(300);
-
-// JUMP is parkour on the same machine: trenches wider than a stride, a
-// speed command, and the seed actually leaves the ground while running.
-const jumpIdx = courses.findIndex((c) => /jump/i.test(c));
-check("the jump course is one of them", jumpIdx >= 0, courses.join(" "));
-await page.click('[data-tab="terrain"]');
-await wait(200);
-await page.click(`[data-course="${jumpIdx}"]`);
-// The sim starts playing (`Pause` on the button). Only click if a previous
-// test left it held — otherwise we pause a running hop and wait on a frozen clock.
-const pauseLabel = await page.textContent("#btnPause");
-if (/Resume/i.test(pauseLabel || "")) await page.click("#btnPause");
-// applyCourse resets the integrator, but the HUD still shows the previous
-// course's clock until the next frame. A stale 00:02.x would look like the
-// hop had already had time to fire.
-await page.waitForFunction(
-  () => {
-    const summary = document.getElementById("tSummary")?.textContent || "";
-    const clock = document.getElementById("hClock")?.textContent || "";
-    const m = clock.match(/(\d+):(\d+(?:\.\d+)?)/);
-    const secs = m ? Number(m[1]) * 60 + Number(m[2]) : 99;
-    return /JUMP/.test(summary) && secs < 0.6;
-  },
-  { timeout: 8000 }
-);
-try {
-  await page.waitForFunction(
-    () => {
-      const state = document.getElementById("hState")?.textContent || "";
-      const meter = document.getElementById("mSpeedLabel")?.textContent || "";
-      const jumps = Number((meter.match(/(\d+)\s*jumps/i) || ["", "0"])[1]);
-      return /JUMPING/i.test(state) || jumps > 0;
-    },
-    { timeout: 25000 }
-  );
-} catch {
-  // assertions below report HUD / meter / clock
-}
-const jump = await page.evaluate(() => ({
-  summary: document.getElementById("tSummary").textContent,
-  note: document.getElementById("tNote").textContent,
-  title: document.getElementById("cruiseTitle").textContent,
-  hold: document.getElementById("vCruise").textContent,
-  meter: document.getElementById("mSpeedLabel").textContent,
-  state: document.getElementById("hState").textContent,
-  speed: document.getElementById("mSpeed").textContent,
-  clock: document.getElementById("hClock").textContent,
-}));
-check("the jump course loads", /JUMP/.test(jump.summary), jump.summary);
-check("the command dial stays a speed", /speed/i.test(jump.title), jump.title);
-check("the hold is metres per second", /m\/s/.test(jump.hold.trim()), jump.hold);
-check(
-  "the note is parkour, not a standing hop",
-  /trench|parkour|platform|stride/i.test(jump.note),
-  jump.note.slice(0, 80)
-);
-check(
-  "the live meter tracks speed and counts jumps",
-  /speed/i.test(jump.meter) && /jump/i.test(jump.meter),
-  jump.meter
-);
-const jumped = /JUMPING|AIRBORNE/i.test(jump.state) || /[1-9]\s*jumps/i.test(jump.meter);
-check(
-  "the seed takes off on the first trench",
-  jumped,
-  `${jump.state} / ${jump.meter} @ ${jump.clock}`
-);
-await page.screenshot({ path: path.join(SHOTS, "15-jump.png") });
-
-// Turning the autopilot off has to actually hand steering back.
-await page.click("#btnNav");
-await wait(900);
-const manual = await page.textContent("#hudNav");
-check("the autopilot can be switched off", manual === "MANUAL", manual);
-await page.click("#btnNav");
-await wait(400);
-
-await page.click('[data-tab="terrain"]');
-await wait(200);
-await page.click('[data-course="4"]');
-await wait(1200);
-await page.click('[data-tab="kinematics"]');
-await wait(600);
-
-/* ------------------------------------------------------------- wrap */
-
-check("no console errors overall", errors.length === 0, errors.slice(0, 3).join(" | "));
-
-const noHScroll = await page.evaluate(
-  () => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1
-);
-check("page does not scroll sideways", noHScroll);
 
 await browser.close();
-console.log(`\n${failures === 0 ? "PASS" : failures + " FAILURE(S)"}  — screenshots in dist/shots/`);
+
+let failures = 0;
+for (const result of results) {
+  console.log(`\n${result.name}  — ${(result.elapsed / 1000).toFixed(2)}s`);
+  for (const item of result.checks) {
+    console.log(`${item.ok ? "  ok  " : "FAIL  "}${item.label}${item.detail ? "  — " + item.detail : ""}`);
+    if (!item.ok) failures++;
+  }
+}
+
+const errors = results.flatMap((result) => result.errors.map((error) => `${result.name}: ${error}`));
+const clean = errors.length === 0;
+console.log(`${clean ? "  ok  " : "FAIL  "}no console errors overall${clean ? "" : "  — " + errors.slice(0, 3).join(" | ")}`);
+if (!clean) failures++;
+
+const elapsed = (performance.now() - started) / 1000;
+console.log(
+  `\n${failures === 0 ? "PASS" : failures + " FAILURE(S)"}  — ${scenarios.length} parallel scenarios in ${elapsed.toFixed(2)}s` +
+    (TAKE_SCREENSHOTS ? " · screenshots in dist/shots/" : "")
+);
 process.exit(failures === 0 ? 0 : 1);

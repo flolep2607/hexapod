@@ -3,8 +3,21 @@ name = "hexapod-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Kinematic hexapod simulator and Augmented Random Search trainer. No dependencies."
+description = "Kinematic hexapod simulator and Augmented Random Search trainer."
+rust-version = "1.87"
 
 [lib]
 name = "hexapod_core"
 path = "src/lib.rs"
+
+[dependencies]
+rapier3d = { version = "0.32", optional = true }
+
+[features]
+default = []
+# Rapier 0.32 plant: 3 revolute joints per leg plus ground friction. The
+# centroidal model stays the default so ARS can still train in the page.
+rapier = ["dep:rapier3d"]
+
+[lints]
+workspace = true

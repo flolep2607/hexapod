@@ -11,7 +11,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # 1. wasm target for the browser module (no-op once present).
-rustup target add wasm32-unknown-unknown
+# Rapier 0.32 needs Rust 1.87 (see rust-toolchain.toml).
+rustup toolchain install 1.87.0
+rustup target add wasm32-unknown-unknown --toolchain 1.87.0
 
 # 2. Node dev tooling. Only Playwright, used by test/smoke.mjs; the app ships no
 #    runtime JS dependencies.
@@ -29,7 +31,11 @@ if [ ! -w "$BROWSERS_DIR" ]; then
 fi
 PLAYWRIGHT_BROWSERS_PATH="$BROWSERS_DIR" npx playwright install chromium
 
-# 4. Warm the Rust build caches (native + wasm) so ./build.sh is quick. Offline
-#    is safe: the whole workspace is path-only crates with no registry deps.
-cargo build --release --offline
-cargo build --release --offline --target wasm32-unknown-unknown -p hexapod-wasm
+# 4. Warm the Rust build caches (native + wasm) so ./build.sh is quick.
+#    Rapier and its registry deps are fetched once, then later builds can go
+#    offline from this cache.
+cargo fetch
+cargo build --release
+cargo build --release --target wasm32-unknown-unknown -p hexapod-wasm
+cargo test --release -p hexapod-core --features rapier --offline --no-run || \
+  cargo test --release -p hexapod-core --features rapier --no-run

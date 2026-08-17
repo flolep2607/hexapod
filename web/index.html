@@ -4,7 +4,7 @@
   <header class="hdr">
     <div class="chips">
       <div class="chip"><span class="k">Model</span><b id="hModel">HEXAPOD · 18 DOF</b></div>
-      <div class="chip"><span class="k">Solver</span><b>ANALYTIC 3-DOF IK</b></div>
+      <div class="chip"><span class="k">Solver</span><b id="hSolver">RAPIER 18-REV</b></div>
       <div class="chip"><span class="k">Clock</span><b id="hClock">00:00.0</b></div>
     </div>
     <div class="wordmark">HEXAPOD<small>GAIT LAB</small></div>
@@ -92,14 +92,14 @@
           <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
 GAIT <b id="hudGait">TRIPOD</b> · DUTY <b id="hudDuty">0.50</b></div>
           <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
-SCROLL TO ZOOM · WASD / QE
+SCROLL TO ZOOM · WASD / QE · [ ] SPEED
 <b id="hudHit"></b></div>
           <div class="hud bl">BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm</div>
           <div class="hud br2">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · ω <b id="hudW">0.00</b> rad/s
 CYCLE <b id="hudCycle">0.47</b> s · STRIDE <b id="hudStride">1.08</b> m
 NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b> m · BRG <b id="hudBrg">+0°</b></div>
-          <div class="banner" id="banner">RECOVERING</div>
+          <div class="banner" id="banner">DEAD</div>
         </div>
       </div>
 
@@ -108,15 +108,16 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
 
         <p class="lede">The learner starts as an exact copy of the hand-tuned gait on the right, then searches
         for something better on <b id="trCourse">MIXED</b>. Each iteration samples random directions in
-        parameter space, runs the gait forward and backward along each, and steps toward the directions that
+        parameter space, runs the gait forward and backward along each on the <b>centroidal</b> plant
+        (not the Rapier robot on screen), and steps toward the directions that
         scored best. There is no gradient and no neural network — <b id="trTheta">489 parameters</b>: six gait
         scalars, one phase offset per leg, two stance trims, and a <b id="trShape">19×25</b> linear feedback
         matrix mapping what the machine senses onto what it does with its legs, its gait clock, its
         jump, and its steering.</p>
 
         <div class="statrow">
-          <div class="stat mute"><span class="k">Hand-tuned</span><b id="sBase">—</b><span class="k">reward</span></div>
-          <div class="stat"><span class="k">Learned best</span><b id="sBest">—</b><span class="k">reward</span></div>
+          <div class="stat mute"><span class="k">Hand-tuned</span><b id="sBase">—</b><span class="k">centroidal eval</span></div>
+          <div class="stat"><span class="k">Learned best</span><b id="sBest">—</b><span class="k">centroidal eval</span></div>
           <div class="stat mute"><span class="k">Iterations</span><b id="sIter">0</b><span class="k" id="sIterMs">— ms each</span></div>
           <div class="stat mute"><span class="k">Rollouts</span><b id="sRoll">0</b><span class="k">simulated episodes</span></div>
           <div class="stat"><span class="k">Improvement</span><b id="sGain">—</b><span class="k">over baseline</span></div>
@@ -310,10 +311,18 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         <div class="grid2">
           <div class="sec">
             <div class="sec-bar"><h2>The simulator</h2></div>
-            <p class="note">A <b>centroidal rigid-body</b> model. The chassis carries linear and angular
-            momentum; it cannot change speed faster than traction allows, it coasts when a foot slips, and
-            its own acceleration throws the centre of mass around — braking hard pitches the mass forward
-            over the toes.</p>
+            <p class="note">The live robot is <b>Rapier</b>: a chassis, three revolute joints per leg
+            (eighteen on a hexapod), and Coulomb friction at the feet. Gait, analytic 3-DOF IK and the servo
+            torque-speed cap are written here; the engine is not. Motors track the IK solution with the
+            stall torque of the servo you picked. That is the first milestone — standing on a plane, then a
+            tripod gait — and it already uses the engine.</p>
+            <p class="note">A <b>centroidal rigid-body</b> model still runs the learner. A Rapier step is
+            too expensive for in-page ARS (the centroidal tick is about seven microseconds). Training
+            therefore keeps the fast plant; the dashboard shows the articulated one. Both are driven by the
+            same gait, IK and servo numbers.</p>
+            <p class="note">The chassis carries linear and angular momentum; it cannot change speed faster
+            than traction allows, it coasts when a foot slips, and its own acceleration throws the centre of
+            mass around — braking hard pitches the mass forward over the toes.</p>
             <p class="note">Contact is <b>Coulomb friction</b>: a stance foot transmits at most μ·N, and past
             that it skids and its contact point moves in the world, corrupting the support polygon for every
             tick after. Loose rubble grips about two thirds of what firm ground does.</p>
@@ -333,11 +342,11 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             and keeps the component along it, so a machine that arrives square stops and one that arrives
             at an angle slides along and gets round; a step aimed at somewhere a leg cannot reach is
             deflected to the nearest ground that it can.</p>
-            <p class="note">What is still kinematic, stated plainly: links are rigid, contact is resolved
-            once per tick rather than by an impulse solver, and the leg-inertia terms are the diagonal ones
-            — each joint sees the mass below it, without the off-diagonal coupling or the Coriolis terms of
-            a full mass matrix. It is not a general articulated multibody engine, and it is not Bevy or
-            Rapier: a step has to stay cheap enough that the learner can run in the page.</p>
+            <p class="note">What the centroidal learner still approximates, stated plainly: links are rigid,
+            contact is resolved once per tick rather than by Rapier's impulse solver, and the leg-inertia
+            terms are the diagonal ones — each joint sees the mass below it, without the off-diagonal
+            coupling or the Coriolis terms of a full mass matrix. The live view is the articulated engine;
+            the learner stays cheap enough to run in the page.</p>
           </div>
           <div class="sec">
             <div class="sec-bar"><h2>The learner</h2></div>
@@ -419,6 +428,8 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn primary" id="btnPause" data-on="false">Pause</button>
           <button class="btn" id="btnReset">Reset</button>
         </div>
+        <label class="slider"><span class="hd"><span class="k">Sim speed</span><b id="vRate">1×</b></span>
+          <input type="range" id="rRate" min="0.25" max="4" step="0.25" value="1"></label>
       </div>
 
       <div class="sec">

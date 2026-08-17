@@ -27,7 +27,9 @@
 //! sized at `MAX_*` and the live length is carried by the [`Frame`].
 
 use crate::math::{clamp, frac, squash, unsquash};
-use crate::robot::{Frame, MAX_LEGS};
+use crate::math::V3;
+use crate::robot::{fk_world, solve_ik, Frame, MAX_LEGS};
+use crate::terrain::Terrain;
 
 /// Observations that do not depend on how many legs there are: body height
 /// error, pitch, roll, stability margin, gait phase as sin/cos, and speed
@@ -217,7 +219,7 @@ impl Preset {
         // cycle is already exactly `p` leg-steps, so it never needs the nudge —
         // and neither does an odd pair count, which is why the three-pair
         // hexapod comes out identical to the original hand-written table.
-        let ripple_side = if frame.pairs() % 2 == 0 {
+        let ripple_side = if frame.pairs().is_multiple_of(2) {
             0.5 + 0.5 / p
         } else {
             0.5
@@ -640,4 +642,226 @@ mod tests {
         n.apply(&probe, &mut out, no);
         assert!(out[..no].iter().all(|v| v.abs() < 0.25), "{out:?}");
     }
+}
+
+/// Body-frame foot target for an open-loop gait. Stance sweeps aft, swing
+/// returns with a sine lift. This is the whole walking programme: IK turns it
+/// into 18 joint angles, Rapier does the rest.
+///
+/// `turn` is the commanded yaw rate in rad/s. Over one stance the body turns
+/// through `turn * duty * cycle`, so the planted foot has to travel along an arc
+/// about the body's yaw axis rather than straight aft — without it the machine
+/// has no way to steer at all and wanders off on whatever heading the contacts
+/// hand it.
+#[allow(clippy::too_many_arguments)]
+pub fn foot_in_body(
+    frame: Frame,
+    gait: &Gait,
+    leg: usize,
+    phase: f64,
+    stride: f64,
+    duty: f64,
+    cycle: f64,
+    body_h: f64,
+    step_h: f64,
+    turn: f64,
+) -> V3 {
+    use crate::math::{frac, rot_y};
+    let d = frame.dir(leg);
+    let out = gait.stance_w * 0.5 + gait.trim(leg);
+    let neutral = [d[0] * out, -body_h - 0.03, d[2] * out];
+    let lp = frac(phase + gait.offsets[leg]);
+    // `s` runs +0.5 at touchdown to -0.5 at lift-off. A planted foot travels
+    // aft, which is what carries the body forward; the swing takes it back to
+    // the front. Getting this backwards leaves the machine pushing against
+    // itself and creeping along on nothing but foot slip.
+    let (s, lift) = if lp < duty {
+        (0.5 - lp / duty.max(1e-6), 0.0)
+    } else {
+        let u = (lp - duty) / (1.0 - duty).max(1e-6);
+        (
+            u - 0.5,
+            step_h * (core::f64::consts::PI * u).sin(),
+        )
+    };
+    let arc = rot_y(neutral, turn * duty * cycle * s);
+    [arc[0], arc[1] + lift, arc[2] + stride * s]
+}
+
+/// The same target, but told what is under the foot.
+///
+/// The longitudinal sweep is left alone — that aft stance stroke is what pushes
+/// the machine along, and anchoring the foot to a world point instead (which is
+/// what the centroidal planner does, since there the body advances by fiat)
+/// leaves the real plant with nothing to push against. What the terrain gets to
+/// change is where the foot ends up:
+///
+/// * the foot lands on whatever it is over — the top of a block counts as ground
+///   as long as it is inside the leg's reach, which is how the machine steps up
+///   onto a kerb instead of kicking it;
+/// * a swinging foot rides `FOOT_CLEAR` above whatever it passes over, so it
+///   crosses an obstacle rather than dragging through it;
+/// * a foot that would land inside something too tall to stand on is pushed out
+///   to the nearest face, so the leg is never asked to occupy a wall;
+/// * and the pose the whole leg would have to take is checked, not just the
+///   foot: a target that puts the femur or the tibia through a block is pulled
+///   in toward the hip until the links are clear, because a foot standing in
+///   free air is no use if the knee is inside the crate.
+///
+/// `pos`/`yaw` are the body's *measured* pose, so the leg reacts to the rock
+/// that is actually in front of it.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+pub fn foot_on_terrain(
+    frame: Frame,
+    gait: &Gait,
+    leg: usize,
+    phase: f64,
+    stride: f64,
+    duty: f64,
+    cycle: f64,
+    body_h: f64,
+    step_h: f64,
+    turn: f64,
+    terrain: &Terrain,
+    pos: V3,
+    yaw: f64,
+    pitch: f64,
+    roll: f64,
+) -> V3 {
+    use crate::math::{body_to_world, frac, world_to_body};
+    use crate::sim::{FOOT_CLEAR, MAX_FOOTHOLD};
+
+    // The stroke is laid out in a level frame at yaw: where the foot should go
+    // does not depend on how the deck happens to be tipped this instant.
+    let base = foot_in_body(
+        frame, gait, leg, phase, stride, duty, cycle, body_h, step_h, turn,
+    );
+    let w = body_to_world(base, yaw, 0.0, 0.0);
+    let (mut x, mut z) = (pos[0] + w[0], pos[2] + w[2]);
+
+    // The plane the machine is standing on, as far as this leg is concerned:
+    // reach is measured from the body, not from sea level.
+    let plane = pos[1] - body_h;
+    let pushed = terrain.push_xz(x, z, plane, MAX_FOOTHOLD);
+    x = pushed.0;
+    z = pushed.1;
+    let ground = terrain.height(x, z).min(plane + MAX_FOOTHOLD);
+
+    // Vertically the target is referenced to the *terrain*, never to the body's
+    // measured height. Hanging it off the measured height closes a loop with the
+    // wrong sign — the deck dips, every target dips with it, the legs extend and
+    // shove it back past level — and the machine pogos itself off the map inside
+    // a minute. The ground does not move, so it is what the feet aim at.
+    //
+    // Taking the higher of the ground under the body and the ground under the
+    // foot is what makes the machine step *onto* a kerb rather than into its
+    // side, and it keeps a foot swinging over a block from dragging through it.
+    let under_body = terrain.height(pos[0], pos[2]);
+    let stand = under_body.max(ground);
+    let lp = frac(phase + gait.offsets[leg]);
+    let y = if lp < duty {
+        stand - PRESS
+    } else {
+        let u = (lp - duty) / (1.0 - duty).max(1e-6);
+        stand + FOOT_CLEAR + step_h * (core::f64::consts::PI * u).sin()
+    };
+
+    let body = world_to_body([x - pos[0], y - pos[1], z - pos[2]], yaw, pitch, roll);
+    clear_links(frame, leg, body, terrain, pos, yaw)
+}
+
+/// How far a standing foot is driven into its ground. A servo holding station
+/// needs some error to pull against; without it the leg hovers and the deck
+/// sinks onto whatever is left.
+const PRESS: f64 = 0.02;
+
+/// Pull a foot target in toward the hip until no link chords a wall.
+///
+/// Five tries at 12% a step: enough to walk a leg out of a crate it was about
+/// to reach through, and it gives up rather than folding the leg under the body
+/// when there is no clear pose at all — a stubbed step is better than a
+/// collapsed stance.
+fn clear_links(
+    frame: Frame,
+    leg: usize,
+    target: V3,
+    terrain: &Terrain,
+    pos: V3,
+    yaw: f64,
+) -> V3 {
+    let hip = frame.hip(leg);
+    let mut t = target;
+    for _ in 0..5 {
+        if !leg_hits_block(frame, leg, t, terrain, pos, yaw) {
+            return t;
+        }
+        for c in 0..3 {
+            t[c] += (hip[c] - t[c]) * 0.12;
+        }
+    }
+    t
+}
+
+/// True when any of this leg's links would pass through a block.
+///
+/// `Terrain::segment_hits_solid` already does the swept test, insets by the same
+/// wall padding the rest of the course logic uses, and is what the terrain tests
+/// pin down — so the links are handed to it rather than sampled here.
+fn leg_hits_block(
+    frame: Frame,
+    leg: usize,
+    target: V3,
+    terrain: &Terrain,
+    pos: V3,
+    yaw: f64,
+) -> bool {
+    let q = solve_ik(frame, leg, target).q;
+    let j = fk_world(frame, leg, q, pos, yaw, 0.0, 0.0);
+    (0..3).any(|k| terrain.segment_hits_solid(j[k], j[k + 1]))
+}
+
+/// Shortest cycle time this stroke can be run at without asking a joint to turn
+/// faster than the servo's no-load speed.
+///
+/// Real hardware does not get to ignore this: past the no-load speed a servo has
+/// no torque left to give, so the joint stops following and the leg waves about a
+/// few degrees from where it was told to be. Commanding a gait the actuators
+/// cannot execute does not make the machine faster, it makes it imprecise.
+///
+/// The stroke's shape is fixed in phase, so joint travel per unit phase does not
+/// depend on the cycle: sample it once and the shortest feasible cycle is that
+/// travel divided by the speed limit. One leg is enough — the others run the same
+/// stroke on a phase offset.
+#[allow(clippy::too_many_arguments)]
+pub fn feasible_cycle(
+    frame: Frame,
+    gait: &Gait,
+    stride: f64,
+    duty: f64,
+    cycle: f64,
+    body_h: f64,
+    step_h: f64,
+    turn: f64,
+    omega_max: f64,
+) -> f64 {
+    if omega_max <= 1e-6 {
+        return cycle;
+    }
+    const N: usize = 16;
+    let mut prev = [0.0f64; 3];
+    let mut peak = 0.0f64;
+    for k in 0..=N {
+        let phase = frac(k as f64 / N as f64 - gait.offsets[0]);
+        let foot = foot_in_body(frame, gait, 0, phase, stride, duty, cycle, body_h, step_h, turn);
+        let q = solve_ik(frame, 0, foot).q;
+        if k > 0 {
+            for j in 0..3 {
+                // Radians per unit phase, i.e. per cycle.
+                peak = peak.max((q[j] - prev[j]).abs() * N as f64);
+            }
+        }
+        prev = q;
+    }
+    peak / omega_max
 }
