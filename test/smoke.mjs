@@ -463,16 +463,26 @@ await page.click(`[data-course="${jumpIdx}"]`);
 // test left it held — otherwise we pause a running hop and wait on a frozen clock.
 const pauseLabel = await page.textContent("#btnPause");
 if (/Resume/i.test(pauseLabel || "")) await page.click("#btnPause");
+// applyCourse resets the integrator, but the HUD still shows the previous
+// course's clock until the next frame. A stale 00:02.x would look like the
+// hop had already had time to fire.
+await page.waitForFunction(
+  () => {
+    const summary = document.getElementById("tSummary")?.textContent || "";
+    const clock = document.getElementById("hClock")?.textContent || "";
+    const m = clock.match(/(\d+):(\d+(?:\.\d+)?)/);
+    const secs = m ? Number(m[1]) * 60 + Number(m[2]) : 99;
+    return /JUMP/.test(summary) && secs < 0.6;
+  },
+  { timeout: 8000 }
+);
 try {
   await page.waitForFunction(
     () => {
       const state = document.getElementById("hState")?.textContent || "";
       const meter = document.getElementById("mSpeedLabel")?.textContent || "";
-      const clock = document.getElementById("hClock")?.textContent || "";
       const jumps = Number((meter.match(/(\d+)\s*jumps/i) || ["", "0"])[1]);
-      const m = clock.match(/(\d+):(\d+(?:\.\d+)?)/);
-      const secs = m ? Number(m[1]) * 60 + Number(m[2]) : 0;
-      return /JUMPING/i.test(state) || jumps > 0 || secs >= 1.4;
+      return /JUMPING/i.test(state) || jumps > 0;
     },
     { timeout: 25000 }
   );
