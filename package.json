@@ -5,6 +5,8 @@
   "description": "Dev tooling for the Hexapod Gait Lab dashboard. The app itself is dependency-free; Playwright is only used by test/smoke.mjs to drive the built page in a real browser.",
   "scripts": {
     "build": "./build.sh",
+    "serve": "python3 -m http.server 8000 --bind 0.0.0.0 --directory dist",
+    "dev": "./build.sh && npm run serve",
     "smoke": "node test/smoke.mjs"
   },
   "devDependencies": {

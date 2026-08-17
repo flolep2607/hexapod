@@ -5,7 +5,7 @@
   "terminals": [
     {
       "name": "dashboard",
-      "command": "test -f dist/hexapod-simulator.html || ./build.sh; python3 -m http.server 8000 --bind 0.0.0.0 --directory dist"
+      "command": "test -f dist/hexapod-simulator.html || npm run build; npm run serve"
     }
   ],
   "ports": [8000]
