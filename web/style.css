@@ -582,6 +582,12 @@ input[type="number"] {
   text-align: right;
 }
 
+.hud.tr b#hudHit:not(:empty) {
+  display: block;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
 .hud.bl {
   bottom: 0;
   left: 0;

@@ -91,8 +91,9 @@
           <canvas id="view"></canvas>
           <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
 GAIT <b id="hudGait">TRIPOD</b> · DUTY <b id="hudDuty">0.50</b></div>
-          <div class="hud tr">CAM ORBIT · DRAG TO ROTATE
-SCROLL TO ZOOM · WASD / QE</div>
+          <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
+SCROLL TO ZOOM · WASD / QE
+<b id="hudHit"></b></div>
           <div class="hud bl">BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm</div>
           <div class="hud br2">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · ω <b id="hudW">0.00</b> rad/s
@@ -380,9 +381,16 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
               <tr><td>Dashed grey ring</td><td>Where a swinging leg intends to touch down</td></tr>
               <tr><td>Dashed red polygon</td><td>Support polygon — the convex hull of the planted feet</td></tr>
               <tr><td>Crosshair</td><td>Centre of mass. It turns red as it approaches the polygon edge</td></tr>
+              <tr><td>Clay block</td><td>Unclimbable wall. Turns red, with a red outline, when the chassis or a link is inside it</td></tr>
+              <tr><td>Slate slab</td><td>Staircase tread</td></tr>
+              <tr><td>Sage strip</td><td>Ramp slab</td></tr>
+              <tr><td>Sand block</td><td>Rubble</td></tr>
+              <tr><td>Pale cyan sheet</td><td>Ice. Thin, and slippery</td></tr>
               <tr><td>Recessed grey box</td><td>Pit. Falling into one usually ends the run</td></tr>
+              <tr><td>Red chassis / leg</td><td>That body is currently in a wall</td></tr>
               <tr><td>Red ring with a post</td><td>The waypoint being chased right now</td></tr>
               <tr><td>Small dashed rings</td><td>The rest of the route, faded once passed</td></tr>
+              <tr><td>1 / 2 / 3</td><td>Orbit, top and side cameras. Drag on the stage to take orbit back</td></tr>
               <tr><td>Dashed red line at ±5 m</td><td>An invisible wall. Uprights appear as you close on it</td></tr>
             </tbody>
           </table>
@@ -460,11 +468,18 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnNav" data-on="true">Follow route</button>
           <button class="btn" id="btnRoute" data-on="true">Show route</button>
         </div>
+        <div class="row3" style="margin-top:8px">
+          <button class="btn" id="btnCamOrbit" data-on="true">Orbit</button>
+          <button class="btn" id="btnCamTop">Top</button>
+          <button class="btn" id="btnCamSide">Side</button>
+        </div>
         <p class="note">Every course carries a route, and the corridor is fenced by two
         invisible walls. With the autopilot on, the policy's own steering action drives the
         yaw and the machine works its way to each waypoint in turn — on the slalom that is the
         only way past, because the walls are taller than a leg can reach. Touch the turn keys
-        and steering hands back to you until you let go.</p>
+        and steering hands back to you until you let go. Orbit, Top and Side lock the camera
+        (keys 1 / 2 / 3); drag the stage to take orbit back. Obstacles are coloured by kind,
+        and a solid the chassis or a link is inside turns red.</p>
       </div>
 
       <div class="sec">

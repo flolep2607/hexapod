@@ -519,13 +519,20 @@ test/smoke.mjs         Playwright end-to-end check of the built page
 | Dashed grey ring | Where a swinging leg intends to touch down |
 | Dashed red polygon | Support polygon — convex hull of the planted feet |
 | Crosshair | Centre of mass; turns red near the polygon edge |
+| Clay block | Unclimbable wall. Turns red, with a red outline, when the chassis or a link is inside it |
+| Slate slab | Staircase tread |
+| Sage strip | Ramp slab |
+| Sand block | Rubble |
+| Pale cyan sheet | Ice. Thin, and slippery |
 | Recessed grey box | Pit. Falling in usually ends the run |
+| Red chassis / leg | That body is currently in a wall |
 | Red ring with a post | The waypoint being chased right now |
 | Small dashed rings | The rest of the route, faded once passed |
+| `1` / `2` / `3` | Orbit, top and side cameras. Drag the stage to take orbit back |
 | Dashed red line at ±5 m | An invisible wall. Uprights fade in as you close on it |
 
 Drag to orbit, scroll to zoom, `WASD`/`QE` to drive, `X` to stop, `space` to
-pause. The **Frame** slider sets the leg count, the **Commanded speed** dial is
+pause, `1`/`2`/`3` for orbit / top / side. The **Frame** slider sets the leg count, the **Commanded speed** dial is
 the number the reward tracks, and the **Machine** selector picks the servo the
 joints are driven with. Changing any of them is a different robot, so anything
 learned for the old one is discarded. **Follow route** hands steering to the
