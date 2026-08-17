@@ -91,7 +91,7 @@ struct LegBodies {
     _coxa: RigidBodyHandle,
     _femur: RigidBodyHandle,
     _tibia: RigidBodyHandle,
-    foot: ColliderHandle,
+    _foot: ColliderHandle,
     hinges: [Hinge; 3],
 }
 
@@ -379,7 +379,7 @@ impl ArticulatedPlant {
                 _coxa: coxa,
                 _femur: femur,
                 _tibia: tibia,
-                foot: foot_col,
+                _foot: foot_col,
                 hinges: [
                     Hinge {
                         joint: h_coxa,
