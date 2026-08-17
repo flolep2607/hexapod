@@ -74,11 +74,11 @@ check(
   (await page.evaluate(() => document.characterSet)) === "UTF-8",
   await page.evaluate(() => document.characterSet)
 );
-const gait = (await page.textContent("#tblGait")) || "";
+const gaitTable = (await page.textContent("#tblGait")) || "";
 check(
   "gait table dashes are not mojibake",
-  /—/.test(gait) && /·/.test(gait) && !/â€/.test(gait) && !/Â·/.test(gait),
-  (gait.match(/Running now[^\n]*/)?.[0] || gait.slice(0, 120)).trim()
+  /—/.test(gaitTable) && /·/.test(gaitTable) && !/â€/.test(gaitTable) && !/Â·/.test(gaitTable),
+  (gaitTable.match(/Running now[^\n]*/)?.[0] || gaitTable.slice(0, 120)).trim()
 );
 await page.screenshot({ path: path.join(SHOTS, "02-training-before.png") });
 
