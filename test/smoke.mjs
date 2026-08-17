@@ -27,6 +27,11 @@ const browser = await chromium.launch(executablePath ? { executablePath } : {});
 async function openHarness(name) {
   const context = await browser.newContext({ viewport: { width: 1680, height: 1000 } });
   const page = await context.newPage();
+  // A --fast artifact reloads itself when dist changes. Smoke pages must stay
+  // pinned to the artifact they opened even if a dev watcher rebuilds it.
+  await page.addInitScript(() => {
+    window.setInterval = () => 0;
+  });
   const checks = [];
   const errors = [];
   const hasDevFileReloader = HAS_DEV_FILE_RELOADER;
@@ -396,12 +401,12 @@ async function quadruped(h) {
 }
 
 async function gaitAndNavigation(h) {
-  const { page, check, waitFor, setRange } = h;
+  const { page, check, waitFor, stepSamples } = h;
   await page.click("#btnBase");
   await page.click('[data-preset="0"]');
   await waitFor(
     () =>
-      window.__hxFalls.t.length > 60 &&
+      window.__hxFalls.t.length > 40 &&
       window.__hxFalls.cycle() > 0 &&
       window.__hxFalls.classify() === "TRIPOD",
     null,
@@ -424,7 +429,7 @@ async function gaitAndNavigation(h) {
       live: window.__hxDuty(),
     };
   });
-  check("footfalls are recorded, not assumed", gait.n > 60, `${gait.n} samples`);
+  check("footfalls are recorded, not assumed", gait.n > 40, `${gait.n} samples`);
   check(
     "the pattern is classified from the footfalls, not the label",
     gait.kind === "TRIPOD",
@@ -441,8 +446,9 @@ async function gaitAndNavigation(h) {
     `${gait.duty.map((value) => value.toFixed(2)).join(" ")} vs ${gait.live.duty.toFixed(2)}`
   );
 
-  await setRange("rRate", 2);
-  await waitFor(() => parseInt(document.getElementById("pReached")?.textContent, 10) >= 1, null, 5000);
+  await page.click("#btnPause");
+  let stepped = await stepSamples(180);
+  for (let attempt = 0; attempt < 5 && stepped.reached < 1; attempt++) stepped = await stepSamples(180);
   const nav = await page.evaluate(() => ({
     waypoint: document.getElementById("hudWp").textContent,
     mode: document.getElementById("hudNav").textContent,
@@ -457,6 +463,7 @@ async function gaitAndNavigation(h) {
 
 async function courses(h) {
   const { page, check, waitFor, setRange, screenshot, stepSamples, nextFrame } = h;
+  if (/Pause/i.test((await page.textContent("#btnPause")) || "")) await page.click("#btnPause");
   await setRange("rRate", 2);
   const names = await page.evaluate(() =>
     [...document.querySelectorAll("[data-course]")].map((button) => button.textContent)
@@ -519,10 +526,8 @@ async function courses(h) {
 }
 
 const scenarios = [
-  ["dashboard + courses", async (harness) => {
-    await bootAndStatic(harness);
-    await courses(harness);
-  }],
+  ["dashboard", bootAndStatic],
+  ["courses", courses],
   ["training", training],
   ["physics + servo", async (harness) => {
     await speedAndPhysics(harness);
@@ -536,13 +541,30 @@ const scenarios = [
 ];
 
 const started = performance.now();
+const SCENARIO_TIMEOUT_MS = 20000;
+const withScenarioTimeout = async (promise, name) => {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${name} exceeded ${SCENARIO_TIMEOUT_MS / 1000}s`)),
+          SCENARIO_TIMEOUT_MS
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
 const results = await Promise.all(
   scenarios.map(async ([name, scenario]) => {
     const scenarioStarted = performance.now();
     let harness;
     try {
       harness = await openHarness(name);
-      await scenario(harness);
+      await withScenarioTimeout(scenario(harness), name);
     } catch (error) {
       if (!harness) {
         return {

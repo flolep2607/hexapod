@@ -230,6 +230,28 @@ pub fn leg_com(joints: &[V3; 4], mass: &LegMass, scale: f64) -> V3 {
     [w(f[0], t[0]), w(f[1], t[1]), w(f[2], t[2])]
 }
 
+/// Mass-weighted centre of mass of the chassis plus every swinging link.
+///
+/// `pos` and `joints` must share a frame — world in the dashboard, body in
+/// the torque path. Coxa mass stays in the chassis: that servo does not swing.
+pub fn robot_com(pos: V3, joints: &[[V3; 4]], phys: &Physics) -> V3 {
+    let swing = phys.leg.total() * joints.len() as f64;
+    let chassis = (phys.mass_kg - swing).max(0.15);
+    let mut acc = [pos[0] * chassis, pos[1] * chassis, pos[2] * chassis];
+    let mut m = chassis;
+    let lm = phys.leg.total();
+    if lm > 0.0 {
+        for j in joints {
+            let c = leg_com(j, &phys.leg, 1.0);
+            acc[0] += c[0] * lm;
+            acc[1] += c[1] * lm;
+            acc[2] += c[2] * lm;
+            m += lm;
+        }
+    }
+    [acc[0] / m, acc[1] / m, acc[2] / m]
+}
+
 /// Torque each joint pays for carrying and swinging the leg itself, N-m.
 ///
 /// Two terms, both of which used to be zero:
@@ -348,7 +370,7 @@ pub fn collapse_direction(q: [f64; 3], femur: f64, tibia: f64) -> [f64; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::robot::{fk_body, Frame, FEMUR, TIBIA};
+    use crate::robot::{fk_body, fk_world, Frame, FEMUR, TIBIA};
 
     #[test]
     fn the_ideal_joint_is_deadbeat_at_the_control_rate() {
@@ -448,6 +470,31 @@ mod tests {
         assert!(com[1] < j[1][1] && com[1] > j[3][1], "{com:?}");
         let out = |v: V3| (v[0] * v[0] + v[2] * v[2]).sqrt();
         assert!(out(com) > out(j[1]) && out(com) < out(j[3]), "{com:?}");
+    }
+
+    #[test]
+    fn weightless_legs_put_the_centre_of_mass_on_the_chassis() {
+        let phys = Physics {
+            leg: LegMass::WEIGHTLESS,
+            ..Physics::default()
+        };
+        let pos = [1.0, 2.0, 3.0];
+        assert_eq!(robot_com(pos, &[], &phys), pos);
+    }
+
+    #[test]
+    fn hanging_legs_pull_the_centre_of_mass_below_the_chassis() {
+        let f = Frame::default();
+        let phys = Physics::default();
+        let pos = [0.0, 1.0, 0.0];
+        let q = [0.0, 0.08, -1.33];
+        let joints: Vec<_> = (0..f.legs())
+            .map(|i| fk_world(f, i, q, pos, 0.0, 0.0, 0.0))
+            .collect();
+        let com = robot_com(pos, &joints, &phys);
+        assert!(com[1] < pos[1] - 0.05, "{com:?}");
+        assert!(com[1] > 0.0, "{com:?}");
+        assert!(com[0].abs() < 0.25 && com[2].abs() < 0.25, "{com:?}");
     }
 
     #[test]

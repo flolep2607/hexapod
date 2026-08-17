@@ -38,7 +38,7 @@ pub const T_TIME: usize = 294;
 pub const T_FALLEN: usize = 295;
 pub const T_BLOCKED: usize = 296;
 pub const T_ADVANCE: usize = 297;
-pub const T_COM: usize = 298; // 2: centre-of-mass drift, x and z
+pub const T_COM: usize = 298; // 2: centre-of-mass drift, x and z (stability)
 pub const T_STUB: usize = 300;
 pub const T_COLLISIONS: usize = 301;
 pub const T_PLANE: usize = 302; // 3: support plane a, b, c
@@ -111,6 +111,8 @@ pub const T_CLEARANCE: usize = 385;
 /// 1 while the live view is the Rapier articulated plant.
 pub const T_PLANT: usize = 386;
 pub const T_N_HINGES: usize = 387;
+/// World xyz of the mass-weighted centre of mass of the drawn robot.
+pub const T_COM3: usize = 388; // 3
 
 pub const T_LEN: usize = 392;
 

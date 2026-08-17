@@ -56,7 +56,7 @@ use crate::terrain::{Terrain, WAYPOINT_R};
 pub const DT: f64 = 1.0 / 100.0;
 
 /// Clearance the foot keeps above terrain before it counts as catching.
-const FOOT_CLEAR: f64 = 0.03;
+pub const FOOT_CLEAR: f64 = 0.03;
 /// How strongly the chassis conforms to the slope under it.
 const COMPLIANCE: f64 = 0.55;
 /// Peak yaw rate at full turn command, rad/s.
@@ -110,7 +110,7 @@ const REACT_TAU: f64 = 0.03;
 /// Highest a foot can be planted above the support plane. A leg has finite
 /// reach, so anything taller than this is not a step — it is a wall, and the
 /// foot has to go somewhere else.
-const MAX_FOOTHOLD: f64 = 0.62;
+pub const MAX_FOOTHOLD: f64 = 0.62;
 /// Radii searched, in order, when the intended touchdown is unreachable.
 const FOOTHOLD_R: [f64; 2] = [0.35, 0.70];
 /// Forward terrain scan: ranges ahead of the body, and bearings across it.
@@ -505,6 +505,22 @@ impl Default for Sim {
 }
 
 impl Sim {
+    /// Adopt a measured body pose — the articulated plant's, when one is running.
+    ///
+    /// The gait clock, the foot schedule and the joint state are untouched: this
+    /// only tells the planner where the body it plans for actually is. Without
+    /// it the footholds, the swing clearance and the support polygon are all
+    /// chosen around a ghost that has walked on ahead of the real machine, so
+    /// the legs you see lift over rocks that are no longer there and plough
+    /// through the ones that are.
+    pub fn observe_pose(&mut self, pos: V3, yaw: f64, pitch: f64, roll: f64, vel: [f64; 2]) {
+        self.pos = pos;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.roll = roll;
+        self.vel = vel;
+    }
+
     pub fn reset(&mut self, terrain: &Terrain, gait: &Gait, phys: &Physics) {
         let start = [0.0, 0.0, 0.0];
         let ground = terrain.height(start[0], start[2]);
@@ -578,6 +594,11 @@ impl Sim {
         cmd: Cmd,
     ) -> f64 {
         if self.fallen || self.broken {
+            return 0.0;
+        }
+        // Belly already on the floor: do not let the height spring stand it up.
+        if self.pos[1] < BODY_H * 0.45 {
+            self.fallen = true;
             return 0.0;
         }
         let n = self.frame.legs();
@@ -1280,7 +1301,7 @@ impl Sim {
         // or a tumble is.
         if self.pitch.abs() > 0.75
             || self.roll.abs() > 0.75
-            || self.pos[1] < self.plane_y(self.pos[0], self.pos[2]) - 0.15
+            || self.pos[1] < BODY_H * 0.45
         {
             self.fallen = true;
         }
@@ -2474,7 +2495,7 @@ mod tests {
         }
         assert!(saw_neg, "trot never went statically unstable");
 
-        s.pos[1] = s.plane_y(s.pos[0], s.pos[2]) - 2.0;
+        s.pos[1] = BODY_H * 0.40;
         s.step(&t, &p, &g, DT, Cmd::at(3.0));
         assert!(s.fallen, "chassis on the ground should be a fall");
     }

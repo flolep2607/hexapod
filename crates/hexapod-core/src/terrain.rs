@@ -238,7 +238,9 @@ impl Terrain {
         }
     }
 
-    fn rebuild_buckets(&mut self) {
+    /// Re-index after obstacles are added by hand — `height` and the sweep tests
+    /// read the buckets, so an obstacle that is not in them is invisible to them.
+    pub(crate) fn rebuild_buckets(&mut self) {
         for b in self.buckets.iter_mut() {
             b.clear();
         }
@@ -511,7 +513,7 @@ impl Terrain {
         false
     }
 
-    fn push(&mut self, x0: f64, x1: f64, z0: f64, z1: f64, top: f64, grip: f64) {
+    pub(crate) fn push(&mut self, x0: f64, x1: f64, z0: f64, z1: f64, top: f64, grip: f64) {
         self.obstacles.push(Obstacle {
             x0,
             x1,

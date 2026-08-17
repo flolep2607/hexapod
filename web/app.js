@@ -1177,7 +1177,7 @@ function updateReadouts(t) {
   $("hState").textContent = broken
     ? "BROKEN"
     : fallen
-    ? "RECOVERING"
+    ? "DEAD"
     : airborne
     ? t[L.T_TASK] > 0.5
       ? "JUMPING"
@@ -1191,7 +1191,7 @@ function updateReadouts(t) {
       ? "TURNING"
       : "WALKING"
     : "STANDING";
-  $("banner").textContent = broken ? "BROKEN" : "RECOVERING";
+  $("banner").textContent = broken ? "BROKEN" : "DEAD";
   $("banner").dataset.on = String(fallen || broken);
 
   $("hudGait").textContent =

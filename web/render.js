@@ -660,23 +660,33 @@ class Stage {
   }
 
   _ringXZ(cx, cz, y, r, style, width, dash) {
-    const c = this.ctx;
+    this._ringAround([cx, y, cz], [1, 0, 0], [0, 0, 1], r, style, width, dash);
+  }
+
+  _ringAround(c, u, v, r, style, width, dash) {
+    const ctx = this.ctx;
     const pts = [];
     for (let i = 0; i <= 20; i++) {
       const a = (i / 20) * Math.PI * 2;
-      const v = this._view([cx + Math.cos(a) * r, y, cz + Math.sin(a) * r]);
-      if (v[2] <= NEAR) return;
-      pts.push(this._project(v));
+      const ca = Math.cos(a) * r;
+      const sa = Math.sin(a) * r;
+      const q = this._view([
+        c[0] + u[0] * ca + v[0] * sa,
+        c[1] + u[1] * ca + v[1] * sa,
+        c[2] + u[2] * ca + v[2] * sa,
+      ]);
+      if (q[2] <= NEAR) return;
+      pts.push(this._project(q));
     }
-    c.save();
-    c.strokeStyle = style;
-    c.lineWidth = (width || 1) * this.dpr;
-    if (dash) c.setLineDash(dash.map((d) => d * this.dpr));
-    c.beginPath();
-    c.moveTo(pts[0][0], pts[0][1]);
-    for (const p of pts.slice(1)) c.lineTo(p[0], p[1]);
-    c.stroke();
-    c.restore();
+    ctx.save();
+    ctx.strokeStyle = style;
+    ctx.lineWidth = (width || 1) * this.dpr;
+    if (dash) ctx.setLineDash(dash.map((d) => d * this.dpr));
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (const p of pts.slice(1)) ctx.lineTo(p[0], p[1]);
+    ctx.stroke();
+    ctx.restore();
   }
 
   _grid(zc) {
@@ -1013,10 +1023,19 @@ class Stage {
     this._chassis(pos, t[L.T_YAW], t[L.T_PITCH], t[L.T_ROLL], bodyR, blocked || hits.chassis);
     this._legs(joints, t.subarray(L.T_STANCE, L.T_STANCE + legs), legs, hits.hitLegs);
 
+    const bad = t[L.T_MARGIN] < 0.05;
+    const com =
+      L.T_COM3 != null
+        ? [t[L.T_COM3], t[L.T_COM3 + 1], t[L.T_COM3 + 2]]
+        : [pos[0] + t[L.T_COM], pos[1], pos[2] + t[L.T_COM + 1]];
+    if (this.showSupport) {
+      this._ellipsoid(com, 0.09, bad ? COL.hit : COL.accent, 10, 4);
+    }
+
     if (this.view !== "top") this._paintShadows(robotFrom);
     this._paintFaces();
 
-    // Support polygon and centre of mass.
+    // Support polygon on the ground, mass-weighted CoM in 3-D with its plumb.
     if (this.showSupport) {
       const n = Math.round(t[L.T_HULL_N]);
       if (n >= 3) {
@@ -1027,14 +1046,20 @@ class Stage {
           this._line(a, b, "rgba(229,57,29,0.5)", 1.2, [6, 4]);
         }
       }
-      const cx = pos[0] + t[L.T_COM];
-      const cz = pos[2] + t[L.T_COM + 1];
-      const bad = t[L.T_MARGIN] < 0.05;
+      const [cx, cy, cz] = com;
+      const gy = 0.02;
       const col = bad ? "#e5391d" : "rgba(20,20,22,0.6)";
-      this._line([cx - 0.22, 0.02, cz], [cx + 0.22, 0.02, cz], col, 1.5);
-      this._line([cx, 0.02, cz - 0.22], [cx, 0.02, cz + 0.22], col, 1.5);
-      this._ringXZ(cx, cz, 0.02, 0.13, col, 1.2);
-      this._line([pos[0], pos[1], pos[2]], [cx, 0.02, cz], "rgba(20,20,22,0.18)", 1, [3, 4]);
+      const s = 0.18;
+      this._line([cx - s, cy, cz], [cx + s, cy, cz], col, 1.6);
+      this._line([cx, cy - s, cz], [cx, cy + s, cz], col, 1.6);
+      this._line([cx, cy, cz - s], [cx, cy, cz + s], col, 1.6);
+      this._ringAround(com, [1, 0, 0], [0, 1, 0], 0.13, col, 1.2);
+      this._ringAround(com, [1, 0, 0], [0, 0, 1], 0.13, col, 1.2);
+      this._ringAround(com, [0, 1, 0], [0, 0, 1], 0.13, col, 1.2);
+      this._line([cx, cy, cz], [cx, gy, cz], "rgba(20,20,22,0.22)", 1, [3, 4]);
+      this._line([cx - 0.22, gy, cz], [cx + 0.22, gy, cz], col, 1.5);
+      this._line([cx, gy, cz - 0.22], [cx, gy, cz + 0.22], col, 1.5);
+      this._ringXZ(cx, cz, gy, 0.13, col, 1.2);
     }
 
     // Foot contacts and where each swinging leg intends to land.

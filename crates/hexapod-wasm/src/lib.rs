@@ -15,13 +15,13 @@ pub mod layout;
 use core::ptr::addr_of_mut;
 
 use hexapod_core::ars::{ArsConfig, Trainer};
-use hexapod_core::dynamics::Physics;
+use hexapod_core::dynamics::{robot_com, Physics};
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
 use hexapod_core::math::{squash, unsquash};
-use hexapod_core::plant::{foot_in_body, ArticulatedPlant};
+use hexapod_core::plant::ArticulatedPlant;
+use hexapod_core::policy::foot_on_terrain;
 use hexapod_core::policy::{act_body_dh, n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
-use hexapod_core::robot::BODY_H;
 use hexapod_core::sim::{
     Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX,
     JUMP_CRUISE_MIN,
@@ -51,9 +51,10 @@ struct App {
 
     live: Sim,
     live_gait: Gait,
-    /// Rapier articulated plant. The live view draws its body transforms;
-    /// ARS still trains on the centroidal step. Pose is never written back
-    /// into `Sim`.
+    /// Rapier articulated plant. The live view draws its body transforms and
+    /// `live` is told the pose each tick so it plans footholds for the real
+    /// body; joint angles still never travel back. ARS trains on the
+    /// centroidal step alone, with no plant in the loop.
     plant: Option<ArticulatedPlant>,
     mode: u32,
     since_fall: f64,
@@ -537,6 +538,38 @@ impl App {
 
     fn reset_live(&mut self) {
         self.live_gait = self.active_gait();
+        // The machine on screen is driven by real motors, so it does not get to
+        // run a clock its servos cannot track: past their no-load speed a joint
+        // has no torque left and simply stops following, which buys no speed and
+        // costs all of the accuracy. The trainer is deliberately left alone — it
+        // optimises the centroidal model, and narrowing its action space is a
+        // separate decision.
+        // And a leg is not thrown higher than a third of the ride height. The
+        // seeded 0.46 is over half of it: on the centroidal model that costs
+        // nothing, since its swing arc is decoration, but the articulated machine
+        // throws three legs that high every half cycle and spends the gait
+        // recovering from itself. Swept against the plant on both courses, at the
+        // clock below: 0.46 gives 0.26 m/s on the flat and 0.17 on the mixed
+        // course with 24 degrees of deck tilt, 0.28 gives 0.68 and 0.35 with the
+        // lateral drift down from 27% of forward travel to 4%. Obstacles are
+        // still cleared without the height — `foot_on_terrain` lifts the swing
+        // arc over whatever the foot is crossing, which is the job the hand-set
+        // height was doing badly.
+        self.live_gait.step_h = self.live_gait.step_h.min(0.32 * self.live_gait.body_h);
+
+        let g = self.live_gait;
+        let floor = hexapod_core::policy::feasible_cycle(
+            self.frame,
+            &g,
+            g.stride,
+            g.duty,
+            g.cycle,
+            g.body_h,
+            g.step_h,
+            0.0,
+            self.phys.actuator.omega_max,
+        );
+        self.live_gait.cycle = g.cycle.max(floor);
         self.live.reset(&self.terrain, &self.live_gait, &self.phys);
         self.plant = Some(ArticulatedPlant::standing(
             self.frame,
@@ -606,26 +639,54 @@ impl App {
                 let mut q_cmd = self.live.q_cmd;
                 let body_h = self.live_gait.body_h
                     + 0.20 * self.live.act[act_body_dh(self.frame)];
+                // Each leg is given a foot position to reach, worked out against
+                // the terrain in front of the body Rapier is actually carrying;
+                // the joint motors are what get it there. The centroidal plan's
+                // own `q_cmd` cannot be used directly: its stance feet are
+                // anchored to world points, which is fine for a body that
+                // advances by fiat and gives the real plant nothing to push on.
+                let (bp, byaw, bpitch, broll) = plant.chassis_pose();
+                // Steering has to reach the legs, not just the centroidal
+                // integrator: the plan's yaw rate becomes an arc on every
+                // stance stroke, which is the only way the machine can hold a
+                // heading instead of drifting off on whatever the contacts give
+                // it. Plus a proportional pull back onto the planned heading,
+                // since the real body loses yaw to slip that the plan does not.
+                let turn = self.live.yaw_rate
+                    + 1.5 * hexapod_core::math::ang_diff(self.live.yaw - byaw);
                 for i in 0..self.frame.legs() {
-                    let target = foot_in_body(
+                    let target = foot_on_terrain(
                         self.frame,
                         &self.live_gait,
                         i,
                         self.live.phase,
                         self.live.stride_now,
                         self.live.duty_now,
+                        self.live.cycle_now,
                         body_h,
                         self.live.feet[i].step_h,
+                        turn,
+                        &self.terrain,
+                        bp,
+                        byaw,
+                        bpitch,
+                        broll,
                     );
                     q_cmd[i] = hexapod_core::robot::solve_ik(self.frame, i, target).q;
                     self.live.q_cmd[i] = q_cmd[i];
                 }
                 plant.drive(&q_cmd, &self.phys, h);
+                let pre = plant.chassis_vel();
                 plant.step(h);
-                // Do not write Rapier q/pose back into `live`: a missed
-                // motor track would rewind the centroidal gait clock.
-                let (p, ..) = plant.chassis_pose();
-                if p[1] <= self.terrain.height(p[0], p[2]) + BODY_H * 0.45 {
+                // Rapier's q is still never written back — a missed motor track
+                // would rewind the centroidal gait clock. The body pose is a
+                // different matter: the planner has to know where the machine
+                // really is, or it picks footholds around a ghost that has
+                // walked on ahead.
+                let (p, yaw, pitch, roll) = plant.chassis_pose();
+                let v = plant.chassis_vel();
+                self.live.observe_pose(p, yaw, pitch, roll, [v[0], v[2]]);
+                if plant.chassis_dead(pre) {
                     self.live.fallen = true;
                 }
             }
@@ -661,20 +722,13 @@ impl App {
         t[T_PITCH] = pitch as f32;
         t[T_ROLL] = roll as f32;
 
-        // Hull, touchdown targets and CoM come out of the centroidal `Sim`,
-        // whose world pose slowly parts company with the Rapier body the
-        // canvas actually draws. Rebase them into the drawn frame or they
-        // wander off across the terrain as the gap grows.
-        let rebase = |x: f64, z: f64| {
-            let d = hexapod_core::math::rot_y([x - s.pos[0], 0.0, z - s.pos[2]], yaw - s.yaw);
-            [pos[0] + d[0], pos[2] + d[2]]
-        };
-
+        let mut world_j = [[[0.0f64; 3]; 4]; MAX_LEGS];
         for leg in 0..n {
             let (q_draw, joints) = match plant_draw.as_ref() {
                 Some((_, _, _, _, q, j)) => (q[leg], j[leg]),
                 None => (s.q[leg], s.joints[leg]),
             };
+            world_j[leg] = joints;
             for p in 0..4 {
                 for c in 0..3 {
                     t[T_JOINTS + leg * 12 + p * 3 + c] = joints[p][c] as f32;
@@ -685,21 +739,18 @@ impl App {
             t[T_LEGPHASE + leg] = s.feet[leg].leg_phase as f32;
             t[T_STEPH + leg] = s.feet[leg].step_h as f32;
             t[T_LEG_LOAD + leg] = s.feet[leg].load_frac as f32;
-            let td = s.feet[leg].td;
-            let td_draw = rebase(td[0], td[2]);
-            t[T_TD + leg * 3] = td_draw[0] as f32;
-            t[T_TD + leg * 3 + 1] = td[1] as f32;
-            t[T_TD + leg * 3 + 2] = td_draw[1] as f32;
             for c in 0..3 {
+                t[T_TD + leg * 3 + c] = s.feet[leg].td[c] as f32;
                 t[T_Q + leg * 3 + c] = q_draw[c] as f32;
                 t[T_QCMD + leg * 3 + c] = s.q_cmd[leg][c] as f32;
             }
         }
 
+        // Hull, touchdown targets and CoM are already in the drawn body's frame:
+        // the planner is fed Rapier's pose every tick.
         for i in 0..MAX_LEGS {
-            let h = rebase(s.hull[i][0], s.hull[i][1]);
-            t[T_HULL + i * 2] = h[0] as f32;
-            t[T_HULL + i * 2 + 1] = h[1] as f32;
+            t[T_HULL + i * 2] = s.hull[i][0] as f32;
+            t[T_HULL + i * 2 + 1] = s.hull[i][1] as f32;
         }
         t[T_HULL_N] = s.hull_n as f32;
         t[T_LEGS] = n as f32;
@@ -714,13 +765,12 @@ impl App {
         t[T_FALLEN] = if s.fallen { 1.0 } else { 0.0 };
         t[T_BLOCKED] = if s.blocked { 1.0 } else { 0.0 };
         t[T_ADVANCE] = s.advance_frac as f32;
-        // Renderer adds the drawn pos back, so only the drift rotates.
-        let cd = hexapod_core::math::rot_y(
-            [s.com_drift[0], 0.0, s.com_drift[1]],
-            yaw - s.yaw,
-        );
-        t[T_COM] = cd[0] as f32;
-        t[T_COM + 1] = cd[2] as f32;
+        t[T_COM] = s.com_drift[0] as f32;
+        t[T_COM + 1] = s.com_drift[1] as f32;
+        let com = robot_com(pos, &world_j[..n], &self.phys);
+        t[T_COM3] = com[0] as f32;
+        t[T_COM3 + 1] = com[1] as f32;
+        t[T_COM3 + 2] = com[2] as f32;
         t[T_STUB] = s.stub_total as f32;
         t[T_COLLISIONS] = s.collisions as f32;
         for i in 0..3 {

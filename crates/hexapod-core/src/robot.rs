@@ -37,6 +37,10 @@ const SPREAD: f64 = 50.0 * DEG;
 /// these a joint that has been overloaded past stall keeps giving way for as
 /// long as the load is there, and the chassis sinks forever instead of
 /// arriving on the ground.
+/// Collider radius of a leg link, simulator units. The plant builds capsules
+/// this thick and the trajectory generator keeps them out of blocks.
+pub const LINK_R: f64 = 0.05;
+
 pub const Q_LIMIT: [(f64, f64); 3] = [
     (-100.0 * DEG, 100.0 * DEG),
     (-110.0 * DEG, 110.0 * DEG),
