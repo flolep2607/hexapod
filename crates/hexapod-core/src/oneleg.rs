@@ -71,8 +71,8 @@ pub struct OneLegDrill {
     pub q_hold: [[f64; 3]; MAX_LEGS],
     /// Last planted body-frame foot, used to sample the next reachable plant.
     pub hold_body: [V3; MAX_LEGS],
-    /// World plants captured at the start of the current move. Stance IK holds
-    /// these; they do not move while the free foot is in the air.
+    /// World plants captured at the start of the current move. Used for the
+    /// swing chord and the landing mark; stance legs keep `q_hold`.
     pub origin_world: [V3; MAX_LEGS],
     pub origin_pos: V3,
     pub moving: usize,
