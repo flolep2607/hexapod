@@ -436,7 +436,7 @@ class Footfalls {
 const falls = new Footfalls();
 
 function drawGaitDiagram(t) {
-  if (state.mode === 2) return;
+  if (state.mode !== 1) return;
   const cv = $("cGait");
   const legs = Math.round(t[L.T_LEGS]) || 6;
   const rowH = 17;
@@ -808,7 +808,7 @@ function syncSliders() {
     el.disabled = state.mode !== 0;
   });
   $("paramLock").textContent =
-    state.mode === 1 ? "set by policy" : state.mode === 2 ? "one-leg drill" : "";
+    state.mode === 1 ? "set by policy" : state.mode === 2 ? "one-leg drill" : "crawl";
 }
 
 function setMode(mode) {
@@ -833,9 +833,9 @@ function setMode(mode) {
   const btnWalk = $("btnWalk");
   if (btnOl) btnOl.dataset.on = String(mode === 2);
   if (btnWalk) btnWalk.dataset.on = String(mode !== 2);
-  $("hPolicy").textContent = mode === 2 ? "ONE LEG" : mode === 1 ? "LEARNED" : "HAND-TUNED";
+  $("hPolicy").textContent = mode === 2 ? "ONE LEG" : mode === 1 ? "LEARNED" : "CRAWL";
   const secGait = $("secGait");
-  if (secGait) secGait.hidden = mode === 2;
+  if (secGait) secGait.hidden = true;
   const secCruise = $("secCruise");
   if (secCruise) secCruise.hidden = mode === 2;
   syncSliders();
@@ -1256,18 +1256,20 @@ function updateReadouts(t) {
       : "WALKING"
     : "STANDING";
   const oneleg = L.T_ONELEG != null && t[L.T_ONELEG] > 0.5;
+  const crawl = !oneleg && (state.mode === 0 || state.mode === 1);
+  const plantHud = oneleg || crawl;
   const hudWalk = $("hudWalk");
   const hudDrill = $("hudDrill");
   const hudWalkMore = $("hudWalkMore");
   const hudGaitBits = $("hudGaitBits");
-  if (hudWalk) hudWalk.hidden = oneleg;
-  if (hudDrill) hudDrill.hidden = !oneleg;
-  if (hudWalkMore) hudWalkMore.hidden = oneleg;
-  if (hudGaitBits) hudGaitBits.hidden = oneleg;
-  if (oneleg) {
+  if (hudWalk) hudWalk.hidden = plantHud;
+  if (hudDrill) hudDrill.hidden = !plantHud;
+  if (hudWalkMore) hudWalkMore.hidden = plantHud;
+  if (hudGaitBits) hudGaitBits.hidden = plantHud;
+  if (plantHud) {
     const phases = ["SETTLE", "LIFT", "SHIFT", "PLACE", "PAUSE"];
     const movingLeg = Math.round(t[L.T_MOVE_LEG]);
-    const phaseName = phases[Math.round(t[L.T_MOVE_PHASE])] || "ONE-LEG";
+    const phaseName = phases[Math.round(t[L.T_MOVE_PHASE])] || (oneleg ? "ONE-LEG" : "CRAWL");
     $("hudOlLeg").textContent = legNames()[movingLeg] || String(movingLeg);
     $("hudOlPhase").textContent = phaseName;
     $("hudOlMove").textContent = String(Math.round(t[L.T_MOVE_I]));
@@ -1275,12 +1277,18 @@ function updateReadouts(t) {
     $("hudOlDrift").textContent = fmt(t[L.T_STANCE_DRIFT], 2);
     $("hudOlXz").textContent = fmt(t[L.T_CHASSIS_XZ], 2);
     $("hState").textContent = phaseName;
-    $("hudGait").textContent = "ONE LEG";
+    const kind = $("hudDrillKind");
+    if (kind) kind.textContent = oneleg ? "ONE LEG" : "CRAWL";
     const callout = $("drillCallout");
     const calloutLine = $("drillCalloutLine");
     if (callout) callout.hidden = false;
     if (calloutLine) {
-      calloutLine.textContent = `${legNames()[movingLeg] || "L1"} · ${phaseName} · the red leg is the only one commanded`;
+      calloutLine.textContent = oneleg
+        ? `${legNames()[movingLeg] || "L1"} · ${phaseName} · the red leg is the only one commanded`
+        : `${legNames()[movingLeg] || "L1"} · ${phaseName} · one foot plants, the rest hold`;
+    }
+    if (callout && callout.firstChild && callout.firstChild.nodeType === 3) {
+      callout.firstChild.textContent = oneleg ? "ONE LEG MOVING" : "CRAWL ";
     }
   } else {
     const callout = $("drillCallout");
@@ -1290,7 +1298,7 @@ function updateReadouts(t) {
   $("banner").dataset.on = String(fallen || broken);
 
   $("hudGait").textContent =
-    state.mode === 2 ? "ONE LEG" : state.mode === 1 ? "LEARNED" : presetName(state.preset).toUpperCase();
+    state.mode === 2 ? "ONE LEG" : state.mode === 1 ? "LEARNED" : "CRAWL";
   $("hudDuty").textContent = fmt(t[L.T_DUTY_NOW], 2);
   $("hudY").textContent = (t[L.T_POS + 1] >= 0 ? "+" : "") + fmt(t[L.T_POS + 1], 2);
   $("hudPhase").textContent = fmt(t[L.T_PHASE], 2);
@@ -1497,20 +1505,6 @@ function wire() {
       api.hx_set_oneleg_leg(state.onelegLeg);
       if (state.mode !== 2) setMode(2);
       else log(`drill.leg("${legNames()[state.onelegLeg]}")`);
-    }
-    const pb = e.target.closest("[data-preset]");
-    if (pb) {
-      if (state.mode === 2) return;
-      state.preset = +pb.dataset.preset;
-      api.hx_set_preset(state.preset);
-      document
-        .querySelectorAll("[data-preset]")
-        .forEach((b) => (b.dataset.on = String(+b.dataset.preset === state.preset)));
-      setMode(0);
-      syncSliders();
-      drawCurve();
-      updateTrainingPanel();
-      log(`gait.set("${PRESETS[state.preset].toLowerCase()}")`);
     }
     const cb = e.target.closest("[data-course]");
     if (cb) {

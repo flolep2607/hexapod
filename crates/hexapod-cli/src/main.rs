@@ -375,7 +375,7 @@ fn watch(
     frame: Frame,
     course: Course,
     seed: u64,
-    preset: Preset,
+    _preset: Preset,
     phys: Physics,
     args: &[String],
 ) {
@@ -394,31 +394,23 @@ fn watch(
     let nav = args.iter().any(|a| a == "--nav");
 
     let terrain = Terrain::new(course, seed);
-    let policy = Policy::seeded(preset, frame);
-    let mut gait = policy.gait();
-    hexapod_core::walker::prepare_live_gait(frame, &mut gait, &phys);
-    let mut walker = hexapod_core::ArticulatedWalker::spawn(frame, &gait, &phys, &terrain);
-
+    let mut drill = OneLegDrill::spawn_on(frame, &phys, &terrain, seed, true);
     let cmd = Cmd {
         fwd: 1.0,
         turn: 0.0,
         cruise: speed,
         nav,
     };
+    drill.set_cmd(cmd);
 
     println!(
-        "# hexapod watch  {} on {}  course={} seed={}  cmd={:.2} m/s  nav={}  \
-         gait={:?} cycle={:.3}s stride={:.3} v_kin={:.2}",
+        "# hexapod watch  {} on {}  course={} seed={}  cmd={:.2} m/s  nav={}  crawl",
         frame.label(),
         frame.legs(),
         course.name(),
         seed,
         speed,
         if nav { "on" } else { "off" },
-        preset,
-        gait.cycle,
-        gait.stride,
-        gait.nominal_speed()
     );
     println!(
         "# t      x      y      z     yaw   pit   rol     vx     vy     vz   |v|  along   slip  \
@@ -432,15 +424,15 @@ fn watch(
 
     for k in 0..=ticks {
         if k > 0 {
-            walker.step(&terrain, &policy, &gait, DT, cmd);
+            drill.set_cmd(cmd);
+            drill.step(DT);
         }
-        if k % emit_every == 0 || k == ticks || walker.sim.fallen {
-            let s = walker
-                .sample()
-                .with_wp_n(terrain.waypoints.len());
+        let fallen = drill.sample().fallen;
+        if k % emit_every == 0 || k == ticks || fallen {
+            let s = watch_sample(&drill, terrain.waypoints.len());
             print_watch_row(&s);
             samples.push(s);
-            if walker.sim.fallen {
+            if fallen {
                 println!("# FALLEN at t={:.2}s", s.t);
                 break;
             }
@@ -449,6 +441,41 @@ fn watch(
 
     let elapsed = wall.elapsed().as_secs_f64();
     print_watch_summary(&samples, speed, elapsed);
+}
+
+fn watch_sample(drill: &OneLegDrill, wp_n: usize) -> WalkSample {
+    let s = drill.sample();
+    let n = drill.frame.legs();
+    let mut stance = [false; hexapod_core::MAX_LEGS];
+    for i in 0..n {
+        stance[i] = !(i == s.moving && s.phase.swinging());
+    }
+    let (hs, hc) = s.yaw.sin_cos();
+    let along = s.vel[0] * (-hs) + s.vel[2] * hc;
+    let speed = (s.vel[0] * s.vel[0] + s.vel[2] * s.vel[2]).sqrt();
+    WalkSample {
+        t: s.t,
+        pos: s.pos,
+        yaw: s.yaw,
+        pitch: s.pitch,
+        roll: s.roll,
+        vel: s.vel,
+        speed,
+        along,
+        slip: s.slip,
+        yaw_rate: 0.0,
+        heading_deg: s.yaw.to_degrees(),
+        wp: 0,
+        wp_n,
+        wp_dist: 0.0,
+        bearing: 0.0,
+        bearing_deg: 0.0,
+        reached: 0,
+        cmd_speed: 0.0,
+        n_legs: n,
+        stance,
+        fallen: s.fallen,
+    }
 }
 
 fn print_watch_row(s: &WalkSample) {

@@ -97,7 +97,7 @@ SCROLL TO ZOOM · WASD / QE · [ ] SPEED
           <div class="hud bl" id="hudWalk" hidden>BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm
 vx <b id="hudVx">+0.00</b>  vy <b id="hudVy">+0.00</b>  vz <b id="hudVz">+0.00</b>  slip <b id="hudSlip">0.00</b></div>
-          <div class="hud bl" id="hudDrill">ONE LEG <b id="hudOlLeg">L1</b> · <b id="hudOlPhase">LIFT</b> · move <b id="hudOlMove">0</b>
+          <div class="hud bl" id="hudDrill"> <span id="hudDrillKind">CRAWL</span> <b id="hudOlLeg">L1</b> · <b id="hudOlPhase">LIFT</b> · move <b id="hudOlMove">0</b>
 clearance <b id="hudOlClear">0.00</b> m · stance drift <b id="hudOlDrift">0.00</b> m
 chassis Δxz <b id="hudOlXz">0.00</b> m · grey X = plant start</div>
           <div class="hud br2" id="hudWalkMore">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · HEAD <b id="hudHead">+0°</b> · ω <b id="hudW">0.00</b>
@@ -446,7 +446,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnWalk">Walk</button>
         </div>
         <div class="row3" id="onelegBtns"></div>
-        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost.</p>
+        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost. Walk is the same plant, one foot at a time, along the command.</p>
       </div>
 
       <div class="sec">

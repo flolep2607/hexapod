@@ -1023,7 +1023,8 @@ class Stage {
     this._terrain(pos[2], hits.hitOb);
     const robotFrom = this.faces.length;
     this._chassis(pos, t[L.T_YAW], t[L.T_PITCH], t[L.T_ROLL], bodyR, blocked || hits.chassis);
-    const movingLeg = L.T_ONELEG != null && t[L.T_ONELEG] > 0.5 ? Math.round(t[L.T_MOVE_LEG]) : -1;
+    const swinging = L.T_MOVE_PHASE != null && t[L.T_MOVE_PHASE] >= 1 && t[L.T_MOVE_PHASE] <= 3;
+    const movingLeg = swinging ? Math.round(t[L.T_MOVE_LEG]) : -1;
     this._legs(joints, t.subarray(L.T_STANCE, L.T_STANCE + legs), legs, hits.hitLegs, movingLeg);
 
     const bad = t[L.T_MARGIN] < 0.05;
@@ -1091,7 +1092,7 @@ class Stage {
       }
     }
 
-    if (L.T_ONELEG != null && t[L.T_ONELEG] > 0.5) {
+    if (L.T_ORIGIN != null && t[L.T_PLANT] > 0.5) {
       const moving = Math.round(t[L.T_MOVE_LEG]);
       for (let leg = 0; leg < legs; leg++) {
         const ox = t[L.T_ORIGIN + leg * 3];
