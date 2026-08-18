@@ -3,13 +3,18 @@
 //!
 //! ```text
 //! hexapod train  [--course mixed] [--iters 200] [--seed 1] [--preset tripod]
-//! hexapod watch  [--course flat] [--seconds 8] [--speed 1.5] [--nav]
+//! hexapod oneleg [--moves 6] [--leg L1] [--seed 1]
+//! hexapod watch  [--course flat] [--seconds 8] [--speed 1.5]
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
 //! hexapod speed  [--iters 200]      commanded vs achieved speed
 //! hexapod jump   [--iters 200]      parkour: distance, waypoints, jumps
 //! hexapod servo                     the same gait on every servo
 //! ```
+//!
+//! `oneleg` is the empty-field drill: five legs hold their standing joint
+//! setpoints (friction only, nothing welded to the floor) while one foot lifts
+//! and plants a random reachable spot in its workspace.
 //!
 //! `watch` runs the Rapier plant and prints pose, 3-axis velocity, heading,
 //! stance-foot slip and range/bearing to the next waypoint — numbers you can
@@ -42,6 +47,7 @@ use hexapod_core::sim::{
     evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
     JUMP_EVAL_SPEEDS,
 };
+use hexapod_core::oneleg::{OneLegDrill, Phase};
 use hexapod_core::walker::WalkSample;
 use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
 
@@ -130,6 +136,7 @@ fn main() {
         "parts" => parts_json(),
         "courses" => courses_json(),
         "system" => system(frame, course, seed, iters, cfg, phys, &args),
+        "oneleg" | "reach" => oneleg(frame, seed, phys, &args),
         "watch" => {
             let course = if flag(&args, "--course").is_some() {
                 course
@@ -537,6 +544,159 @@ fn print_watch_summary(samples: &[WalkSample], cmd: f64, wall_s: f64) {
         if last.fallen { "  FALLEN" } else { "" }
     );
     println!("along spark  {}", sparkline(&alongs));
+}
+
+/// Empty field: five legs hold their standing setpoints, one foot relocates
+/// inside its reachable workspace. Nothing is welded to the floor.
+fn oneleg(frame: Frame, seed: u64, phys: Physics, args: &[String]) {
+    let moves: usize = flag(args, "--moves")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(frame.legs());
+    let every: f64 = f64::max(
+        flag(args, "--every")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.10),
+        DT,
+    );
+    let mut drill = OneLegDrill::spawn(frame, &phys, seed);
+    if let Some(name) = flag(args, "--leg") {
+        let idx = (0..frame.legs()).find(|&i| {
+            frame.name(i).eq_ignore_ascii_case(&name) || name == i.to_string()
+        });
+        match idx {
+            Some(i) => drill.pin_leg(i),
+            None => {
+                eprintln!(
+                    "unknown leg {name:?}; try {}",
+                    (0..frame.legs())
+                        .map(|i| frame.name(i))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
+    println!(
+        "# hexapod oneleg  {} on {}  seed={}  moves={}  empty field, friction only",
+        frame.label(),
+        frame.legs(),
+        seed,
+        moves
+    );
+    println!(
+        "# stance legs hold standing joint setpoints; the free foot lifts and \
+         plants a random reachable spot in its workspace"
+    );
+    println!(
+        "# t     phase  mv leg    cmdx   cmdy   cmdz    actx   acty   actz  \
+         err  Δxz  drift travel   slip     vx     vy     vz  y    yaw"
+    );
+
+    let emit_every = (every / DT).round().max(1.0) as usize;
+    let mut k = 0usize;
+    let mut last_move = 0usize;
+    let mut last_leg = 0usize;
+    let mut last_phase = Phase::Settle;
+    let wall = Instant::now();
+    let mut summaries: Vec<(usize, &'static str, f64, f64, f64, f64)> = Vec::new();
+    // per-move peaks: travel, stance_drift, chassis_xz, end reach_err
+    let mut peak_travel = 0.0;
+    let mut peak_drift = 0.0;
+    let mut peak_xz = 0.0;
+
+    loop {
+        if k > 0 {
+            drill.step(DT);
+        }
+        let s = drill.sample();
+        if s.move_i != last_move {
+            summaries.push((
+                last_move,
+                frame.name(last_leg),
+                peak_travel,
+                peak_drift,
+                peak_xz,
+                s.reach_err,
+            ));
+            peak_travel = 0.0;
+            peak_drift = 0.0;
+            peak_xz = 0.0;
+            last_move = s.move_i;
+        }
+        last_leg = s.moving;
+        peak_travel = peak_travel.max(s.moving_travel);
+        peak_drift = peak_drift.max(s.stance_drift);
+        peak_xz = peak_xz.max(s.chassis_xz);
+
+        if k % emit_every == 0 || s.phase != last_phase || s.fallen {
+            println!(
+                "{:5.2} {:>6} {:3} {:<3} {:+6.3} {:+6.3} {:+6.3}  {:+6.3} {:+6.3} {:+6.3} \
+                 {:5.3} {:5.3} {:5.3} {:6.3} {:6.3} {:+6.3} {:+6.3} {:+6.3} {:5.3} {:+5.1}{}",
+                s.t,
+                s.phase.name(),
+                s.move_i,
+                frame.name(s.moving),
+                s.cmd_body[0],
+                s.cmd_body[1],
+                s.cmd_body[2],
+                s.foot_body[0],
+                s.foot_body[1],
+                s.foot_body[2],
+                s.reach_err,
+                s.chassis_xz,
+                s.stance_drift,
+                s.moving_travel,
+                s.slip,
+                s.vel[0],
+                s.vel[1],
+                s.vel[2],
+                s.pos[1],
+                s.yaw.to_degrees(),
+                if s.fallen { " FALLEN" } else { "" }
+            );
+        }
+        last_phase = s.phase;
+        if s.fallen {
+            println!("# FALLEN at t={:.2}s", s.t);
+            break;
+        }
+        if s.move_i >= moves && s.phase == Phase::Lift && s.phase_u < 0.05 && k > 10 {
+            break;
+        }
+        k += 1;
+        if k > (120.0 / DT) as usize {
+            break;
+        }
+    }
+
+    println!();
+    println!(
+        "--- {} moves in {:.2} s ({:.2} s wall) ---",
+        summaries.len().max(last_move),
+        drill.t,
+        wall.elapsed().as_secs_f64()
+    );
+    println!(
+        "{:<6} {:<4} {:>8} {:>10} {:>10}",
+        "move", "leg", "travel", "stanceΔ", "chassisΔ"
+    );
+    for (i, name, travel, drift, xz, _) in &summaries {
+        println!(
+            "{:<6} {:<4} {:8.3} {:10.3} {:10.3}",
+            i, name, travel, drift, xz
+        );
+    }
+    let s = drill.sample();
+    println!(
+        "end  y={:.3}  yaw={:+.1}°  pitch={:+.1}°  |v|={:.3}  fallen={}",
+        s.pos[1],
+        s.yaw.to_degrees(),
+        s.pitch.to_degrees(),
+        (s.vel[0] * s.vel[0] + s.vel[2] * s.vel[2]).sqrt(),
+        s.fallen
+    );
 }
 
 /// Train on MIXED, then check the policy on courses it never trained on.

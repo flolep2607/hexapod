@@ -35,6 +35,8 @@ pub mod terrain;
 pub mod plant;
 #[cfg(feature = "rapier")]
 pub mod walker;
+#[cfg(feature = "rapier")]
+pub mod oneleg;
 
 pub use ars::{ArsConfig, Trainer};
 pub use dynamics::{Actuator, LegMass, Physics};
@@ -49,3 +51,5 @@ pub use sim::{
 pub use terrain::{Course, Terrain};
 #[cfg(feature = "rapier")]
 pub use walker::{ArticulatedWalker, WalkSample};
+#[cfg(feature = "rapier")]
+pub use oneleg::{OneLegDrill, OneLegSample};
