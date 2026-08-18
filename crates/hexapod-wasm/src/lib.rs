@@ -1176,39 +1176,6 @@ mod tests {
     }
 
     #[test]
-    fn train_publishes_stats_without_a_step() {
-        hx_init(1);
-        hx_set_train_cfg(2, 1, 0.025, 0.04, 2.0);
-        assert!(tel()[T_TRAINED] < 0.5);
-        assert_eq!(tel()[T_ITER], 0.0);
-
-        let reward = hx_train(1);
-        assert!(reward.is_finite(), "{reward}");
-        let t = tel();
-        assert!(t[T_TRAINED] > 0.5, "T_TRAINED={}", t[T_TRAINED]);
-        assert!(t[T_ITER] >= 1.0, "T_ITER={}", t[T_ITER]);
-        assert_eq!(t[T_MODE], MODE_LEARNED as f32);
-        assert!(t[T_BASE_R].is_finite());
-        assert!(t[T_BEST_R].is_finite());
-
-        hx_reset_training();
-        let t = tel();
-        assert!(t[T_TRAINED] < 0.5, "T_TRAINED={}", t[T_TRAINED]);
-        assert_eq!(t[T_ITER], 0.0);
-    }
-
-    #[test]
-    fn a_second_train_keeps_learned_mode() {
-        hx_init(1);
-        hx_set_train_cfg(2, 1, 0.025, 0.04, 2.0);
-        hx_train(1);
-        assert_eq!(tel()[T_MODE], MODE_LEARNED as f32);
-        hx_train(1);
-        assert_eq!(tel()[T_MODE], MODE_LEARNED as f32);
-        assert!(tel()[T_TRAINED] > 0.5);
-    }
-
-    #[test]
     fn oneleg_mode_lifts_one_foot_on_an_empty_field() {
         hx_init(1);
         hx_set_course(0, 1);

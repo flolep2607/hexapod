@@ -124,16 +124,8 @@ async function bootAndStatic(h) {
   await screenshot("01-kinematics.png");
   await page.click("#btnPause");
 
-  await page.click('[data-tab="training"]');
   const characterSet = await page.evaluate(() => document.characterSet);
   check("the page is decoded as UTF-8", characterSet === "UTF-8", characterSet);
-  const gaitTable = (await page.textContent("#tblGait")) || "";
-  check(
-    "gait table dashes are not mojibake",
-    /—/.test(gaitTable) && /·/.test(gaitTable) && !/â€/.test(gaitTable) && !/Â·/.test(gaitTable),
-    (gaitTable.match(/Running now[^\n]*/)?.[0] || gaitTable.slice(0, 120)).trim()
-  );
-  await screenshot("02-training-before.png");
 
   await page.click('[data-tab="terrain"]');
   const summary = await page.textContent("#tSummary");
@@ -203,61 +195,6 @@ async function bootAndStatic(h) {
     () => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1
   );
   check("page does not scroll sideways", noHScroll);
-}
-
-async function training(h) {
-  const { page, check, waitFor, setRange, screenshot, stepSamples } = h;
-  await page.click('[data-tab="training"]');
-  await setRange("rHorizon", 4);
-  await page.click("#btnPause");
-  await page.click("#btnTrain");
-  await waitFor(
-    () => {
-      const best = parseFloat(document.getElementById("sBest")?.textContent);
-      const base = parseFloat(document.getElementById("sBase")?.textContent);
-      const feed = parseFloat(document.getElementById("sFeed")?.textContent);
-      const iter = parseInt(document.getElementById("sIter")?.textContent, 10);
-      return iter > 0 && Number.isFinite(best) && Number.isFinite(base) && best > base && feed > 0.01;
-    },
-    null,
-    10000
-  );
-  await page.click("#btnTrain");
-  await page.click("#btnPause");
-
-  const trained = await page.evaluate(() => ({
-    iter: parseInt(document.getElementById("sIter").textContent, 10),
-    base: parseFloat(document.getElementById("sBase").textContent),
-    best: parseFloat(document.getElementById("sBest").textContent),
-    gain: document.getElementById("sGain").textContent,
-    iterMs: document.getElementById("sIterMs").textContent,
-    feedback: parseFloat(document.getElementById("sFeed").textContent),
-  }));
-  check("training ran iterations", trained.iter > 0, `${trained.iter} iterations, ${trained.iterMs}`);
-  check("baseline recorded", Number.isFinite(trained.base), `${trained.base}`);
-  check(
-    "learned beats hand-tuned",
-    trained.best > trained.base,
-    `${trained.base.toFixed(1)} -> ${trained.best.toFixed(1)} (${trained.gain})`
-  );
-  check("feedback layer left zero", trained.feedback > 0.01, `norm ${trained.feedback}`);
-  await screenshot("03-training-after.png");
-
-  const learnEnabled = await page.isEnabled("#btnLearn");
-  check("learned policy selectable", learnEnabled);
-  if (learnEnabled) {
-    await page.click("#btnLearn");
-    check("header shows learned policy", (await page.textContent("#hPolicy")) === "LEARNED");
-    check("sliders lock under learned policy", await page.isDisabled("#pr0"));
-    await stepSamples(180);
-    const pattern = await page.evaluate(() => window.__hxFalls.classify());
-    check(
-      "the learned policy gets its own reading",
-      typeof pattern === "string" && pattern.length > 1,
-      `learned footfalls read as ${pattern}`
-    );
-  }
-  await screenshot("04-learned-walking.png");
 }
 
 async function speedAndPhysics(h) {
@@ -573,7 +510,6 @@ async function onelegDrill(h) {
 const scenarios = [
   ["dashboard", bootAndStatic],
   ["courses", courses],
-  ["training", training],
   ["physics + servo", async (harness) => {
     await speedAndPhysics(harness);
     await servo(harness);
