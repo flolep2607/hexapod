@@ -279,7 +279,9 @@ impl ArticulatedPlant {
                 .angular_damping(0.40),
         );
         let chassis_col = colliders.insert_with_parent(
-            ColliderBuilder::cuboid(body_r * 0.72, body_h * 0.45, body_r * 0.72)
+            // Cylinder of the drawn deck, not a cuboid: square corners stuck
+            // out into the hip circle and counted a femur scrape as a body hit.
+            ColliderBuilder::cylinder(body_h * 0.45, body_r * 0.88)
                 .mass(chassis_kg)
                 .friction(0.3)
                 .collision_groups(groups_chassis),
@@ -669,8 +671,9 @@ impl ArticulatedPlant {
         (fwd.y as f64).abs()
     }
 
-    /// Belly on the floor, or a chassis hit on a block/wall faster than
-    /// [`IMPACT_KILL`]. `pre_vel` is the chassis velocity *before* the step
+    /// The *chassis hull* is on the floor, or it hit a block/wall faster than
+    /// [`IMPACT_KILL`]. Links and feet are ignored: a tibia on the ground is
+    /// walking, not dead. `pre_vel` is the chassis velocity *before* the step
     /// that produced the contacts — after the solver the normal component is
     /// already gone.
     pub fn chassis_dead(&self, pre_vel: V3) -> bool {
@@ -1163,6 +1166,10 @@ mod tests {
             "plant exploded: y={} pitch={}",
             plant.chassis_y(),
             plant.pitch_abs()
+        );
+        assert!(
+            !plant.chassis_dead(plant.chassis_vel()),
+            "a tibia against a crate is not a body hit"
         );
     }
 

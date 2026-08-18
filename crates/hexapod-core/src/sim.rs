@@ -621,8 +621,10 @@ impl Sim {
         if self.fallen || self.broken {
             return 0.0;
         }
-        // Belly already on the floor: do not let the height spring stand it up.
-        if self.pos[1] < BODY_H * 0.45 {
+        // Centroidal only: the Rapier plant decides death from chassis-hull
+        // contacts, not from this height heuristic (which cannot tell a femur
+        // collapse from the deck hitting the floor).
+        if integrate && self.pos[1] < BODY_H * 0.45 {
             self.fallen = true;
             return 0.0;
         }

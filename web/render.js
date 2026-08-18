@@ -575,7 +575,9 @@ class Stage {
       const qz = Math.max(z0, Math.min(z1, pos[2]));
       const dx = pos[0] - qx;
       const dz = pos[2] - qz;
-      if (dx * dx + dz * dz <= r * r && pos[1] - 0.18 < top) {
+      // Deck radius, not the hip circumradius: a femur in a crate is a
+      // leg hit, not a chassis hit.
+      if (dx * dx + dz * dz <= (r * 0.88) * (r * 0.88) && pos[1] - 0.18 < top) {
         hitOb[i] = 1;
         chassis = true;
       }
