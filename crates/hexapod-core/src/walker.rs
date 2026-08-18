@@ -180,9 +180,12 @@ pub fn drive_articulated(
         STANCE_LEAN * v_cmd.signum()
     };
     let plane = terrain.height(bp[0], bp[2]);
-    let turn = sim.yaw_rate + 1.5 * crate::math::ang_diff(sim.yaw - byaw);
+    let turn = 1.5 * crate::math::ang_diff(sim.yaw - byaw);
     let yaw_w = plant.chassis_angvel()[1];
-    let w_err = sim.yaw_rate - yaw_w;
+    // Damp measured spin only. Feeding `sim.yaw_rate` in as a desired rate
+    // made route pursuit add a tripod split with the wrong sign and the
+    // machine walked off-axis chasing its own yaw.
+    let w_err = -yaw_w;
 
     let mut q_cmd = sim.q_cmd;
     for i in 0..n {

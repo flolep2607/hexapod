@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! hexapod train  [--course mixed] [--iters 200] [--seed 1] [--preset tripod]
-//! hexapod watch  [--course flat] [--seconds 8] [--speed 1.5]
+//! hexapod watch  [--course flat] [--seconds 8] [--speed 1.5] [--nav]
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
 //! hexapod speed  [--iters 200]      commanded vs achieved speed
@@ -384,7 +384,7 @@ fn watch(
     let speed: f64 = flag(args, "--speed")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1.5);
-    let nav = !args.iter().any(|a| a == "--no-nav");
+    let nav = args.iter().any(|a| a == "--nav");
 
     let terrain = Terrain::new(course, seed);
     let policy = Policy::seeded(preset, frame);
