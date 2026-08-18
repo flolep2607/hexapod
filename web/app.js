@@ -436,6 +436,7 @@ class Footfalls {
 const falls = new Footfalls();
 
 function drawGaitDiagram(t) {
+  if (state.mode === 2) return;
   const cv = $("cGait");
   const legs = Math.round(t[L.T_LEGS]) || 6;
   const rowH = 17;
@@ -833,6 +834,10 @@ function setMode(mode) {
   if (btnOl) btnOl.dataset.on = String(mode === 2);
   if (btnWalk) btnWalk.dataset.on = String(mode !== 2);
   $("hPolicy").textContent = mode === 2 ? "ONE LEG" : mode === 1 ? "LEARNED" : "HAND-TUNED";
+  const secGait = $("secGait");
+  if (secGait) secGait.hidden = mode === 2;
+  const secCruise = $("secCruise");
+  if (secCruise) secCruise.hidden = mode === 2;
   syncSliders();
   refreshGaitTable();
   updateHardware();
@@ -1253,8 +1258,12 @@ function updateReadouts(t) {
   const oneleg = L.T_ONELEG != null && t[L.T_ONELEG] > 0.5;
   const hudWalk = $("hudWalk");
   const hudDrill = $("hudDrill");
+  const hudWalkMore = $("hudWalkMore");
+  const hudGaitBits = $("hudGaitBits");
   if (hudWalk) hudWalk.hidden = oneleg;
   if (hudDrill) hudDrill.hidden = !oneleg;
+  if (hudWalkMore) hudWalkMore.hidden = oneleg;
+  if (hudGaitBits) hudGaitBits.hidden = oneleg;
   if (oneleg) {
     const phases = ["SETTLE", "LIFT", "SHIFT", "PLACE", "PAUSE"];
     const movingLeg = Math.round(t[L.T_MOVE_LEG]);
@@ -1491,6 +1500,7 @@ function wire() {
     }
     const pb = e.target.closest("[data-preset]");
     if (pb) {
+      if (state.mode === 2) return;
       state.preset = +pb.dataset.preset;
       api.hx_set_preset(state.preset);
       document

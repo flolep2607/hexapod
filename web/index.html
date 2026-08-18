@@ -90,7 +90,7 @@
         <div class="viewwrap">
           <canvas id="view"></canvas>
           <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
-GAIT <b id="hudGait">ONE LEG</b> · DUTY <b id="hudDuty">0.50</b></div>
+<span id="hudGaitBits">GAIT <b id="hudGait">ONE LEG</b> · DUTY <b id="hudDuty">0.50</b></span></div>
           <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
 SCROLL TO ZOOM · WASD / QE · [ ] SPEED
 <b id="hudHit"></b></div>
@@ -100,7 +100,7 @@ vx <b id="hudVx">+0.00</b>  vy <b id="hudVy">+0.00</b>  vz <b id="hudVz">+0.00</
           <div class="hud bl" id="hudDrill">ONE LEG <b id="hudOlLeg">L1</b> · <b id="hudOlPhase">LIFT</b> · move <b id="hudOlMove">0</b>
 clearance <b id="hudOlClear">0.00</b> m · stance drift <b id="hudOlDrift">0.00</b> m
 chassis Δxz <b id="hudOlXz">0.00</b> m · grey X = plant start</div>
-          <div class="hud br2">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · HEAD <b id="hudHead">+0°</b> · ω <b id="hudW">0.00</b>
+          <div class="hud br2" id="hudWalkMore">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · HEAD <b id="hudHead">+0°</b> · ω <b id="hudW">0.00</b>
 CYCLE <b id="hudCycle">0.47</b> s · STRIDE <b id="hudStride">1.08</b> m
 NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b> m · BRG <b id="hudBrg">+0°</b></div>
           <div class="drill-callout" id="drillCallout">ONE LEG MOVING<small id="drillCalloutLine">L1 · LIFT · the red leg is the only one commanded</small></div>
@@ -400,7 +400,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             <thead><tr><th>Mark</th><th>Meaning</th></tr></thead>
             <tbody>
               <tr><td>Solid red ring</td><td>Foot planted; ring grows with its share of the load</td></tr>
-              <tr><td>Red highlighted leg</td><td>The free leg in the one-leg drill. The other five hold standing joint angles</td></tr>
+              <tr><td>Red highlighted leg</td><td>The free leg in the one-leg drill. The other five hold their settled joints</td></tr>
               <tr><td>Grey X on the floor</td><td>Where that foot was at the start of this plant. If the foot leaves the X, friction lost</td></tr>
               <tr><td>Dashed grey ring</td><td>Where a swinging leg intends to touch down</td></tr>
               <tr><td>Dashed red polygon</td><td>Support polygon — the convex hull of the planted feet</td></tr>
@@ -446,7 +446,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnWalk">Walk</button>
         </div>
         <div class="row3" id="onelegBtns"></div>
-        <p class="note" id="onelegNote">Empty plane. Five legs hold standing joint angles — friction only, nothing welded. The red leg lifts and plants a new reachable spot. Grey X is where each plant started: if a foot leaves its X, grip lost.</p>
+        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost.</p>
       </div>
 
       <div class="sec">
@@ -469,7 +469,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         simulator judges stability statically.</p>
       </div>
 
-      <div class="sec">
+      <div class="sec" id="secGait">
         <div class="sec-bar"><h2>Gait pattern</h2><span class="k" id="presetNote"></span></div>
         <div class="row3" id="presetBtns"></div>
         <div class="br"><i></i><canvas id="cGait" height="124"></canvas></div>
@@ -481,7 +481,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         nobody has a name for reads as <b>IRREGULAR</b> rather than as whatever it started from.</p>
       </div>
 
-      <div class="sec">
+      <div class="sec" id="secCruise">
         <div class="sec-bar"><h2 id="cruiseTitle">Commanded speed</h2><span class="k" id="cruiseNote"></span></div>
         <label class="slider"><span class="hd"><span class="k" id="cruiseHold">Hold this cruise</span><b id="vCruise">4.0 m/s</b></span>
           <input type="range" id="rCruise" min="1.5" max="6" step="0.1" value="4"></label>

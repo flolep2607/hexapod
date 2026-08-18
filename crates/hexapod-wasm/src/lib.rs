@@ -57,7 +57,7 @@ struct App {
     /// body; joint angles still never travel back. ARS trains on the
     /// centroidal step alone, with no plant in the loop.
     plant: Option<ArticulatedPlant>,
-    /// Empty-field drill: five legs hold standing joint setpoints, one relocates.
+    /// Empty-field drill: five legs hold their world plants, one relocates.
     /// When this is `Some`, `plant` is unused and the canvas reads the drill.
     oneleg: Option<OneLegDrill>,
     /// Which leg the dashboard drill keeps relocating.
@@ -630,7 +630,7 @@ impl App {
         self.since_fall = 0.0;
     }
 
-    /// Empty plane, five legs holding standing joint setpoints, one free foot.
+    /// Empty plane, five legs holding settled joints, one free foot.
     /// The canvas draws this plant; the walking Rapier body is dropped.
     fn start_oneleg(&mut self) {
         if self.course != Course::Flat {
