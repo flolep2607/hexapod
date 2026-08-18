@@ -19,6 +19,7 @@ use hexapod_core::dynamics::{robot_com, Physics};
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
 use hexapod_core::math::{convex_hull_xz, polygon_margin, squash, unsquash};
+use hexapod_core::oneleg::OneLegDrill;
 use hexapod_core::plant::ArticulatedPlant;
 use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
 use hexapod_core::sim::{
@@ -32,6 +33,7 @@ use layout::*;
 
 const MODE_BASELINE: u32 = 0;
 const MODE_LEARNED: u32 = 1;
+const MODE_ONELEG: u32 = 2;
 
 struct App {
     frame: Frame,
@@ -55,6 +57,11 @@ struct App {
     /// body; joint angles still never travel back. ARS trains on the
     /// centroidal step alone, with no plant in the loop.
     plant: Option<ArticulatedPlant>,
+    /// Empty-field drill: five legs hold standing joint setpoints, one relocates.
+    /// When this is `Some`, `plant` is unused and the canvas reads the drill.
+    oneleg: Option<OneLegDrill>,
+    /// Which leg the dashboard drill keeps relocating.
+    oneleg_leg: usize,
     /// World plants for stance feet. Without these the live gait sweeps a
     /// stride through the floor every cycle and the machine skates.
     locks: hexapod_core::walker::StanceLocks,
@@ -122,6 +129,8 @@ fn make(seed: u64) -> App {
         live: Sim::default(),
         live_gait,
         plant: None,
+        oneleg: None,
+        oneleg_leg: 0,
         locks: hexapod_core::walker::StanceLocks::new(),
         mode: MODE_BASELINE,
         since_fall: 0.0,
@@ -271,6 +280,19 @@ pub extern "C" fn hx_set_mode(mode: u32) {
     if a.mode != mode {
         a.mode = mode;
         a.reset_live();
+    }
+}
+
+/// Pin which leg the empty-field drill relocates. Ignored unless the one-leg
+/// mode is on; switching it on the live drill respawns from standing.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_set_oneleg_leg(leg: u32) {
+    let a = app();
+    let n = a.frame.legs().max(1);
+    a.oneleg_leg = (leg as usize) % n;
+    if a.mode == MODE_ONELEG {
+        a.start_oneleg();
+        a.publish();
     }
 }
 
@@ -582,6 +604,11 @@ impl App {
     }
 
     fn reset_live(&mut self) {
+        if self.mode == MODE_ONELEG {
+            self.start_oneleg();
+            return;
+        }
+        self.oneleg = None;
         self.live_gait = self.active_gait();
         self.apply_live_gait_limits();
         self.live.reset(&self.terrain, &self.live_gait, &self.phys);
@@ -600,6 +627,33 @@ impl App {
             }
             self.locks.capture(&self.live, plant);
         }
+        self.since_fall = 0.0;
+    }
+
+    /// Empty plane, five legs holding standing joint setpoints, one free foot.
+    /// The canvas draws this plant; the walking Rapier body is dropped.
+    fn start_oneleg(&mut self) {
+        if self.course != Course::Flat {
+            self.course = Course::Flat;
+            self.terrain = Terrain::new(Course::Flat, self.course_seed);
+            self.course_buf = self.terrain.export();
+            self.route_buf = self.terrain.export_route();
+        }
+        let n = self.frame.legs().max(1);
+        let mut drill = OneLegDrill::spawn(self.frame, &self.phys, self.course_seed);
+        drill.pin_leg(self.oneleg_leg % n);
+        let (p, yaw, pitch, roll) = drill.plant.chassis_pose();
+        self.live.observe_pose(p, yaw, pitch, roll, drill.plant.chassis_vel());
+        self.live.t = 0.0;
+        self.live.fallen = false;
+        self.live.broken = false;
+        for i in 0..self.frame.legs() {
+            self.live.feet[i].world = drill.plant.leg_joints_world(i)[3];
+            self.live.feet[i].stance = true;
+        }
+        self.oneleg = Some(drill);
+        self.plant = None;
+        self.locks.reset();
         self.since_fall = 0.0;
     }
 
@@ -628,6 +682,38 @@ impl App {
     }
 
     fn step(&mut self, dt: f64, fwd: f64, turn: f64) {
+        if self.oneleg.is_some() {
+            let fallen = self
+                .oneleg
+                .as_ref()
+                .map(|d| d.sample().fallen)
+                .unwrap_or(false);
+            if fallen {
+                self.since_fall += dt;
+                if self.since_fall > 1.2 {
+                    self.start_oneleg();
+                }
+                return;
+            }
+            let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
+            let h = dt / n as f64;
+            if let Some(drill) = self.oneleg.as_mut() {
+                for _ in 0..n {
+                    drill.step(h);
+                }
+                let s = drill.sample();
+                self.live.observe_pose(s.pos, s.yaw, s.pitch, s.roll, s.vel);
+                self.live.t = s.t;
+                self.live.fallen = s.fallen;
+                self.live.slip = s.slip;
+                for i in 0..self.frame.legs() {
+                    self.live.feet[i].world = drill.plant.leg_joints_world(i)[3];
+                    self.live.feet[i].stance = !(i == s.moving && s.phase.swinging());
+                }
+            }
+            return;
+        }
+
         // Auto-recover so the viewport never gets stuck on a fallen robot.
         if self.live.fallen || self.live.broken || self.live.pos[2] > Z_MAX - 8.0 {
             self.since_fall += dt;
@@ -683,7 +769,12 @@ impl App {
         let n = self.frame.legs();
         // Canvas reads Rapier body transforms. `Sim` stays centroidal: writing
         // plant pose back through the integrator rewinds the gait clock.
-        let plant_draw = self.plant.as_ref().map(|plant| {
+        let draw_plant = self
+            .oneleg
+            .as_ref()
+            .map(|d| &d.plant)
+            .or(self.plant.as_ref());
+        let plant_draw = draw_plant.map(|plant| {
             let (pos, yaw, pitch, roll) = plant.chassis_pose();
             let mut q = [[0.0f64; 3]; MAX_LEGS];
             let mut joints = [[[0.0f64; 3]; 4]; MAX_LEGS];
@@ -877,8 +968,61 @@ impl App {
         t[T_JUMPS] = s.jumps as f32;
         t[T_TASK] = if s.jump_clock > 0.0 { 1.0 } else { 0.0 };
         t[T_CLEARANCE] = s.clearance as f32;
-        t[T_PLANT] = if self.plant.is_some() { 1.0 } else { 0.0 };
+        t[T_PLANT] = if self.plant.is_some() || self.oneleg.is_some() {
+            1.0
+        } else {
+            0.0
+        };
         t[T_N_HINGES] = (self.frame.legs() * 3) as f32;
+
+        if let Some(d) = self.oneleg.as_ref() {
+            let s = d.sample();
+            let qcmd = d.cmd_q();
+            t[T_ONELEG] = 1.0;
+            t[T_MOVE_LEG] = s.moving as f32;
+            t[T_MOVE_PHASE] = s.phase.as_u32() as f32;
+            t[T_MOVE_I] = s.move_i as f32;
+            t[T_STANCE_DRIFT] = s.stance_drift as f32;
+            t[T_CHASSIS_XZ] = s.chassis_xz as f32;
+            t[T_FOOT_CLEAR] = s.foot_clear as f32;
+            t[T_TIME] = s.t as f32;
+            t[T_SLIP_RATE] = s.slip as f32;
+            t[T_FALLEN] = if s.fallen { 1.0 } else { 0.0 };
+            t[T_MODE] = MODE_ONELEG as f32;
+            for i in 0..n {
+                let origin = d.origin_world[i];
+                t[T_ORIGIN + i * 3] = origin[0] as f32;
+                t[T_ORIGIN + i * 3 + 1] = origin[1] as f32;
+                t[T_ORIGIN + i * 3 + 2] = origin[2] as f32;
+                t[T_STANCE + i] = if i == s.moving && s.phase.swinging() {
+                    0.0
+                } else {
+                    1.0
+                };
+                let td = if i == s.moving { s.dest_world } else { origin };
+                for c in 0..3 {
+                    t[T_QCMD + i * 3 + c] = qcmd[i][c] as f32;
+                    t[T_TD + i * 3 + c] = td[c] as f32;
+                }
+            }
+            t[T_DEST] = s.dest_world[0] as f32;
+            t[T_DEST + 1] = s.dest_world[1] as f32;
+            t[T_DEST + 2] = s.dest_world[2] as f32;
+        } else {
+            t[T_ONELEG] = 0.0;
+            t[T_MOVE_LEG] = 0.0;
+            t[T_MOVE_PHASE] = 0.0;
+            t[T_MOVE_I] = 0.0;
+            t[T_STANCE_DRIFT] = 0.0;
+            t[T_CHASSIS_XZ] = 0.0;
+            t[T_FOOT_CLEAR] = 0.0;
+            for i in 0..MAX_LEGS * 3 {
+                t[T_ORIGIN + i] = 0.0;
+            }
+            t[T_DEST] = 0.0;
+            t[T_DEST + 1] = 0.0;
+            t[T_DEST + 2] = 0.0;
+        }
     }
 }
 
@@ -1062,5 +1206,56 @@ mod tests {
         hx_train(1);
         assert_eq!(tel()[T_MODE], MODE_LEARNED as f32);
         assert!(tel()[T_TRAINED] > 0.5);
+    }
+
+    #[test]
+    fn oneleg_mode_lifts_one_foot_on_an_empty_field() {
+        hx_init(1);
+        hx_set_course(0, 1);
+        hx_set_oneleg_leg(0);
+        hx_set_mode(MODE_ONELEG);
+        hx_set_oneleg_leg(0);
+        assert!(tel()[T_ONELEG] > 0.5, "T_ONELEG={}", tel()[T_ONELEG]);
+        assert_eq!(tel()[T_MOVE_LEG], 0.0);
+
+        let dt = hexapod_core::DT;
+        let ticks = (2.4 / dt) as usize;
+        let mut max_clear = 0.0f32;
+        let mut saw_one_swing = false;
+        let mut q_hold = [0.0f32; 3];
+        for c in 0..3 {
+            q_hold[c] = tel()[T_QCMD + 3 + c];
+        }
+        for _ in 0..ticks {
+            hx_step(dt, 0.0, 0.0);
+            let t = tel();
+            assert!(t[T_ONELEG] > 0.5);
+            assert_eq!(t[T_MOVE_LEG], 0.0);
+            max_clear = max_clear.max(t[T_FOOT_CLEAR]);
+            let mut swing = 0u32;
+            for i in 0..6 {
+                if t[T_STANCE + i] < 0.5 {
+                    swing += 1;
+                }
+            }
+            let phase = t[T_MOVE_PHASE];
+            if phase >= 1.0 && phase <= 3.0 {
+                assert_eq!(swing, 1, "phase {phase} swung {swing} legs");
+                saw_one_swing = true;
+            } else {
+                assert_eq!(swing, 0, "phase {phase} should plant every foot");
+            }
+            for c in 0..3 {
+                assert!(
+                    (t[T_QCMD + 3 + c] - q_hold[c]).abs() < 1e-5,
+                    "stance leg R1 joint {c} commanded away from hold"
+                );
+            }
+        }
+        assert!(saw_one_swing, "never entered lift/shift/place");
+        assert!(
+            max_clear > 0.12,
+            "moving foot never left the floor: clearance={max_clear}"
+        );
     }
 }

@@ -457,14 +457,15 @@ class Stage {
     this._ellipsoid(tip, 0.026, COL.rubber, 8, 3);
   }
 
-  _legs(J, stance, legs, hitLegs) {
+  _legs(J, stance, legs, hitLegs, movingLeg) {
     for (let leg = 0; leg < legs; leg++) {
       const o = leg * 12;
       const hip = [J[o], J[o + 1], J[o + 2]];
       const knee = [J[o + 3], J[o + 4], J[o + 5]];
       const ankle = [J[o + 6], J[o + 7], J[o + 8]];
       const foot = [J[o + 9], J[o + 10], J[o + 11]];
-      const shell = hitLegs && hitLegs[leg] ? COL.hit : COL.shell;
+      const moving = movingLeg === leg;
+      const shell = hitLegs && hitLegs[leg] ? COL.hit : moving ? COL.accent : COL.shell;
 
       const coxa = sub(knee, hip);
       const femur = sub(ankle, knee);
@@ -486,7 +487,7 @@ class Stage {
 
       this._segment(knee, ankle, 0.062, shell, 8);
 
-      this._segment(ankle, foot, 0.046, hitLegs && hitLegs[leg] ? COL.hit : COL.metal, 8);
+      this._segment(ankle, foot, 0.046, hitLegs && hitLegs[leg] ? COL.hit : moving ? COL.accentDark : COL.metal, 8);
 
       // External loom follows the upper and lower links, as on a serviceable
       // robot where each servo is daisy chained. Offset it slightly upward so
@@ -501,6 +502,7 @@ class Stage {
       this._ellipsoid([foot[0], foot[1] + 0.052, foot[2]], [0.052, 0.035, 0.052], COL.metal, 8, 3);
 
       if (stance[leg] > 0.5) this._ellipsoid([foot[0], foot[1] + 0.024, foot[2]], [0.125, 0.022, 0.11], COL.accentDark, 10, 2);
+      if (moving) this._ellipsoid([foot[0], foot[1] + 0.06, foot[2]], [0.09, 0.09, 0.09], COL.accent, 10, 3);
     }
   }
 
@@ -1021,7 +1023,8 @@ class Stage {
     this._terrain(pos[2], hits.hitOb);
     const robotFrom = this.faces.length;
     this._chassis(pos, t[L.T_YAW], t[L.T_PITCH], t[L.T_ROLL], bodyR, blocked || hits.chassis);
-    this._legs(joints, t.subarray(L.T_STANCE, L.T_STANCE + legs), legs, hits.hitLegs);
+    const movingLeg = L.T_ONELEG != null && t[L.T_ONELEG] > 0.5 ? Math.round(t[L.T_MOVE_LEG]) : -1;
+    this._legs(joints, t.subarray(L.T_STANCE, L.T_STANCE + legs), legs, hits.hitLegs, movingLeg);
 
     const bad = t[L.T_MARGIN] < 0.05;
     const com =
@@ -1086,6 +1089,30 @@ class Stage {
       if (hits.hitLegs[leg]) {
         this._ringXZ(fx, fz, t[o + 1] + 0.04, 0.22, "#e5391d", 2.2);
       }
+    }
+
+    if (L.T_ONELEG != null && t[L.T_ONELEG] > 0.5) {
+      const moving = Math.round(t[L.T_MOVE_LEG]);
+      for (let leg = 0; leg < legs; leg++) {
+        const ox = t[L.T_ORIGIN + leg * 3];
+        const oy = t[L.T_ORIGIN + leg * 3 + 1] + 0.02;
+        const oz = t[L.T_ORIGIN + leg * 3 + 2];
+        const col = leg === moving ? "rgba(229,57,29,0.55)" : "rgba(20,20,22,0.55)";
+        this._line([ox - 0.14, oy, oz - 0.14], [ox + 0.14, oy, oz + 0.14], col, 2);
+        this._line([ox - 0.14, oy, oz + 0.14], [ox + 0.14, oy, oz - 0.14], col, 2);
+        const fo = L.T_JOINTS + leg * 12 + 9;
+        const drift = Math.hypot(t[fo] - ox, t[fo + 2] - oz);
+        if (drift > 0.04) {
+          this._line([ox, oy, oz], [t[fo], t[fo + 1], t[fo + 2]], "rgba(229,57,29,0.45)", 1.2, [4, 3]);
+        }
+      }
+      const dx = t[L.T_DEST];
+      const dy = t[L.T_DEST + 1];
+      const dz = t[L.T_DEST + 2];
+      this._ringXZ(dx, dz, dy + 0.02, 0.16, "#e5391d", 1.8, [4, 3]);
+      const fo = L.T_JOINTS + moving * 12 + 9;
+      this._line([t[fo], t[fo + 1], t[fo + 2]], [dx, dy, dz], "rgba(229,57,29,0.35)", 1.2, [3, 4]);
+      this._line([t[fo], t[fo + 1], t[fo + 2]], [t[fo], 0.02, t[fo + 2]], "rgba(229,57,29,0.7)", 1.8);
     }
 
     // Ground footprint of every obstacle the chassis or a link is inside.

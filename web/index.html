@@ -94,9 +94,12 @@ GAIT <b id="hudGait">TRIPOD</b> · DUTY <b id="hudDuty">0.50</b></div>
           <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
 SCROLL TO ZOOM · WASD / QE · [ ] SPEED
 <b id="hudHit"></b></div>
-          <div class="hud bl">BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
+          <div class="hud bl" id="hudWalk">BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm
 vx <b id="hudVx">+0.00</b>  vy <b id="hudVy">+0.00</b>  vz <b id="hudVz">+0.00</b>  slip <b id="hudSlip">0.00</b></div>
+          <div class="hud bl" id="hudDrill" hidden>ONE LEG <b id="hudOlLeg">L1</b> · <b id="hudOlPhase">SETTLE</b> · move <b id="hudOlMove">0</b>
+clearance <b id="hudOlClear">0.00</b> m · stance drift <b id="hudOlDrift">0.00</b> m
+chassis Δxz <b id="hudOlXz">0.00</b> m · grey X = plant start</div>
           <div class="hud br2">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · HEAD <b id="hudHead">+0°</b> · ω <b id="hudW">0.00</b>
 CYCLE <b id="hudCycle">0.47</b> s · STRIDE <b id="hudStride">1.08</b> m
 NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b> m · BRG <b id="hudBrg">+0°</b></div>
@@ -396,6 +399,8 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             <thead><tr><th>Mark</th><th>Meaning</th></tr></thead>
             <tbody>
               <tr><td>Solid red ring</td><td>Foot planted; ring grows with its share of the load</td></tr>
+              <tr><td>Red highlighted leg</td><td>The free leg in the one-leg drill. The other five hold standing joint angles</td></tr>
+              <tr><td>Grey X on the floor</td><td>Where that foot was at the start of this plant. If the foot leaves the X, friction lost</td></tr>
               <tr><td>Dashed grey ring</td><td>Where a swinging leg intends to touch down</td></tr>
               <tr><td>Dashed red polygon</td><td>Support polygon — the convex hull of the planted feet</td></tr>
               <tr><td>Crosshair</td><td>Centre of mass. It turns red as it approaches the polygon edge</td></tr>
@@ -431,6 +436,16 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         </div>
         <label class="slider"><span class="hd"><span class="k">Sim speed</span><b id="vRate">1×</b></span>
           <input type="range" id="rRate" min="0.25" max="4" step="0.25" value="1"></label>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Empty-field drill</h2></div>
+        <div class="row2">
+          <button class="btn" id="btnOneleg">One leg</button>
+          <button class="btn" id="btnWalk" data-on="true">Walk</button>
+        </div>
+        <div class="row3" id="onelegBtns"></div>
+        <p class="note" id="onelegNote">Empty plane. Five legs hold standing joint angles — friction only, nothing welded. The red leg lifts and plants a new reachable spot. Grey X is where each plant started: if a foot leaves its X, grip lost.</p>
       </div>
 
       <div class="sec">

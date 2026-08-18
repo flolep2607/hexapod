@@ -601,6 +601,10 @@ input[type="number"] {
   left: 0;
 }
 
+.hud[hidden] {
+  display: none !important;
+}
+
 .hud.br2 {
   bottom: 0;
   right: 0;

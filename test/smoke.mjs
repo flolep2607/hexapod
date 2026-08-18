@@ -525,6 +525,51 @@ async function courses(h) {
   check("the autopilot can be switched off", manual === "MANUAL", manual);
 }
 
+async function onelegDrill(h) {
+  const { page, check, stepSamples, screenshot } = h;
+  await page.click("#btnPause");
+  check("one-leg button is in the page", await page.$("#btnOneleg") !== null);
+  await page.click("#btnOneleg");
+  const header = await page.textContent("#hPolicy");
+  check("policy chip says ONE LEG", /ONE/.test(header), header);
+  check("one-leg button latches", (await page.getAttribute("#btnOneleg", "data-on")) === "true");
+  check("walk button unlatches", (await page.getAttribute("#btnWalk", "data-on")) !== "true");
+
+  let maxClear = 0;
+  let sawOneSwing = false;
+  let extraSwing = false;
+  let on = false;
+  for (let i = 0; i < 10; i++) {
+    await stepSamples(18);
+    const s = await page.evaluate(() => window.__hxOneleg());
+    on = s.on;
+    maxClear = Math.max(maxClear, s.clear);
+    const swinging = s.stance.filter((v) => !v).length;
+    if (s.phase >= 1 && s.phase <= 3) {
+      if (swinging === 1 && s.moving === 0) sawOneSwing = true;
+      if (swinging > 1) extraSwing = true;
+    }
+  }
+  check("telemetry says the drill is on", on);
+  check("only L1 drops its stance flag", sawOneSwing && !extraSwing, `clear ${maxClear.toFixed(3)}`);
+  check("the free foot leaves the floor", maxClear > 0.10, `${maxClear.toFixed(3)} m clearance`);
+  const hud = await page.evaluate(() => ({
+    gait: document.getElementById("hudGait").textContent,
+    drill: document.getElementById("hudDrill").hidden,
+    walk: document.getElementById("hudWalk").hidden,
+    course: document.getElementById("hCourse").textContent,
+    cam: document.getElementById("hudCam").textContent,
+  }));
+  check("HUD switches to the drill readout", hud.walk === true && hud.drill === false, JSON.stringify(hud));
+  check("the empty field is FLAT", /FLAT/.test(hud.course), hud.course);
+  check("side camera shows the lift", /SIDE/.test(hud.cam), hud.cam);
+  await screenshot("16-oneleg.png");
+
+  await page.click("#btnWalk");
+  check("walk restores the gait", (await page.getAttribute("#btnWalk", "data-on")) === "true");
+  check("one-leg turns off", (await page.getAttribute("#btnOneleg", "data-on")) !== "true");
+}
+
 const scenarios = [
   ["dashboard", bootAndStatic],
   ["courses", courses],
@@ -538,6 +583,7 @@ const scenarios = [
     await quadruped(harness);
   }],
   ["gait + navigation", gaitAndNavigation],
+  ["one leg", onelegDrill],
 ];
 
 const started = performance.now();

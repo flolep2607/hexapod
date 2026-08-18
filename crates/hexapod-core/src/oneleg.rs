@@ -16,12 +16,14 @@ use crate::robot::{
 };
 use crate::terrain::{Course, Terrain};
 
-const SETTLE: f64 = 0.60;
-const LIFT_T: f64 = 0.28;
-const SHIFT_T: f64 = 0.40;
-const PLACE_T: f64 = 0.28;
-const PAUSE: f64 = 0.45;
-const LIFT_H: f64 = 0.18;
+const SETTLE: f64 = 0.70;
+const LIFT_T: f64 = 0.55;
+const SHIFT_T: f64 = 0.80;
+const PLACE_T: f64 = 0.55;
+const PAUSE: f64 = 0.55;
+/// High enough that a watching eye can tell the sole left the floor. 18 cm
+/// looked like a scrape; 40 cm is a deliberate pick-up.
+const LIFT_H: f64 = 0.40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -41,6 +43,21 @@ impl Phase {
             Phase::Place => "place",
             Phase::Pause => "pause",
         }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Phase::Settle => 0,
+            Phase::Lift => 1,
+            Phase::Shift => 2,
+            Phase::Place => 3,
+            Phase::Pause => 4,
+        }
+    }
+
+    /// The free foot is off the floor, or coming down onto a new plant.
+    pub fn swinging(self) -> bool {
+        matches!(self, Phase::Lift | Phase::Shift | Phase::Place)
     }
 }
 
@@ -85,11 +102,15 @@ pub struct OneLegSample {
     pub foot_body: V3,
     pub foot_world: V3,
     pub dest_body: V3,
+    pub dest_world: V3,
     pub reach_err: f64,
     pub chassis_xz: f64,
     pub stance_drift: f64,
     pub moving_travel: f64,
     pub slip: f64,
+    /// Moving foot centre height minus the sole radius. Negative means the
+    /// ball is in the floor; near zero is a scrape; a real lift is > 0.15 m.
+    pub foot_clear: f64,
     pub fallen: bool,
 }
 
@@ -140,16 +161,23 @@ impl OneLegDrill {
         self.from = self.hold_body[self.moving];
     }
 
-    pub fn step(&mut self, dt: f64) {
-        if self.phase == Phase::Settle && self.phase_t == 0.0 && self.move_i == 0 {
-            self.capture_origin();
-        }
-
+    /// Joint setpoints this tick: standing pose on every stance leg, IK of the
+    /// swing target on the free leg. Stance commands do not change.
+    pub fn cmd_q(&self) -> [[f64; 3]; MAX_LEGS] {
         let u = (self.phase_t / self.phase_dur()).clamp(0.0, 1.0);
         let cmd_body = self.cmd_body(smooth(u));
         let mut q = self.q_hold;
         q[self.moving] = solve_ik(self.frame, self.moving, cmd_body).q;
         clamp_joints(&mut q[self.moving]);
+        q
+    }
+
+    pub fn step(&mut self, dt: f64) {
+        if self.phase == Phase::Settle && self.phase_t == 0.0 && self.move_i == 0 {
+            self.capture_origin();
+        }
+
+        let q = self.cmd_q();
         self.plant.drive(&q, &self.phys, dt);
         self.plant.step(dt);
 
@@ -169,6 +197,10 @@ impl OneLegDrill {
         let foot_body = to_body(foot_world, pos, yaw, pitch, roll);
         let cmd_world = {
             let w = body_to_world(cmd_body, yaw, pitch, roll);
+            [pos[0] + w[0], pos[1] + w[1], pos[2] + w[2]]
+        };
+        let dest_world = {
+            let w = body_to_world(self.dest, yaw, pitch, roll);
             [pos[0] + w[0], pos[1] + w[1], pos[2] + w[2]]
         };
         let reach_err = dist(foot_world, cmd_world);
@@ -197,11 +229,13 @@ impl OneLegDrill {
             foot_body,
             foot_world,
             dest_body: self.dest,
+            dest_world,
             reach_err,
             chassis_xz: hypot2(pos[0] - self.origin_pos[0], pos[2] - self.origin_pos[2]),
             stance_drift,
             moving_travel: dist(foot_world, self.origin_world[self.moving]),
             slip: self.plant.foot_slip(),
+            foot_clear: foot_world[1] - FOOT_R,
             fallen: self.plant.chassis_y() < 0.45 || self.plant.pitch_abs() > 0.80,
         }
     }
@@ -295,7 +329,7 @@ pub fn sample_plant(frame: Frame, gait: &Gait, leg: usize, rng: &mut Rng, avoid:
     let yaw0 = frame.yaw(leg);
     let r_lo = REACH_MIN + 0.20;
     let r_hi = (REACH_MAX - 0.12).min(gait.stance_w * 0.55 + 0.35);
-    for _ in 0..48 {
+    for _ in 0..80 {
         let a = yaw0 + rng.range(-1.05, 1.05);
         let r = rng.range(r_lo, r_hi);
         let t = [hip[0] + r * a.cos(), y, hip[2] + r * a.sin()];
@@ -305,7 +339,7 @@ pub fn sample_plant(frame: Frame, gait: &Gait, leg: usize, rng: &mut Rng, avoid:
         if hypot2(t[0], t[2]) < frame.body_r() + 0.10 {
             continue;
         }
-        if hypot2(t[0] - avoid[0], t[2] - avoid[2]) < 0.16 {
+        if hypot2(t[0] - avoid[0], t[2] - avoid[2]) < 0.28 {
             continue;
         }
         return t;
@@ -374,29 +408,49 @@ mod tests {
         let frame = Frame::new(6);
         let phys = Physics::default();
         let mut drill = OneLegDrill::spawn(frame, &phys, 1);
-        let ticks = (4.5 / DT) as usize;
+        drill.pin_leg(0);
+        let ticks = (6.0 / DT) as usize;
         let mut max_stance = 0.0f64;
         let mut max_chassis = 0.0f64;
         let mut max_travel = 0.0f64;
+        let mut max_clear = 0.0f64;
         let mut min_y = f64::INFINITY;
+        let q_stance0 = drill.q_hold[1];
         for _ in 0..ticks {
             drill.step(DT);
             let s = drill.sample();
+            assert_eq!(s.moving, 0, "drill left L1");
             min_y = min_y.min(s.pos[1]);
+            max_clear = max_clear.max(s.foot_clear);
             if s.phase != Phase::Settle {
                 max_stance = max_stance.max(s.stance_drift);
                 max_chassis = max_chassis.max(s.chassis_xz);
                 max_travel = max_travel.max(s.moving_travel);
             }
+            if s.phase.swinging() {
+                let q1 = drill.cmd_q()[1];
+                for j in 0..3 {
+                    assert!(
+                        (q1[j] - q_stance0[j]).abs() < 1e-12,
+                        "stance leg 1 commanded while L1 swung: {:?} vs {:?}",
+                        q1,
+                        q_stance0
+                    );
+                }
+            }
             assert!(!s.fallen, "fell at t={:.2} y={:.3}", s.t, s.pos[1]);
         }
         eprintln!(
             "oneleg: min_y={min_y:.3} travel={max_travel:.3} stance_drift={max_stance:.3} \
-             chassis_xz={max_chassis:.3}"
+             chassis_xz={max_chassis:.3} max_clear={max_clear:.3}"
         );
         assert!(
             min_y > 0.55,
             "sat down: min_y={min_y:.3}"
+        );
+        assert!(
+            max_clear > 0.12,
+            "moving foot never left the floor: clearance={max_clear:.3}"
         );
         assert!(
             max_travel > 0.12,
