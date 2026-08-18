@@ -214,6 +214,7 @@ impl ArticulatedPlant {
         colliders.insert_with_parent(
             ColliderBuilder::cuboid(x1 - x0 + 4.0, floor_h, 0.5 * (z1 - z0) + 4.0)
                 .friction(phys.mu as f32)
+                .friction_combine_rule(CoefficientCombineRule::Max)
                 .restitution(0.0)
                 .collision_groups(groups_floor)
                 .user_data(HIT_FLOOR),
@@ -274,8 +275,8 @@ impl ArticulatedPlant {
                 .translation(v(pos, s))
                 .can_sleep(false)
                 .ccd_enabled(true)
-                .linear_damping(0.15)
-                .angular_damping(0.40),
+                .linear_damping(0.05)
+                .angular_damping(0.32),
         );
         // A cylinder matches the visual disc. The old cube's corners stuck out
         // past the hips and scraped every wall the body walked past.
@@ -328,16 +329,16 @@ impl ArticulatedPlant {
                     .translation(coxa_mid)
                     .rotation(coxa_rot.to_scaled_axis())
                     .can_sleep(false)
-                    .linear_damping(0.15)
-                    .angular_damping(0.40),
+                    .linear_damping(0.08)
+                    .angular_damping(0.20),
             );
             let femur = bodies.insert(
                 RigidBodyBuilder::dynamic()
                     .translation(femur_mid)
                     .rotation(femur_rot.to_scaled_axis())
                     .can_sleep(false)
-                    .linear_damping(0.15)
-                    .angular_damping(0.40),
+                    .linear_damping(0.08)
+                    .angular_damping(0.20),
             );
             let tibia = bodies.insert(
                 RigidBodyBuilder::dynamic()
@@ -345,8 +346,8 @@ impl ArticulatedPlant {
                     .rotation(tibia_rot.to_scaled_axis())
                     .can_sleep(false)
                     .ccd_enabled(true)
-                    .linear_damping(0.15)
-                    .angular_damping(0.40),
+                    .linear_damping(0.08)
+                    .angular_damping(0.20),
             );
 
             // Kinematic half-length. Rapier's capsule_y half-height is the
@@ -385,7 +386,8 @@ impl ArticulatedPlant {
             let foot_col = colliders.insert_with_parent(
                 ColliderBuilder::ball(FOOT_R * s)
                     .mass(tibia_kg * 0.15)
-                    .friction(phys.mu as f32)
+                    .friction((phys.mu as f32).max(1.15))
+                    .friction_combine_rule(CoefficientCombineRule::Max)
                     .restitution(0.0)
                     .collision_groups(groups_foot)
                     // Centered on the kinematic foot so a tilted tibia still
@@ -646,10 +648,17 @@ impl ArticulatedPlant {
         self.bodies[self.chassis].translation().z as f64 / self.scale as f64
     }
 
-    /// Sum of horizontal foot speed for feet touching the walkable plane, m/s.
+    /// Chassis angular velocity, rad/s.
+    pub fn chassis_angvel(&self) -> V3 {
+        let w = self.bodies[self.chassis].angvel();
+        [w.x as f64, w.y as f64, w.z as f64]
+    }
+
+    /// Mean horizontal speed of feet that are touching the walkable plane, m/s,
+    /// taken at the rubber rather than the tibia COM.
     pub fn foot_slip(&self) -> f64 {
-        // ponytail: tibia linvel at the ball, not Rapier friction impulses.
         let mut slip = 0.0f64;
+        let mut n = 0usize;
         for i in 0..self.n {
             let Some(leg) = self.legs[i].as_ref() else {
                 continue;
@@ -668,10 +677,19 @@ impl ArticulatedPlant {
             if !touching {
                 continue;
             }
-            let v = self.bodies[leg.tibia].linvel();
-            slip += (v.x * v.x + v.z * v.z).sqrt() as f64;
+            let tibia = &self.bodies[leg.tibia];
+            let half = (TIBIA as f32 * self.scale * 0.5).max(0.004);
+            let offset = *tibia.rotation() * Vector::new(0.0, half, 0.0);
+            let v = tibia.linvel() + tibia.angvel().cross(offset);
+            let s = self.scale as f64;
+            slip += ((v.x * v.x + v.z * v.z).sqrt() as f64) / s;
+            n += 1;
         }
-        slip
+        if n == 0 {
+            0.0
+        } else {
+            slip / n as f64
+        }
     }
 
     pub fn pitch_abs(&self) -> f64 {
@@ -782,54 +800,32 @@ mod tests {
     #[test]
     fn a_tripod_gait_walks_forward() {
         let frame = Frame::new(6);
-        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
-        // At the seeded 0.47 s the stroke needs 1.75x the default servo's
-        // no-load speed, so the joints never arrive and the machine shuffles.
-        // Run it at a clock the motors can actually track.
-        gait.cycle = gait.cycle.max(crate::policy::feasible_cycle(
-            frame,
-            &gait,
-            gait.stride,
-            gait.duty,
-            gait.cycle,
-            gait.body_h,
-            gait.step_h,
-            0.0,
-            phys_omega(),
-        ));
         let phys = Physics::default();
-        let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-
-        let z0 = plant.chassis_z();
-        let mut phase = 0.0;
-        let ticks = (12.0 / crate::sim::DT) as usize;
+        let (mut walker, terrain, policy, gait) =
+            crate::walker::open_loop_walk(frame, Course::Flat, 1, phys);
+        let cmd = crate::sim::Cmd {
+            fwd: 1.0,
+            turn: 0.0,
+            cruise: 1.5,
+            nav: false,
+        };
+        let ticks = (8.0 / crate::sim::DT) as usize;
         for _ in 0..ticks {
-            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
-            let mut q = [[0.0; 3]; MAX_LEGS];
-            for i in 0..6 {
-                let target = foot_in_body(
-                    frame, &gait, i, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
-                    gait.step_h, 0.0,
-                );
-                q[i] = solve_ik(frame, i, target).q;
-            }
-            plant.drive(&q, &phys, crate::sim::DT);
-            plant.step(crate::sim::DT);
+            walker.step(&terrain, &policy, &gait, crate::sim::DT, cmd);
         }
-        let dz = plant.chassis_z() - z0;
-        // Body-frame stance advances one stride per stance window. 0.5 m in
-        // 12 s on a ~2 m machine is a slide; a body-length is a walk.
-        let want = 1.2;
+        let s = walker.sample();
+        assert!(!s.fallen, "fell at y={:.3}", s.pos[1]);
         assert!(
-            dz > want,
-            "tripod did not walk forward: dz={dz:.3} (want > {want:.3} sim-m in 12 s; \
-             cycle={:.3} stride={:.3} v_kin={:.3})",
+            s.pos[2] > 1.2,
+            "tripod did not walk forward: z={:.3} x={:.3} yaw={:.3} (cycle={:.3} stride={:.3})",
+            s.pos[2],
+            s.pos[0],
+            s.yaw,
             gait.cycle,
-            gait.stride,
-            gait.nominal_speed()
+            gait.stride
         );
-        assert!(plant.pitch_abs() < 0.55, "fell while walking");
+        assert!(s.yaw.abs() < 0.45, "spun while walking: yaw={:.3}", s.yaw);
+        assert!(s.pos[1] > 0.55, "sat down: y={:.3}", s.pos[1]);
     }
 
     #[test]
@@ -1359,39 +1355,39 @@ mod tests {
         );
     }
 
-    /// The live dashboard drives `foot_on_terrain`, not the open-loop stroke.
-    /// Converting world ground through a dipped `pos[1]` used to fold the legs
-    /// on the first step, so the chassis was on the floor by two seconds.
+    /// The live dashboard world-locks stance and keeps ride height as a
+    /// body-frame command. Converting world ground through a dipped `pos[1]`
+    /// used to fold the legs on the first step.
     #[test]
     fn terrain_aware_tripod_does_not_sit_down() {
         let frame = Frame::new(6);
-        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
-        gait.cycle = walk_cycle(frame, &gait);
         let phys = Physics::default();
-        let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-        let mut phase = 0.0;
+        let (mut walker, terrain, policy, gait) =
+            crate::walker::open_loop_walk(frame, Course::Flat, 1, phys);
+        let cmd = crate::sim::Cmd {
+            fwd: 1.0,
+            turn: 0.0,
+            cruise: 1.5,
+            nav: false,
+        };
         let mut min_y = f64::INFINITY;
         let ticks = (6.0 / crate::sim::DT) as usize;
         for k in 0..ticks {
-            drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
-            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
+            walker.step(&terrain, &policy, &gait, crate::sim::DT, cmd);
             if k > 50 {
-                min_y = min_y.min(plant.chassis_y());
+                min_y = min_y.min(walker.plant.chassis_y());
             }
         }
+        let s = walker.sample();
         assert!(
             min_y > 0.55,
             "terrain-aware walk sat down: min_y={min_y:.3} end_y={:.3} z={:.3}",
-            plant.chassis_y(),
-            plant.chassis_z()
+            s.pos[1],
+            s.pos[2]
         );
-        assert!(
-            plant.chassis_z() > 0.35,
-            "did not walk: z={:.3}",
-            plant.chassis_z()
-        );
-        assert!(plant.pitch_abs() < 0.55, "fell while walking");
+        assert!(s.pos[2] > 0.70, "did not walk: z={:.3}", s.pos[2]);
+        assert!(s.pitch.abs() < 0.55, "fell while walking");
+        assert!(!s.fallen);
     }
 
     /// A wall beside the machine, not in front of it. Swing used to be projected

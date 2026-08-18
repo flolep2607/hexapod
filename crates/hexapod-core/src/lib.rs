@@ -33,6 +33,8 @@ pub mod sim;
 pub mod terrain;
 #[cfg(feature = "rapier")]
 pub mod plant;
+#[cfg(feature = "rapier")]
+pub mod walker;
 
 pub use ars::{ArsConfig, Trainer};
 pub use dynamics::{Actuator, LegMass, Physics};
@@ -45,3 +47,5 @@ pub use sim::{
     JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
 };
 pub use terrain::{Course, Terrain};
+#[cfg(feature = "rapier")]
+pub use walker::{ArticulatedWalker, WalkSample};

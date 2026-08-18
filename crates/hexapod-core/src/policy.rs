@@ -886,7 +886,7 @@ pub fn foot_on_terrain(
     clear_links(frame, leg, target, terrain, pos, yaw)
 }
 
-fn swing_blocked(terrain: &Terrain, x: f64, z: f64, floor: f64, max_step: f64, r: f64) -> bool {
+pub(crate) fn swing_blocked(terrain: &Terrain, x: f64, z: f64, floor: f64, max_step: f64, r: f64) -> bool {
     use crate::terrain::CORRIDOR_HALF;
     if x.abs() > CORRIDOR_HALF - r {
         return true;
@@ -904,7 +904,7 @@ fn swing_blocked(terrain: &Terrain, x: f64, z: f64, floor: f64, max_step: f64, r
 /// to reach through, and it gives up rather than folding the leg under the body
 /// when there is no clear pose at all — a stubbed step is better than a
 /// collapsed stance.
-fn clear_links(
+pub(crate) fn clear_links(
     frame: Frame,
     leg: usize,
     target: V3,

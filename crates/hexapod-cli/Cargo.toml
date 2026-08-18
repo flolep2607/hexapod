@@ -10,7 +10,7 @@ name = "hexapod"
 path = "src/main.rs"
 
 [dependencies]
-hexapod-core = { path = "../hexapod-core" }
+hexapod-core = { path = "../hexapod-core", features = ["rapier"] }
 
 [lints]
 workspace = true

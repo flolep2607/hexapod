@@ -513,12 +513,13 @@ impl Sim {
     /// chosen around a ghost that has walked on ahead of the real machine, so
     /// the legs you see lift over rocks that are no longer there and plough
     /// through the ones that are.
-    pub fn observe_pose(&mut self, pos: V3, yaw: f64, pitch: f64, roll: f64, vel: [f64; 2]) {
+    pub fn observe_pose(&mut self, pos: V3, yaw: f64, pitch: f64, roll: f64, vel: V3) {
         self.pos = pos;
         self.yaw = yaw;
         self.pitch = pitch;
         self.roll = roll;
-        self.vel = vel;
+        self.vel = [vel[0], vel[2]];
+        self.vy = vel[1];
     }
 
     pub fn reset(&mut self, terrain: &Terrain, gait: &Gait, phys: &Physics) {

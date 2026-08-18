@@ -18,10 +18,9 @@ use hexapod_core::ars::{ArsConfig, Trainer};
 use hexapod_core::dynamics::{robot_com, Physics};
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
-use hexapod_core::math::{body_to_world, convex_hull_xz, polygon_margin, squash, unsquash};
+use hexapod_core::math::{convex_hull_xz, polygon_margin, squash, unsquash};
 use hexapod_core::plant::ArticulatedPlant;
-use hexapod_core::policy::foot_on_terrain;
-use hexapod_core::policy::{act_body_dh, n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
+use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
 use hexapod_core::sim::{
     Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX,
     JUMP_CRUISE_MIN,
@@ -56,6 +55,9 @@ struct App {
     /// body; joint angles still never travel back. ARS trains on the
     /// centroidal step alone, with no plant in the loop.
     plant: Option<ArticulatedPlant>,
+    /// World plants for stance feet. Without these the live gait sweeps a
+    /// stride through the floor every cycle and the machine skates.
+    locks: hexapod_core::walker::StanceLocks,
     mode: u32,
     since_fall: f64,
 
@@ -120,6 +122,7 @@ fn make(seed: u64) -> App {
         live: Sim::default(),
         live_gait,
         plant: None,
+        locks: hexapod_core::walker::StanceLocks::new(),
         mode: MODE_BASELINE,
         since_fall: 0.0,
         build,
@@ -588,6 +591,15 @@ impl App {
             &self.phys,
             &self.terrain,
         ));
+        self.locks.reset();
+        if let Some(plant) = self.plant.as_ref() {
+            let (p, yaw, pitch, roll) = plant.chassis_pose();
+            self.live.observe_pose(p, yaw, pitch, roll, plant.chassis_vel());
+            for i in 0..self.frame.legs() {
+                self.live.feet[i].world = plant.leg_joints_world(i)[3];
+            }
+            self.locks.capture(&self.live, plant);
+        }
         self.since_fall = 0.0;
     }
 
@@ -652,66 +664,17 @@ impl App {
                     .step(&self.terrain, policy, &self.live_gait, h, cmd);
             }
             if let Some(plant) = self.plant.as_mut() {
-                let mut q_cmd = self.live.q_cmd;
-                let body_h = self.live_gait.body_h
-                    + 0.20 * self.live.act[act_body_dh(self.frame)];
-                // Each leg is given a foot position to reach, worked out against
-                // the terrain in front of the body Rapier is actually carrying;
-                // the joint motors are what get it there. The centroidal plan's
-                // own `q_cmd` cannot be used directly: its stance feet are
-                // anchored to world points, which is fine for a body that
-                // advances by fiat and gives the real plant nothing to push on.
-                let (bp, byaw, bpitch, broll) = plant.chassis_pose();
-                // Steering has to reach the legs, not just the centroidal
-                // integrator: the plan's yaw rate becomes an arc on every
-                // stance stroke, which is the only way the machine can hold a
-                // heading instead of drifting off on whatever the contacts give
-                // it. Plus a proportional pull back onto the planned heading,
-                // since the real body loses yaw to slip that the plan does not.
-                let turn = self.live.yaw_rate
-                    + 1.5 * hexapod_core::math::ang_diff(self.live.yaw - byaw);
-                for i in 0..self.frame.legs() {
-                    let target = foot_on_terrain(
-                        self.frame,
-                        &self.live_gait,
-                        i,
-                        self.live.phase,
-                        self.live.stride_now,
-                        self.live.duty_now,
-                        self.live.cycle_now,
-                        body_h,
-                        self.live.feet[i].step_h,
-                        turn,
-                        &self.terrain,
-                        bp,
-                        byaw,
-                        bpitch,
-                        broll,
-                    );
-                    q_cmd[i] = hexapod_core::robot::solve_ik(self.frame, i, target).q;
-                    self.live.q_cmd[i] = q_cmd[i];
-                    let w = body_to_world(target, byaw, bpitch, broll);
-                    self.live.feet[i].td = [bp[0] + w[0], bp[1] + w[1], bp[2] + w[2]];
-                }
-                plant.drive(&q_cmd, &self.phys, h);
-                let pre = plant.chassis_vel();
-                plant.step(h);
-                // Rapier's q is still never written back — a missed motor track
-                // would rewind the centroidal gait clock. The body pose is a
-                // different matter: the planner has to know where the machine
-                // really is, or it picks footholds around a ghost that has
-                // walked on ahead.
-                let (p, yaw, pitch, roll) = plant.chassis_pose();
-                let v = plant.chassis_vel();
-                self.live.observe_pose(p, yaw, pitch, roll, [v[0], v[2]]);
-                let slip_v = plant.foot_slip();
-                self.live.slip = slip_v * h;
-                self.live.slip_total += self.live.slip;
-                // ponytail: traction left 0 until we read Rapier contact impulses
-                self.live.traction = 0.0;
-                if plant.chassis_dead(pre) {
-                    self.live.fallen = true;
-                }
+                hexapod_core::walker::drive_articulated(
+                    &mut self.live,
+                    plant,
+                    &mut self.locks,
+                    &self.terrain,
+                    policy,
+                    &self.live_gait,
+                    &self.phys,
+                    h,
+                    cmd,
+                );
             }
         }
     }

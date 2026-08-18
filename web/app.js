@@ -104,6 +104,10 @@ const circMean = (xs) => {
   return frac(Math.atan2(sy, sx) / (2 * Math.PI));
 };
 const fmt = (v, d = 2) => (Number.isFinite(v) ? v.toFixed(d) : "—");
+const signed = (v, d = 2) => {
+  const s = fmt(v, d);
+  return v >= 0 ? `+${s}` : s;
+};
 
 /* ------------------------------------------------------------------ wasm */
 
@@ -1208,6 +1212,12 @@ function updateReadouts(t) {
   $("hudMargin").textContent = fmt(t[L.T_MARGIN], 2);
   $("hudV").textContent = fmt(Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]), 2);
   $("hudVc").textContent = fmt(t[L.T_CMD_SPEED], 2);
+  $("hudVx").textContent = signed(t[L.T_VEL], 2);
+  $("hudVy").textContent = signed(t[L.T_VY], 2);
+  $("hudVz").textContent = signed(t[L.T_VEL + 1], 2);
+  $("hudSlip").textContent = fmt(t[L.T_SLIP_RATE] > 0 ? t[L.T_SLIP_RATE] / (1 / 100) : 0, 2);
+  const head = (t[L.T_YAW] * 180) / Math.PI;
+  $("hudHead").textContent = `${head >= 0 ? "+" : ""}${head.toFixed(0)}°`;
   $("hudW").textContent = fmt(t[L.T_STEER] * 1.1, 2);
   // Where it is being asked to go, and whether it is choosing that itself.
   const nav = t[L.T_NAV] > 0.5 && Math.abs(state.cmd.turn) < 0.02;

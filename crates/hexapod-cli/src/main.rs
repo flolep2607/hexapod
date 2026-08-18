@@ -3,12 +3,17 @@
 //!
 //! ```text
 //! hexapod train  [--course mixed] [--iters 200] [--seed 1] [--preset tripod]
+//! hexapod watch  [--course flat] [--seconds 8] [--speed 1.5]
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
 //! hexapod speed  [--iters 200]      commanded vs achieved speed
 //! hexapod jump   [--iters 200]      parkour: distance, waypoints, jumps
 //! hexapod servo                     the same gait on every servo
 //! ```
+//!
+//! `watch` runs the Rapier plant and prints pose, 3-axis velocity, heading,
+//! stance-foot slip and range/bearing to the next waypoint — numbers you can
+//! read when a canvas walk is too small or too icy to judge by eye.
 //!
 //! `--course` takes any of `flat steps rubble gaps mixed ramps slalom slick
 //! gauntlet jump`, matched case-insensitively against the names the simulator
@@ -37,6 +42,7 @@ use hexapod_core::sim::{
     evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
     JUMP_EVAL_SPEEDS,
 };
+use hexapod_core::walker::WalkSample;
 use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
 
 fn main() {
@@ -124,6 +130,14 @@ fn main() {
         "parts" => parts_json(),
         "courses" => courses_json(),
         "system" => system(frame, course, seed, iters, cfg, phys, &args),
+        "watch" => {
+            let course = if flag(&args, "--course").is_some() {
+                course
+            } else {
+                Course::Flat
+            };
+            watch(frame, course, seed, preset, phys, &args)
+        }
         _ => train(frame, course, seed, iters, preset, cfg, phys),
     }
 }
@@ -346,6 +360,183 @@ fn bench(frame: Frame, course: Course, seed: u64, phys: Physics) {
         "{:.1} simulated seconds per wall second",
         steps as f64 * DT / secs
     );
+}
+
+/// Rapier plant, printed as numbers: pose, 3-axis velocity, heading, slip,
+/// range and bearing to the next waypoint.
+fn watch(
+    frame: Frame,
+    course: Course,
+    seed: u64,
+    preset: Preset,
+    phys: Physics,
+    args: &[String],
+) {
+    let seconds: f64 = flag(args, "--seconds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8.0);
+    let every: f64 = f64::max(
+        flag(args, "--every")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.10),
+        DT,
+    );
+    let speed: f64 = flag(args, "--speed")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.5);
+    let nav = !args.iter().any(|a| a == "--no-nav");
+
+    let terrain = Terrain::new(course, seed);
+    let policy = Policy::seeded(preset, frame);
+    let mut gait = policy.gait();
+    hexapod_core::walker::prepare_live_gait(frame, &mut gait, &phys);
+    let mut walker = hexapod_core::ArticulatedWalker::spawn(frame, &gait, &phys, &terrain);
+
+    let cmd = Cmd {
+        fwd: 1.0,
+        turn: 0.0,
+        cruise: speed,
+        nav,
+    };
+
+    println!(
+        "# hexapod watch  {} on {}  course={} seed={}  cmd={:.2} m/s  nav={}  \
+         gait={:?} cycle={:.3}s stride={:.3} v_kin={:.2}",
+        frame.label(),
+        frame.legs(),
+        course.name(),
+        seed,
+        speed,
+        if nav { "on" } else { "off" },
+        preset,
+        gait.cycle,
+        gait.stride,
+        gait.nominal_speed()
+    );
+    println!(
+        "# t      x      y      z     yaw   pit   rol     vx     vy     vz   |v|  along   slip  \
+         dψ   wp_d   brg  wp  reach stance"
+    );
+
+    let ticks = (seconds / DT).round() as usize;
+    let emit_every = (every / DT).round().max(1.0) as usize;
+    let mut samples: Vec<WalkSample> = Vec::new();
+    let wall = Instant::now();
+
+    for k in 0..=ticks {
+        if k > 0 {
+            walker.step(&terrain, &policy, &gait, DT, cmd);
+        }
+        if k % emit_every == 0 || k == ticks || walker.sim.fallen {
+            let s = walker
+                .sample()
+                .with_wp_n(terrain.waypoints.len());
+            print_watch_row(&s);
+            samples.push(s);
+            if walker.sim.fallen {
+                println!("# FALLEN at t={:.2}s", s.t);
+                break;
+            }
+        }
+    }
+
+    let elapsed = wall.elapsed().as_secs_f64();
+    print_watch_summary(&samples, speed, elapsed);
+}
+
+fn print_watch_row(s: &WalkSample) {
+    println!(
+        "{:5.2} {:+6.3} {:+6.3} {:+6.3} {:+6.1} {:+5.1} {:+5.1} {:+6.3} {:+6.3} {:+6.3} \
+         {:5.2} {:+6.3} {:5.3} {:+5.2} {:6.2} {:+5.1} {:3} {:5} {}",
+        s.t,
+        s.pos[0],
+        s.pos[1],
+        s.pos[2],
+        s.heading_deg,
+        s.pitch.to_degrees(),
+        s.roll.to_degrees(),
+        s.vel[0],
+        s.vel[1],
+        s.vel[2],
+        s.speed,
+        s.along,
+        s.slip,
+        s.yaw_rate,
+        s.wp_dist,
+        s.bearing_deg,
+        s.wp + 1,
+        s.reached,
+        s.stance_bits()
+    );
+}
+
+fn print_watch_summary(samples: &[WalkSample], cmd: f64, wall_s: f64) {
+    let Some(first) = samples.first() else {
+        return;
+    };
+    let last = *samples.last().unwrap();
+    let n = samples.len().max(1) as f64;
+    let mean = |f: fn(&WalkSample) -> f64| samples.iter().map(f).sum::<f64>() / n;
+    let peak_along = samples
+        .iter()
+        .map(|s| s.along)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = samples.iter().map(|s| s.pos[1]).fold(f64::INFINITY, f64::min);
+    let alongs: Vec<f32> = samples.iter().map(|s| s.along as f32).collect();
+
+    println!();
+    println!("--- {:.2} s ({:.2} s wall) ---", last.t, wall_s);
+    println!(
+        "pose         x={:+.3}  y={:.3}  z={:+.3}   heading {:+.1}°  pitch {:+.1}°  roll {:+.1}°",
+        last.pos[0],
+        last.pos[1],
+        last.pos[2],
+        last.heading_deg,
+        last.pitch.to_degrees(),
+        last.roll.to_degrees()
+    );
+    println!(
+        "progress     Δz={:+.3} m  Δx={:+.3} m  heading drift {:+.1}°",
+        last.pos[2] - first.pos[2],
+        last.pos[0] - first.pos[0],
+        last.heading_deg - first.heading_deg
+    );
+    println!(
+        "velocity     mean |v|={:.3} m/s  mean along-heading={:+.3}  peak along={:+.3}  cmd={:.2}",
+        mean(|s| s.speed),
+        mean(|s| s.along),
+        peak_along,
+        cmd
+    );
+    println!(
+        "axis         mean vx={:+.3}  vy={:+.3}  vz={:+.3}   end vx={:+.3} vy={:+.3} vz={:+.3}",
+        mean(|s| s.vel[0]),
+        mean(|s| s.vel[1]),
+        mean(|s| s.vel[2]),
+        last.vel[0],
+        last.vel[1],
+        last.vel[2]
+    );
+    println!(
+        "slip         mean {:.3} m/s  end {:.3} m/s   (stance-foot rubber vs floor)",
+        mean(|s| s.slip),
+        last.slip
+    );
+    println!(
+        "waypoint     {}/{}  dist={:.2} m  bearing {:+.1}°  reached {}",
+        last.wp + 1,
+        last.wp_n.max(1),
+        last.wp_dist,
+        last.bearing_deg,
+        last.reached
+    );
+    println!(
+        "height       min {:.3}  end {:.3}{}",
+        min_y,
+        last.pos[1],
+        if last.fallen { "  FALLEN" } else { "" }
+    );
+    println!("along spark  {}", sparkline(&alongs));
 }
 
 /// Train on MIXED, then check the policy on courses it never trained on.
