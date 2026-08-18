@@ -1,29 +1,28 @@
 //! Empty-field one-leg drill: friction holds the plants, nothing is welded.
 //!
-//! A real foot is not locked to the ground. The motors hold a joint pose; the
-//! floor only has Coulomb friction. This drill asks the smallest honest
-//! question that follows from that: stand on an empty plane, keep five legs
-//! at their standing setpoints, lift the sixth, and plant it somewhere else
-//! inside that leg's reachable workspace. If the other feet skate, or the
-//! chassis walks, the numbers say so.
+//! Stance motors hold their settled angles and yield under load. They are not
+//! walked. Only the free foot is driven, along one eased world chord.
 
 use crate::dynamics::Physics;
-use crate::math::{body_to_world, hypot2, Rng, V3};
+use crate::math::{body_to_world, hypot2, lerp, Rng, V3};
 use crate::plant::ArticulatedPlant;
-use crate::policy::{Gait, Policy, Preset};
+use crate::policy::Gait;
 use crate::robot::{
     clamp_joints, fk_body, solve_ik, to_body, Frame, FOOT_R, MAX_LEGS, REACH_MAX, REACH_MIN,
 };
+use crate::sim::DT;
 use crate::terrain::{Course, Terrain};
 
 const SETTLE: f64 = 0.70;
-const LIFT_T: f64 = 0.55;
-const SHIFT_T: f64 = 0.80;
-const PLACE_T: f64 = 0.55;
+const LIFT_T: f64 = 0.70;
+const SHIFT_T: f64 = 1.00;
+const PLACE_T: f64 = 0.70;
 const PAUSE: f64 = 0.55;
-/// High enough that a watching eye can tell the sole left the floor. 18 cm
-/// looked like a scrape; 40 cm is a deliberate pick-up.
-const LIFT_H: f64 = 0.40;
+const SWING_T: f64 = LIFT_T + SHIFT_T + PLACE_T;
+/// High enough that a watching eye can tell the sole left the floor.
+const LIFT_H: f64 = 0.22;
+/// Ride height and radial plant, independent of any walk gait.
+const RIDE: f64 = 0.88;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -64,19 +63,27 @@ impl Phase {
 /// Stand, then repeatedly relocate one foot inside its workspace.
 pub struct OneLegDrill {
     pub frame: Frame,
-    pub gait: Gait,
+    pub stand: Gait,
     pub phys: Physics,
     pub plant: ArticulatedPlant,
-    /// Standing joint setpoints. Stance legs are driven to these every tick.
+    /// Last planted joints. Stance motors hold these and yield; they are not walked.
     pub q_hold: [[f64; 3]; MAX_LEGS],
-    /// Standing foot in the body frame, one per leg.
+    /// Last planted body-frame foot, used to sample the next reachable plant.
     pub hold_body: [V3; MAX_LEGS],
-    /// World foot positions at the start of the current move.
+    /// World plants. Grey X on the canvas; stance motors are not IK'd here.
     pub origin_world: [V3; MAX_LEGS],
     pub origin_pos: V3,
     pub moving: usize,
+    /// World lift-off of the free foot, frozen at [`Self::begin_move`].
     pub from: V3,
+    /// World landing, frozen at [`Self::begin_move`]. The canvas mark is this.
     pub dest: V3,
+    /// Body-frame sample that produced `dest`, so the next plant can avoid it.
+    pub dest_body: V3,
+    /// Lagged yaw-only chassis the IK uses. Pitch/roll stay out: feeding them
+    /// back into the swing retargets the free foot and tips the machine.
+    pub ik_pos: V3,
+    pub ik_yaw: f64,
     pub phase: Phase,
     pub phase_t: f64,
     pub move_i: usize,
@@ -99,6 +106,7 @@ pub struct OneLegSample {
     pub roll: f64,
     pub vel: V3,
     pub cmd_body: V3,
+    pub cmd_world: V3,
     pub foot_body: V3,
     pub foot_world: V3,
     pub dest_body: V3,
@@ -116,25 +124,32 @@ pub struct OneLegSample {
 
 impl OneLegDrill {
     pub fn spawn(frame: Frame, phys: &Physics, seed: u64) -> Self {
-        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+        let stand = stand_pose(frame);
         let terrain = Terrain::new(Course::Flat, seed);
-        let plant = ArticulatedPlant::standing(frame, &gait, phys, &terrain);
+        let mut plant = ArticulatedPlant::standing(frame, &stand, phys, &terrain);
         let n = frame.legs();
         let mut q_hold = [[0.0; 3]; MAX_LEGS];
         let mut hold_body = [[0.0; 3]; MAX_LEGS];
         for i in 0..n {
-            hold_body[i] = standing_foot(frame, &gait, i);
+            hold_body[i] = standing_foot(frame, &stand, i);
             q_hold[i] = solve_ik(frame, i, hold_body[i]).q;
             clamp_joints(&mut q_hold[i]);
         }
+        for _ in 0..((SETTLE / DT) as usize) {
+            plant.drive(&q_hold, phys, DT);
+            substep(&mut plant, DT);
+        }
+        let (origin_pos, origin_yaw, _, _) = plant.chassis_pose();
         let mut origin_world = [[0.0; 3]; MAX_LEGS];
         for i in 0..n {
             origin_world[i] = plant.leg_joints_world(i)[3];
+            q_hold[i] = plant.leg_q(i);
+            hold_body[i] = to_body(origin_world[i], origin_pos, origin_yaw, 0.0, 0.0);
         }
-        let (origin_pos, _, _, _) = plant.chassis_pose();
+        plant.lock(&[true; MAX_LEGS], phys);
         OneLegDrill {
             frame,
-            gait,
+            stand,
             phys: *phys,
             plant,
             q_hold,
@@ -142,8 +157,11 @@ impl OneLegDrill {
             origin_world,
             origin_pos,
             moving: 0,
-            from: hold_body[0],
-            dest: hold_body[0],
+            from: origin_world[0],
+            dest: origin_world[0],
+            dest_body: hold_body[0],
+            ik_pos: origin_pos,
+            ik_yaw: origin_yaw,
             phase: Phase::Settle,
             phase_t: 0.0,
             move_i: 0,
@@ -158,17 +176,19 @@ impl OneLegDrill {
     pub fn pin_leg(&mut self, leg: usize) {
         self.fixed = Some(leg % self.n);
         self.moving = leg % self.n;
-        self.from = self.hold_body[self.moving];
+        self.from = self.origin_world[self.moving];
+        self.dest = self.origin_world[self.moving];
+        self.dest_body = self.hold_body[self.moving];
     }
 
-    /// Joint setpoints this tick: standing pose on every stance leg, IK of the
-    /// swing target on the free leg. Stance commands do not change.
+    /// Joint setpoints this tick. Stance (and a planted free foot) keep the
+    /// settled joints; only a swing is IK'd onto the world chord.
     pub fn cmd_q(&self) -> [[f64; 3]; MAX_LEGS] {
-        let u = (self.phase_t / self.phase_dur()).clamp(0.0, 1.0);
-        let cmd_body = self.cmd_body(smooth(u));
         let mut q = self.q_hold;
-        q[self.moving] = solve_ik(self.frame, self.moving, cmd_body).q;
-        clamp_joints(&mut q[self.moving]);
+        if self.phase.swinging() {
+            q[self.moving] = solve_ik(self.frame, self.moving, self.body_of(self.cmd_world())).q;
+            clamp_joints(&mut q[self.moving]);
+        }
         q
     }
 
@@ -180,13 +200,9 @@ impl OneLegDrill {
     }
 
     pub fn step(&mut self, dt: f64) {
-        if self.phase == Phase::Settle && self.phase_t == 0.0 && self.move_i == 0 {
-            self.capture_origin();
-        }
-
         let q = self.cmd_q();
         self.plant.drive(&q, &self.phys, dt);
-        self.plant.step(dt);
+        substep(&mut self.plant, dt);
 
         self.t += dt;
         self.phase_t += dt;
@@ -199,17 +215,10 @@ impl OneLegDrill {
         let (pos, yaw, pitch, roll) = self.plant.chassis_pose();
         let vel = self.plant.chassis_vel();
         let u = (self.phase_t / self.phase_dur()).clamp(0.0, 1.0);
-        let cmd_body = self.cmd_body(smooth(u));
+        let cmd_world = self.cmd_world();
+        let cmd_body = self.body_of(cmd_world);
         let foot_world = self.plant.leg_joints_world(self.moving)[3];
         let foot_body = to_body(foot_world, pos, yaw, pitch, roll);
-        let cmd_world = {
-            let w = body_to_world(cmd_body, yaw, pitch, roll);
-            [pos[0] + w[0], pos[1] + w[1], pos[2] + w[2]]
-        };
-        let dest_world = {
-            let w = body_to_world(self.dest, yaw, pitch, roll);
-            [pos[0] + w[0], pos[1] + w[1], pos[2] + w[2]]
-        };
         let reach_err = dist(foot_world, cmd_world);
         let mut stance_drift = 0.0f64;
         for i in 0..self.n {
@@ -233,10 +242,11 @@ impl OneLegDrill {
             roll,
             vel,
             cmd_body,
+            cmd_world,
             foot_body,
             foot_world,
-            dest_body: self.dest,
-            dest_world,
+            dest_body: self.dest_body,
+            dest_world: self.dest,
             reach_err,
             chassis_xz: hypot2(pos[0] - self.origin_pos[0], pos[2] - self.origin_pos[2]),
             stance_drift,
@@ -257,26 +267,46 @@ impl OneLegDrill {
         }
     }
 
-    fn cmd_body(&self, u: f64) -> V3 {
+    fn cmd_world(&self) -> V3 {
         match self.phase {
             Phase::Settle => self.from,
             Phase::Pause => self.dest,
-            Phase::Lift => [
-                self.from[0],
-                self.from[1] + LIFT_H * u,
-                self.from[2],
-            ],
-            Phase::Shift => [
-                self.from[0] + (self.dest[0] - self.from[0]) * u,
-                self.from[1].max(self.dest[1]) + LIFT_H,
-                self.from[2] + (self.dest[2] - self.from[2]) * u,
-            ],
-            Phase::Place => [
-                self.dest[0],
-                self.dest[1] + LIFT_H * (1.0 - u),
-                self.dest[2],
-            ],
+            Phase::Lift | Phase::Shift | Phase::Place => self.swing_world(smooth(self.swing_clock())),
         }
+    }
+
+    fn swing_clock(&self) -> f64 {
+        let t = match self.phase {
+            Phase::Lift => self.phase_t,
+            Phase::Shift => LIFT_T + self.phase_t,
+            Phase::Place => LIFT_T + SHIFT_T + self.phase_t,
+            _ => 0.0,
+        };
+        (t / SWING_T).clamp(0.0, 1.0)
+    }
+
+    fn swing_world(&self, s: f64) -> V3 {
+        let a = LIFT_T / SWING_T;
+        let b = (LIFT_T + SHIFT_T) / SWING_T;
+        let apex_y = self.from[1].max(self.dest[1]) + LIFT_H;
+        if s <= a {
+            let u = (s / a).clamp(0.0, 1.0);
+            [self.from[0], lerp(self.from[1], apex_y, u), self.from[2]]
+        } else if s <= b {
+            let u = ((s - a) / (b - a)).clamp(0.0, 1.0);
+            [
+                lerp(self.from[0], self.dest[0], u),
+                apex_y,
+                lerp(self.from[2], self.dest[2], u),
+            ]
+        } else {
+            let u = ((s - b) / (1.0 - b).max(1e-9)).clamp(0.0, 1.0);
+            [self.dest[0], lerp(apex_y, self.dest[1], u), self.dest[2]]
+        }
+    }
+
+    fn body_of(&self, world: V3) -> V3 {
+        to_body(world, self.ik_pos, self.ik_yaw, 0.0, 0.0)
     }
 
     fn advance_phase(&mut self) {
@@ -288,11 +318,16 @@ impl OneLegDrill {
             }
             Phase::Lift => Phase::Shift,
             Phase::Shift => Phase::Place,
-            Phase::Place => Phase::Pause,
-            Phase::Pause => {
-                self.q_hold[self.moving] = solve_ik(self.frame, self.moving, self.dest).q;
+            Phase::Place => {
+                let foot = self.plant.leg_joints_world(self.moving)[3];
+                self.origin_world[self.moving] = foot;
+                self.hold_body[self.moving] = self.body_of(foot);
+                self.q_hold[self.moving] = self.plant.leg_q(self.moving);
                 clamp_joints(&mut self.q_hold[self.moving]);
-                self.hold_body[self.moving] = self.dest;
+                self.plant.lock(&[true; MAX_LEGS], &self.phys);
+                Phase::Pause
+            }
+            Phase::Pause => {
                 self.move_i += 1;
                 self.begin_move();
                 Phase::Lift
@@ -302,23 +337,50 @@ impl OneLegDrill {
 
     fn begin_move(&mut self) {
         self.moving = self.fixed.unwrap_or(self.move_i % self.n);
-        self.from = self.hold_body[self.moving];
-        self.dest = sample_plant(
-            self.frame,
-            &self.gait,
-            self.moving,
-            &mut self.rng,
-            self.from,
-        );
-        self.capture_origin();
+        let (pos, yaw, _, _) = self.plant.chassis_pose();
+        self.ik_pos[0] = pos[0];
+        self.ik_pos[2] = pos[2];
+        self.ik_yaw = yaw;
+        self.from = self.plant.leg_joints_world(self.moving)[3];
+        self.origin_world[self.moving] = self.from;
+        let avoid = self.hold_body[self.moving];
+        for _ in 0..80 {
+            let cand = sample_plant(self.frame, &self.stand, self.moving, &mut self.rng, avoid);
+            let dest = self.world_plant(cand);
+            if reachable(self.frame, self.moving, self.body_of(dest))
+                && hypot2(dest[0] - self.from[0], dest[2] - self.from[2]) >= 0.28
+            {
+                self.dest_body = cand;
+                self.dest = dest;
+                return;
+            }
+        }
+        self.dest_body = standing_foot(self.frame, &self.stand, self.moving);
+        self.dest = self.world_plant(self.dest_body);
     }
 
-    fn capture_origin(&mut self) {
-        let (pos, _, _, _) = self.plant.chassis_pose();
-        self.origin_pos = pos;
-        for i in 0..self.n {
-            self.origin_world[i] = self.plant.leg_joints_world(i)[3];
-        }
+    fn world_plant(&self, body: V3) -> V3 {
+        let w = body_to_world(body, self.ik_yaw, 0.0, 0.0);
+        [
+            self.ik_pos[0] + w[0],
+            FOOT_R,
+            self.ik_pos[2] + w[2],
+        ]
+    }
+}
+
+fn stand_pose(frame: Frame) -> Gait {
+    Gait {
+        frame,
+        cycle: 1.0,
+        stride: 0.0,
+        step_h: 0.0,
+        body_h: RIDE,
+        stance_w: 2.0 * (frame.hip_r() + 0.40),
+        duty: 1.0,
+        offsets: [0.0; MAX_LEGS],
+        trim_front: 0.0,
+        trim_rear: 0.0,
     }
 }
 
@@ -382,6 +444,15 @@ fn dist(a: V3, b: V3) -> f64 {
     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
 }
 
+fn substep(plant: &mut ArticulatedPlant, dt: f64) {
+    // ponytail: contact at the control rate skates the plants. Split the tick.
+    let n = 8;
+    let h = dt / n as f64;
+    for _ in 0..n {
+        plant.step(h);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +461,7 @@ mod tests {
     #[test]
     fn sampled_plants_are_inside_the_workspace() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let gait = stand_pose(frame);
         let mut rng = Rng::new(3);
         for leg in 0..6 {
             let avoid = standing_foot(frame, &gait, leg);
@@ -422,7 +493,15 @@ mod tests {
         let mut max_travel = 0.0f64;
         let mut max_clear = 0.0f64;
         let mut min_y = f64::INFINITY;
-        let q_stance0 = drill.q_hold[1];
+        let mut dest0 = None;
+        let mut dest_wander = 0.0f64;
+        let mut cmd_reversals = 0usize;
+        let mut prev_cmd: Option<V3> = None;
+        let mut prev_to_dest: Option<f64> = None;
+        let mut land_err = 0.0f64;
+        let mut stance_path = 0.0f64;
+        let mut prev_stance: Option<[V3; MAX_LEGS]> = None;
+        let mut max_overshoot = 0.0f64;
         for _ in 0..ticks {
             drill.step(DT);
             let s = drill.sample();
@@ -434,22 +513,65 @@ mod tests {
                 max_chassis = max_chassis.max(s.chassis_xz);
                 max_travel = max_travel.max(s.moving_travel);
             }
-            if s.phase.swinging() {
-                let q1 = drill.cmd_q()[1];
-                for j in 0..3 {
-                    assert!(
-                        (q1[j] - q_stance0[j]).abs() < 1e-12,
-                        "stance leg 1 commanded while L1 swung: {:?} vs {:?}",
-                        q1,
-                        q_stance0
-                    );
+            if s.phase == Phase::Pause || s.phase == Phase::Place && s.phase_u > 0.85 {
+                land_err = land_err.max(hypot2(
+                    s.foot_world[0] - s.dest_world[0],
+                    s.foot_world[2] - s.dest_world[2],
+                ));
+            }
+            if s.phase == Phase::Place || s.phase == Phase::Pause {
+                let from_dest = hypot2(
+                    drill.from[0] - s.dest_world[0],
+                    drill.from[2] - s.dest_world[2],
+                );
+                let from_foot = hypot2(
+                    drill.from[0] - s.foot_world[0],
+                    drill.from[2] - s.foot_world[2],
+                );
+                if from_foot > from_dest + 0.04 {
+                    max_overshoot = max_overshoot.max(hypot2(
+                        s.foot_world[0] - s.dest_world[0],
+                        s.foot_world[2] - s.dest_world[2],
+                    ));
                 }
             }
-            assert!(!s.fallen, "fell at t={:.2} y={:.3}", s.t, s.pos[1]);
+            let mut feet = [[0.0; 3]; MAX_LEGS];
+            for i in 0..6 {
+                feet[i] = drill.plant.leg_joints_world(i)[3];
+            }
+            if let Some(prev) = prev_stance {
+                for i in 1..6 {
+                    stance_path += dist(feet[i], prev[i]);
+                }
+            }
+            prev_stance = Some(feet);
+            if s.phase.swinging() {
+                let dest = dest0.get_or_insert(s.dest_world);
+                dest_wander = dest_wander.max(dist(s.dest_world, *dest));
+                let to_dest = hypot2(
+                    s.cmd_world[0] - s.dest_world[0],
+                    s.cmd_world[2] - s.dest_world[2],
+                );
+                if let (Some(prev), Some(d0)) = (prev_cmd, prev_to_dest) {
+                    let step = dist(s.cmd_world, prev);
+                    if s.phase == Phase::Shift && to_dest > d0 + 0.02 && step > 0.004 {
+                        cmd_reversals += 1;
+                    }
+                }
+                prev_cmd = Some(s.cmd_world);
+                prev_to_dest = Some(to_dest);
+            } else {
+                dest0 = None;
+                prev_cmd = None;
+                prev_to_dest = None;
+            }
+            assert!(!s.fallen, "fell at t={:.2} y={:.3} pitch={:.3} drift={:.3} land={:.3}", s.t, s.pos[1], s.pitch, s.stance_drift, hypot2(s.foot_world[0]-s.dest_world[0], s.foot_world[2]-s.dest_world[2]));
         }
         eprintln!(
             "oneleg: min_y={min_y:.3} travel={max_travel:.3} stance_drift={max_stance:.3} \
-             chassis_xz={max_chassis:.3} max_clear={max_clear:.3}"
+             chassis_xz={max_chassis:.3} max_clear={max_clear:.3} dest_wander={dest_wander:.4} \
+             reversals={cmd_reversals} land_err={land_err:.3} overshoot={max_overshoot:.3} \
+             stance_path={stance_path:.3}"
         );
         assert!(
             min_y > 0.55,
@@ -464,12 +586,96 @@ mod tests {
             "moving foot barely left its plant: travel={max_travel:.3}"
         );
         assert!(
-            max_stance < max_travel,
-            "stance feet slid as far as the swing: stance_drift={max_stance:.3} travel={max_travel:.3}"
+            max_stance < 0.16,
+            "stance feet wandered: stance_drift={max_stance:.3} travel={max_travel:.3}"
+        );
+        assert!(
+            stance_path < 4.0,
+            "stance feet trembled: path={stance_path:.3} m over 6 s"
+        );
+        assert!(
+            land_err < 0.10,
+            "moving foot missed the landing mark: {land_err:.3} m"
+        );
+        assert!(
+            max_overshoot < 0.12,
+            "moving foot ran past the mark: {max_overshoot:.3} m"
         );
         assert!(
             max_chassis < 0.70,
             "chassis walked away: Δxz={max_chassis:.3} travel={max_travel:.3} stance={max_stance:.3}"
+        );
+        assert!(
+            dest_wander < 0.01,
+            "landing mark crawled during the swing: {dest_wander:.4} m"
+        );
+        assert!(
+            cmd_reversals == 0,
+            "swing command reversed {cmd_reversals} times"
+        );
+    }
+
+    #[test]
+    fn the_landing_is_a_world_point_not_a_body_frame_ghost() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let mut drill = OneLegDrill::spawn(frame, &phys, 1);
+        drill.pin_leg(0);
+        drill.start_lifting();
+        let dest0 = drill.dest;
+        let mut pitch_seen = 0.0f64;
+        let ticks = ((LIFT_T + SHIFT_T + PLACE_T) / DT) as usize;
+        for _ in 0..ticks {
+            drill.step(DT);
+            let s = drill.sample();
+            pitch_seen = pitch_seen.max(s.pitch.abs());
+            assert!(
+                dist(s.dest_world, dest0) < 1e-9,
+                "dest moved from {:?} to {:?} at t={:.3} pitch={:.3}",
+                dest0,
+                s.dest_world,
+                s.t,
+                s.pitch
+            );
+            if s.phase.swinging() {
+                assert_eq!(s.moving, 0);
+            }
+        }
+        assert!(
+            drill.move_i >= 1 || drill.phase == Phase::Pause,
+            "never finished a plant: phase={:?} move={}",
+            drill.phase,
+            drill.move_i
+        );
+        let _ = pitch_seen;
+    }
+
+    #[test]
+    fn settled_feet_do_not_buzz_in_place() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let mut drill = OneLegDrill::spawn(frame, &phys, 1);
+        let mut path = 0.0f64;
+        let mut prev: Option<[V3; MAX_LEGS]> = None;
+        let ticks = (1.0 / DT) as usize;
+        for _ in 0..ticks {
+            drill.step(DT);
+            let mut feet = [[0.0; 3]; MAX_LEGS];
+            for i in 0..6 {
+                feet[i] = drill.plant.leg_joints_world(i)[3];
+            }
+            if let Some(p) = prev {
+                for i in 0..6 {
+                    path += dist(feet[i], p[i]);
+                }
+            }
+            prev = Some(feet);
+            assert!(!drill.sample().fallen, "sat down while standing still");
+        }
+        eprintln!("sit-still path={path:.4} (6 legs, 1 s)");
+        assert!(
+            path < 0.70,
+            "standing feet buzzed: path={path:.3} m over 1 s"
         );
     }
 }

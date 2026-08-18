@@ -12,8 +12,8 @@
 //! hexapod servo                     the same gait on every servo
 //! ```
 //!
-//! `oneleg` is the empty-field drill: five legs hold their standing joint
-//! setpoints (friction only, nothing welded to the floor) while one foot lifts
+//! `oneleg` is the empty-field drill: five legs hold their world plants
+//! (friction only, nothing welded to the floor) while one foot lifts
 //! and plants a random reachable spot in its workspace.
 //!
 //! `watch` runs the Rapier plant and prints pose, 3-axis velocity, heading,
@@ -586,7 +586,7 @@ fn oneleg(frame: Frame, seed: u64, phys: Physics, args: &[String]) {
         moves
     );
     println!(
-        "# stance legs hold standing joint setpoints; the free foot lifts and \
+        "# stance legs hold their world plants; the free foot lifts and \
          plants a random reachable spot in its workspace"
     );
     println!(

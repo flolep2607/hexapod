@@ -539,6 +539,50 @@ impl ArticulatedPlant {
         }
     }
 
+    /// Snap `legs` to their current hinge angles and leave a brake on.
+    /// They still yield under load; they are not walked.
+    pub fn lock(
+        &mut self,
+        legs: &[bool; MAX_LEGS],
+        phys: &Physics,
+    ) {
+        let stall = phys.actuator.stall_nm as f32 / phys.scale as f32;
+        for i in 0..self.n {
+            if !legs[i] {
+                continue;
+            }
+            for j in 0..3 {
+                let Some(leg) = self.legs[i].as_ref() else {
+                    continue;
+                };
+                let h = leg.hinges[j];
+                let at = self.joint_angle(h) - h.q0;
+                if let Some(leg) = self.legs[i].as_mut() {
+                    leg.hinges[j].set = at;
+                }
+            }
+            self.hold_leg(i, stall);
+        }
+    }
+
+    /// Re-assert the frozen servo setpoint. The joint can sag; the target cannot.
+    fn hold_leg(&mut self, i: usize, stall: f32) {
+        for j in 0..3 {
+            let Some(leg) = self.legs[i].as_ref() else {
+                continue;
+            };
+            let h = leg.hinges[j];
+            let Some(joint) = self.impulse_joints.get_mut(h.joint, true) else {
+                continue;
+            };
+            let Some(rev) = joint.data.as_revolute_mut() else {
+                continue;
+            };
+            rev.set_motor_position(h.set, STIFF_PER_STALL * stall, 8.0 * stall);
+            rev.set_motor_max_force(stall);
+        }
+    }
+
     pub fn step(&mut self, dt: f64) {
         self.integration.dt = dt as f32;
         self.pipeline.step(

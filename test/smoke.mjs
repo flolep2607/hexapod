@@ -491,6 +491,8 @@ async function onelegDrill(h) {
   let maxClear = 0;
   let sawOneSwing = false;
   let extraSwing = false;
+  let destWander = 0;
+  let dest0 = null;
   let on = false;
   for (let i = 0; i < 10; i++) {
     await stepSamples(18);
@@ -501,11 +503,22 @@ async function onelegDrill(h) {
     if (s.phase >= 1 && s.phase <= 3) {
       if (swinging === 1 && s.moving === 0) sawOneSwing = true;
       if (swinging > 1) extraSwing = true;
+      if (dest0) {
+        destWander = Math.max(
+          destWander,
+          Math.hypot(s.dest[0] - dest0[0], s.dest[1] - dest0[1], s.dest[2] - dest0[2])
+        );
+      } else {
+        dest0 = s.dest;
+      }
+    } else {
+      dest0 = null;
     }
   }
   check("telemetry says the drill is on", on);
   check("only L1 drops its stance flag", sawOneSwing && !extraSwing, `clear ${maxClear.toFixed(3)}`);
   check("the free foot leaves the floor", maxClear > 0.10, `${maxClear.toFixed(3)} m clearance`);
+  check("the landing mark stays put during the swing", destWander < 0.02, `${destWander.toFixed(4)} m`);
   const hud = await page.evaluate(() => ({
     gait: document.getElementById("hudGait").textContent,
     drill: document.getElementById("hudDrill").hidden,

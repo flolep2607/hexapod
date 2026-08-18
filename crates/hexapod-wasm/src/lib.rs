@@ -57,7 +57,7 @@ struct App {
     /// body; joint angles still never travel back. ARS trains on the
     /// centroidal step alone, with no plant in the loop.
     plant: Option<ArticulatedPlant>,
-    /// Empty-field drill: five legs hold standing joint setpoints, one relocates.
+    /// Empty-field drill: five legs hold their world plants, one relocates.
     /// When this is `Some`, `plant` is unused and the canvas reads the drill.
     oneleg: Option<OneLegDrill>,
     /// Which leg the dashboard drill keeps relocating.
@@ -630,7 +630,7 @@ impl App {
         self.since_fall = 0.0;
     }
 
-    /// Empty plane, five legs holding standing joint setpoints, one free foot.
+    /// Empty plane, five legs holding settled joints, one free foot.
     /// The canvas draws this plant; the walking Rapier body is dropped.
     fn start_oneleg(&mut self) {
         if self.course != Course::Flat {
@@ -1190,10 +1190,8 @@ mod tests {
         let ticks = (2.4 / dt) as usize;
         let mut max_clear = 0.0f32;
         let mut saw_one_swing = false;
-        let mut q_hold = [0.0f32; 3];
-        for c in 0..3 {
-            q_hold[c] = tel()[T_QCMD + 3 + c];
-        }
+        let mut dest0: Option<[f32; 3]> = None;
+        let mut dest_wander = 0.0f32;
         for _ in 0..ticks {
             hx_step(dt, 0.0, 0.0);
             let t = tel();
@@ -1210,20 +1208,29 @@ mod tests {
             if phase >= 1.0 && phase <= 3.0 {
                 assert_eq!(swing, 1, "phase {phase} swung {swing} legs");
                 saw_one_swing = true;
+                let dest = [t[T_DEST], t[T_DEST + 1], t[T_DEST + 2]];
+                if let Some(d0) = dest0 {
+                    let wander = ((dest[0] - d0[0]).powi(2)
+                        + (dest[1] - d0[1]).powi(2)
+                        + (dest[2] - d0[2]).powi(2))
+                    .sqrt();
+                    dest_wander = dest_wander.max(wander);
+                } else {
+                    dest0 = Some(dest);
+                }
             } else {
+                dest0 = None;
                 assert_eq!(swing, 0, "phase {phase} should plant every foot");
-            }
-            for c in 0..3 {
-                assert!(
-                    (t[T_QCMD + 3 + c] - q_hold[c]).abs() < 1e-5,
-                    "stance leg R1 joint {c} commanded away from hold"
-                );
             }
         }
         assert!(saw_one_swing, "never entered lift/shift/place");
         assert!(
             max_clear > 0.12,
             "moving foot never left the floor: clearance={max_clear}"
+        );
+        assert!(
+            dest_wander < 0.01,
+            "landing mark crawled during the swing: {dest_wander}"
         );
     }
 }
