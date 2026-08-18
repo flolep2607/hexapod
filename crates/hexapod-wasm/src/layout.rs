@@ -114,7 +114,26 @@ pub const T_N_HINGES: usize = 387;
 /// World xyz of the mass-weighted centre of mass of the drawn robot.
 pub const T_COM3: usize = 388; // 3
 
-pub const T_LEN: usize = 392;
+/// 1 while the empty-field one-leg drill is running instead of a walk.
+pub const T_ONELEG: usize = 391;
+/// Index of the free leg.
+pub const T_MOVE_LEG: usize = 392;
+/// 0 settle, 1 lift, 2 shift, 3 place, 4 pause.
+pub const T_MOVE_PHASE: usize = 393;
+/// How many plants the free leg has completed.
+pub const T_MOVE_I: usize = 394;
+/// Furthest a stance foot has slid from its plant at the start of this move.
+pub const T_STANCE_DRIFT: usize = 395;
+/// Chassis travel in xz since the start of this move.
+pub const T_CHASSIS_XZ: usize = 396;
+/// Moving-foot clearance above the floor, metres (centre minus sole radius).
+pub const T_FOOT_CLEAR: usize = 397;
+/// World xyz of each foot at the start of the current move. 10 legs × 3.
+pub const T_ORIGIN: usize = 398;
+/// World xyz the free foot is aiming at.
+pub const T_DEST: usize = 428; // 3
+
+pub const T_LEN: usize = 432;
 
 // --- system-sizing result buffer, written by hx_solve_system --------------
 

@@ -79,6 +79,7 @@ const state = {
   iterMs: 0,
   build: { mass: 2.0, femurMm: 80, safety: 1.35 },
   cruise: 4.0,
+  onelegLeg: 0,
   /* Index into the servo catalogue whose torque-speed line drives the joints,
    * or -1 for the generic 20 kg-cm default. */
   servo: -1,
@@ -104,6 +105,10 @@ const circMean = (xs) => {
   return frac(Math.atan2(sy, sx) / (2 * Math.PI));
 };
 const fmt = (v, d = 2) => (Number.isFinite(v) ? v.toFixed(d) : "—");
+const signed = (v, d = 2) => {
+  const s = fmt(v, d);
+  return v >= 0 ? `+${s}` : s;
+};
 
 /* ------------------------------------------------------------------ wasm */
 
@@ -691,6 +696,15 @@ function buildLegUI() {
         `<div class="bar"><span>${n}</span><div class="track"><div class="fill" id="load${i}"></div></div></div>`
     )
     .join("");
+  const ol = $("onelegBtns");
+  if (ol) {
+    ol.innerHTML = legNames()
+      .map(
+        (n, i) =>
+          `<button class="btn" data-oneleg="${i}" data-on="${i === state.onelegLeg}">${n}</button>`
+      )
+      .join("");
+  }
 }
 
 function buildStaticUI() {
@@ -790,21 +804,60 @@ function syncSliders() {
     $(`pv${i}`).textContent = `${v.toFixed(p.dp)}${p.unit ? " " + p.unit : ""}`;
     const el = $(`pr${i}`);
     el.value = Math.round(((v - lo) / (hi - lo)) * 1000);
-    el.disabled = state.mode === 1;
+    el.disabled = state.mode !== 0;
   });
-  $("paramLock").textContent = state.mode === 1 ? "set by policy" : "";
+  $("paramLock").textContent =
+    state.mode === 1 ? "set by policy" : state.mode === 2 ? "one-leg drill" : "";
 }
 
 function setMode(mode) {
+  if (mode === 2 && state.courseKind !== 0) {
+    state.courseKind = 0;
+    api.hx_set_course(0, state.seed);
+    readCourse();
+    document
+      .querySelectorAll("[data-course]")
+      .forEach((b) => (b.dataset.on = String(+b.dataset.course === 0)));
+    $("hCourse").textContent = "FLAT";
+    $("trCourse").textContent = "FLAT";
+    $("tSummary").textContent =
+      `FLAT · seed ${state.seed} · ${api.hx_course_len()} obstacles · ${api.hx_route_len()} waypoints`;
+    $("tNote").textContent = COURSE_NOTES.FLAT || "";
+  }
   state.mode = mode;
   api.hx_set_mode(mode);
   $("btnBase").dataset.on = mode === 0;
   $("btnLearn").dataset.on = mode === 1;
-  $("hPolicy").textContent = mode === 1 ? "LEARNED" : "HAND-TUNED";
+  const btnOl = $("btnOneleg");
+  const btnWalk = $("btnWalk");
+  if (btnOl) btnOl.dataset.on = String(mode === 2);
+  if (btnWalk) btnWalk.dataset.on = String(mode !== 2);
+  $("hPolicy").textContent = mode === 2 ? "ONE LEG" : mode === 1 ? "LEARNED" : "HAND-TUNED";
   syncSliders();
   refreshGaitTable();
   updateHardware();
-  log(mode === 1 ? "policy.use(\"learned\")" : "policy.use(\"hand-tuned\")");
+  if (mode === 2) {
+    api.hx_set_oneleg_leg(state.onelegLeg);
+    state.cmd = { fwd: 0, turn: 0 };
+    document.querySelectorAll("[data-cmd]").forEach((b) => (b.dataset.on = "false"));
+    const stop = document.querySelector('[data-cmd="stop"]');
+    if (stop) stop.dataset.on = "true";
+    if (stage && stage.setView) {
+      stage.setView("orbit");
+      stage.az = -1.05;
+      stage.el = 0.34;
+      stage.dist = 5.2;
+    }
+    log(`drill.oneleg("${legNames()[state.onelegLeg] || "L1"}")`);
+  } else {
+    if (state.cmd.fwd === 0 && state.cmd.turn === 0) {
+      state.cmd = { fwd: 1, turn: 0 };
+      document.querySelectorAll("[data-cmd]").forEach((b) => (b.dataset.on = "false"));
+      const fwd = document.querySelector('[data-cmd="fwd"]');
+      if (fwd) fwd.dataset.on = "true";
+    }
+    log(mode === 1 ? "policy.use(\"learned\")" : "policy.use(\"hand-tuned\")");
+  }
 }
 
 function setTab(name) {
@@ -1197,17 +1250,50 @@ function updateReadouts(t) {
       ? "TURNING"
       : "WALKING"
     : "STANDING";
+  const oneleg = L.T_ONELEG != null && t[L.T_ONELEG] > 0.5;
+  const hudWalk = $("hudWalk");
+  const hudDrill = $("hudDrill");
+  if (hudWalk) hudWalk.hidden = oneleg;
+  if (hudDrill) hudDrill.hidden = !oneleg;
+  if (oneleg) {
+    const phases = ["SETTLE", "LIFT", "SHIFT", "PLACE", "PAUSE"];
+    const movingLeg = Math.round(t[L.T_MOVE_LEG]);
+    const phaseName = phases[Math.round(t[L.T_MOVE_PHASE])] || "ONE-LEG";
+    $("hudOlLeg").textContent = legNames()[movingLeg] || String(movingLeg);
+    $("hudOlPhase").textContent = phaseName;
+    $("hudOlMove").textContent = String(Math.round(t[L.T_MOVE_I]));
+    $("hudOlClear").textContent = fmt(t[L.T_FOOT_CLEAR], 2);
+    $("hudOlDrift").textContent = fmt(t[L.T_STANCE_DRIFT], 2);
+    $("hudOlXz").textContent = fmt(t[L.T_CHASSIS_XZ], 2);
+    $("hState").textContent = phaseName;
+    $("hudGait").textContent = "ONE LEG";
+    const callout = $("drillCallout");
+    const calloutLine = $("drillCalloutLine");
+    if (callout) callout.hidden = false;
+    if (calloutLine) {
+      calloutLine.textContent = `${legNames()[movingLeg] || "L1"} · ${phaseName} · the red leg is the only one commanded`;
+    }
+  } else {
+    const callout = $("drillCallout");
+    if (callout) callout.hidden = true;
+  }
   $("banner").textContent = broken ? "BROKEN" : "DEAD";
   $("banner").dataset.on = String(fallen || broken);
 
   $("hudGait").textContent =
-    state.mode === 1 ? "LEARNED" : presetName(state.preset).toUpperCase();
+    state.mode === 2 ? "ONE LEG" : state.mode === 1 ? "LEARNED" : presetName(state.preset).toUpperCase();
   $("hudDuty").textContent = fmt(t[L.T_DUTY_NOW], 2);
   $("hudY").textContent = (t[L.T_POS + 1] >= 0 ? "+" : "") + fmt(t[L.T_POS + 1], 2);
   $("hudPhase").textContent = fmt(t[L.T_PHASE], 2);
   $("hudMargin").textContent = fmt(t[L.T_MARGIN], 2);
   $("hudV").textContent = fmt(Math.hypot(t[L.T_VEL], t[L.T_VEL + 1]), 2);
   $("hudVc").textContent = fmt(t[L.T_CMD_SPEED], 2);
+  $("hudVx").textContent = signed(t[L.T_VEL], 2);
+  $("hudVy").textContent = signed(t[L.T_VY], 2);
+  $("hudVz").textContent = signed(t[L.T_VEL + 1], 2);
+  $("hudSlip").textContent = fmt(t[L.T_SLIP_RATE] > 0 ? t[L.T_SLIP_RATE] / (1 / 100) : 0, 2);
+  const head = (t[L.T_YAW] * 180) / Math.PI;
+  $("hudHead").textContent = `${head >= 0 ? "+" : ""}${head.toFixed(0)}°`;
   $("hudW").textContent = fmt(t[L.T_STEER] * 1.1, 2);
   // Where it is being asked to go, and whether it is choosing that itself.
   const nav = t[L.T_NAV] > 0.5 && Math.abs(state.cmd.turn) < 0.02;
@@ -1355,6 +1441,8 @@ function wire() {
 
   $("btnBase").addEventListener("click", () => setMode(0));
   $("btnLearn").addEventListener("click", () => setMode(1));
+  $("btnOneleg").addEventListener("click", () => setMode(2));
+  $("btnWalk").addEventListener("click", () => setMode(0));
 
   $("btnTrain").addEventListener("click", () => {
     state.training = !state.training;
@@ -1391,6 +1479,16 @@ function wire() {
   cfg();
 
   document.addEventListener("click", (e) => {
+    const ol = e.target.closest("[data-oneleg]");
+    if (ol) {
+      state.onelegLeg = +ol.dataset.oneleg;
+      document
+        .querySelectorAll("[data-oneleg]")
+        .forEach((b) => (b.dataset.on = String(+b.dataset.oneleg === state.onelegLeg)));
+      api.hx_set_oneleg_leg(state.onelegLeg);
+      if (state.mode !== 2) setMode(2);
+      else log(`drill.leg("${legNames()[state.onelegLeg]}")`);
+    }
     const pb = e.target.closest("[data-preset]");
     if (pb) {
       state.preset = +pb.dataset.preset;
@@ -1625,10 +1723,31 @@ async function boot() {
   updateSystem();
   updateTrainingPanel();
   describeMachine();
+  setMode(2);
 
   /* Hooks for the end-to-end test, which drives the real page rather than
    * reimplementing any of it. Nothing else uses them. */
   window.__hxFalls = falls;
+  window.__hxOneleg = () => {
+    const t = telemetry();
+    const legs = Math.round(t[L.T_LEGS]) || 6;
+    const stance = [];
+    for (let i = 0; i < legs; i++) stance.push(t[L.T_STANCE + i] > 0.5 ? 1 : 0);
+    const phases = ["settle", "lift", "shift", "place", "pause"];
+    return {
+      on: L.T_ONELEG != null && t[L.T_ONELEG] > 0.5,
+      moving: Math.round(t[L.T_MOVE_LEG] || 0),
+      phase: Math.round(t[L.T_MOVE_PHASE] || 0),
+      phaseName: phases[Math.round(t[L.T_MOVE_PHASE] || 0)] || "—",
+      clear: t[L.T_FOOT_CLEAR] || 0,
+      drift: t[L.T_STANCE_DRIFT] || 0,
+      chassis: t[L.T_CHASSIS_XZ] || 0,
+      stance,
+      policy: $("hPolicy").textContent,
+      state: $("hState").textContent,
+      course: $("hCourse").textContent,
+    };
+  };
   // Advance the actual WASM plant deterministically without waiting for wall
   // time. The smoke suite still verifies the animation loop separately; long
   // physics assertions use this to avoid sleeping through simulated seconds.

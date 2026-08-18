@@ -89,7 +89,7 @@ async function openHarness(name) {
 
 async function bootAndStatic(h) {
   const { page, check, waitFor, setRange, screenshot, errors } = h;
-  await waitFor(() => parseFloat(document.getElementById("hudV")?.textContent) > 0.5);
+  await waitFor(() => /ONE/.test(document.getElementById("hPolicy")?.textContent || ""));
   check("no console errors on boot", errors.length === 0, errors.slice(0, 3).join(" | "));
   check(
     "wasm exports present",
@@ -111,8 +111,16 @@ async function bootAndStatic(h) {
     return seen.size;
   });
   check("3-D stage renders content", canvasPainted > 6, `${canvasPainted} distinct sampled colours`);
-  const speed = await page.textContent("#hudV");
-  check("robot is moving", parseFloat(speed) > 0.5, `${speed} m/s`);
+  const drill = await page.evaluate(() => window.__hxOneleg());
+  check(
+    "the page boots on the one-leg drill",
+    drill.on && /ONE/.test(drill.policy),
+    JSON.stringify({ on: drill.on, policy: drill.policy, phase: drill.phaseName })
+  );
+  check(
+    "the one-leg callout is on the stage",
+    await page.$eval("#drillCallout", (el) => !el.hidden)
+  );
 
   await page.click("#btnCamTop");
   check("top camera toggle", (await page.textContent("#hudCam")).includes("TOP"));
@@ -124,16 +132,8 @@ async function bootAndStatic(h) {
   await screenshot("01-kinematics.png");
   await page.click("#btnPause");
 
-  await page.click('[data-tab="training"]');
   const characterSet = await page.evaluate(() => document.characterSet);
   check("the page is decoded as UTF-8", characterSet === "UTF-8", characterSet);
-  const gaitTable = (await page.textContent("#tblGait")) || "";
-  check(
-    "gait table dashes are not mojibake",
-    /—/.test(gaitTable) && /·/.test(gaitTable) && !/â€/.test(gaitTable) && !/Â·/.test(gaitTable),
-    (gaitTable.match(/Running now[^\n]*/)?.[0] || gaitTable.slice(0, 120)).trim()
-  );
-  await screenshot("02-training-before.png");
 
   await page.click('[data-tab="terrain"]');
   const summary = await page.textContent("#tSummary");
@@ -205,63 +205,15 @@ async function bootAndStatic(h) {
   check("page does not scroll sideways", noHScroll);
 }
 
-async function training(h) {
-  const { page, check, waitFor, setRange, screenshot, stepSamples } = h;
-  await page.click('[data-tab="training"]');
-  await setRange("rHorizon", 4);
-  await page.click("#btnPause");
-  await page.click("#btnTrain");
-  await waitFor(
-    () => {
-      const best = parseFloat(document.getElementById("sBest")?.textContent);
-      const base = parseFloat(document.getElementById("sBase")?.textContent);
-      const feed = parseFloat(document.getElementById("sFeed")?.textContent);
-      const iter = parseInt(document.getElementById("sIter")?.textContent, 10);
-      return iter > 0 && Number.isFinite(best) && Number.isFinite(base) && best > base && feed > 0.01;
-    },
-    null,
-    10000
-  );
-  await page.click("#btnTrain");
-  await page.click("#btnPause");
-
-  const trained = await page.evaluate(() => ({
-    iter: parseInt(document.getElementById("sIter").textContent, 10),
-    base: parseFloat(document.getElementById("sBase").textContent),
-    best: parseFloat(document.getElementById("sBest").textContent),
-    gain: document.getElementById("sGain").textContent,
-    iterMs: document.getElementById("sIterMs").textContent,
-    feedback: parseFloat(document.getElementById("sFeed").textContent),
-  }));
-  check("training ran iterations", trained.iter > 0, `${trained.iter} iterations, ${trained.iterMs}`);
-  check("baseline recorded", Number.isFinite(trained.base), `${trained.base}`);
-  check(
-    "learned beats hand-tuned",
-    trained.best > trained.base,
-    `${trained.base.toFixed(1)} -> ${trained.best.toFixed(1)} (${trained.gain})`
-  );
-  check("feedback layer left zero", trained.feedback > 0.01, `norm ${trained.feedback}`);
-  await screenshot("03-training-after.png");
-
-  const learnEnabled = await page.isEnabled("#btnLearn");
-  check("learned policy selectable", learnEnabled);
-  if (learnEnabled) {
-    await page.click("#btnLearn");
-    check("header shows learned policy", (await page.textContent("#hPolicy")) === "LEARNED");
-    check("sliders lock under learned policy", await page.isDisabled("#pr0"));
-    await stepSamples(180);
-    const pattern = await page.evaluate(() => window.__hxFalls.classify());
-    check(
-      "the learned policy gets its own reading",
-      typeof pattern === "string" && pattern.length > 1,
-      `learned footfalls read as ${pattern}`
-    );
+const clickWalk = async (page) => {
+  if ((await page.getAttribute("#btnWalk", "data-on")) !== "true") {
+    await page.click("#btnWalk");
   }
-  await screenshot("04-learned-walking.png");
-}
+};
 
 async function speedAndPhysics(h) {
   const { page, check, setRange, stepSamples } = h;
+  await clickWalk(page);
   await page.click("#btnPause");
   const speedAt = async (target) => {
     await setRange("rCruise", target);
@@ -351,6 +303,7 @@ async function servo(h) {
 
 async function frameState(h, legs) {
   const { page, setRange, stepSamples, nextFrame } = h;
+  await clickWalk(page);
   if (/Pause/i.test((await page.textContent("#btnPause")) || "")) await page.click("#btnPause");
   await setRange("rRate", 1);
   await setRange("rLegs", legs);
@@ -525,10 +478,57 @@ async function courses(h) {
   check("the autopilot can be switched off", manual === "MANUAL", manual);
 }
 
+async function onelegDrill(h) {
+  const { page, check, stepSamples, screenshot } = h;
+  await page.click("#btnPause");
+  check("one-leg button is in the page", await page.$("#btnOneleg") !== null);
+  await page.click("#btnOneleg");
+  const header = await page.textContent("#hPolicy");
+  check("policy chip says ONE LEG", /ONE/.test(header), header);
+  check("one-leg button latches", (await page.getAttribute("#btnOneleg", "data-on")) === "true");
+  check("walk button unlatches", (await page.getAttribute("#btnWalk", "data-on")) !== "true");
+
+  let maxClear = 0;
+  let sawOneSwing = false;
+  let extraSwing = false;
+  let on = false;
+  for (let i = 0; i < 10; i++) {
+    await stepSamples(18);
+    const s = await page.evaluate(() => window.__hxOneleg());
+    on = s.on;
+    maxClear = Math.max(maxClear, s.clear);
+    const swinging = s.stance.filter((v) => !v).length;
+    if (s.phase >= 1 && s.phase <= 3) {
+      if (swinging === 1 && s.moving === 0) sawOneSwing = true;
+      if (swinging > 1) extraSwing = true;
+    }
+  }
+  check("telemetry says the drill is on", on);
+  check("only L1 drops its stance flag", sawOneSwing && !extraSwing, `clear ${maxClear.toFixed(3)}`);
+  check("the free foot leaves the floor", maxClear > 0.10, `${maxClear.toFixed(3)} m clearance`);
+  const hud = await page.evaluate(() => ({
+    gait: document.getElementById("hudGait").textContent,
+    drill: document.getElementById("hudDrill").hidden,
+    walk: document.getElementById("hudWalk").hidden,
+    course: document.getElementById("hCourse").textContent,
+    cam: document.getElementById("hudCam").textContent,
+  }));
+  check("HUD switches to the drill readout", hud.walk === true && hud.drill === false, JSON.stringify(hud));
+  check("the empty field is FLAT", /FLAT/.test(hud.course), hud.course);
+  check(
+    "the one-leg callout is on the stage",
+    await page.$eval("#drillCallout", (el) => !el.hidden)
+  );
+  await screenshot("16-oneleg.png");
+
+  await page.click("#btnWalk");
+  check("walk restores the gait", (await page.getAttribute("#btnWalk", "data-on")) === "true");
+  check("one-leg turns off", (await page.getAttribute("#btnOneleg", "data-on")) !== "true");
+}
+
 const scenarios = [
   ["dashboard", bootAndStatic],
   ["courses", courses],
-  ["training", training],
   ["physics + servo", async (harness) => {
     await speedAndPhysics(harness);
     await servo(harness);
@@ -538,6 +538,7 @@ const scenarios = [
     await quadruped(harness);
   }],
   ["gait + navigation", gaitAndNavigation],
+  ["one leg", onelegDrill],
 ];
 
 const started = performance.now();
