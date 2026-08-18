@@ -436,8 +436,9 @@ class Footfalls {
 const falls = new Footfalls();
 
 function drawGaitDiagram(t) {
-  if (state.mode !== 1) return;
   const cv = $("cGait");
+  if (!cv) return;
+  if (state.mode !== 1) return;
   const legs = Math.round(t[L.T_LEGS]) || 6;
   const rowH = 17;
   const want = legs * rowH + 22;
@@ -674,9 +675,11 @@ function presetName(i) {
 /* The first preset is named for what it produces on this frame, and is
  * flagged when it cannot hold the machine up statically. */
 function refreshPresetButtons() {
+  const host = $("presetBtns");
+  if (!host) return;
   const stable = api.hx_alternating_is_stable() === 1;
   const names = [presetName(0), "Ripple", "Wave"];
-  $("presetBtns").innerHTML = names
+  host.innerHTML = names
     .map(
       (p, i) =>
         `<button class="btn" data-preset="${i}" data-on="${i === state.preset}"${
@@ -684,9 +687,12 @@ function refreshPresetButtons() {
         }>${p}${i === 0 && !stable ? " \u26a0" : ""}</button>`
     )
     .join("");
-  $("presetNote").textContent = stable
-    ? ""
-    : "the alternating gait stands on two feet here — it falls over";
+  const note = $("presetNote");
+  if (note) {
+    note.textContent = stable
+      ? ""
+      : "the alternating gait stands on two feet here — it falls over";
+  }
 }
 
 /* Anything with one row per leg has to be rebuilt when the count changes. */
@@ -711,25 +717,28 @@ function buildLegUI() {
 function buildStaticUI() {
   buildLegUI();
 
-  $("sliders").innerHTML = PARAMS.map(
-    (p, i) => `<label class="slider">
+  const sliders = $("sliders");
+  if (sliders) {
+    sliders.innerHTML = PARAMS.map(
+      (p, i) => `<label class="slider">
       <span class="hd"><span class="k">${p.label}</span><b id="pv${i}">—</b></span>
       <input type="range" id="pr${i}" min="0" max="1000" step="1" value="500">
     </label>`
-  ).join("");
+    ).join("");
 
-  PARAMS.forEach((p, i) => {
-    const lo = api.hx_param_lo(i);
-    const hi = api.hx_param_hi(i);
-    const el = $(`pr${i}`);
-    el.value = Math.round(((api.hx_get_param(i) - lo) / (hi - lo)) * 1000);
-    el.addEventListener("input", () => {
-      const v = lo + ((hi - lo) * el.value) / 1000;
-      api.hx_set_param(i, v);
-      $(`pv${i}`).textContent = `${v.toFixed(p.dp)}${p.unit ? " " + p.unit : ""}`;
-      if (state.mode === 0) api.hx_reset_live();
+    PARAMS.forEach((p, i) => {
+      const lo = api.hx_param_lo(i);
+      const hi = api.hx_param_hi(i);
+      const el = $(`pr${i}`);
+      el.value = Math.round(((api.hx_get_param(i) - lo) / (hi - lo)) * 1000);
+      el.addEventListener("input", () => {
+        const v = lo + ((hi - lo) * el.value) / 1000;
+        api.hx_set_param(i, v);
+        $(`pv${i}`).textContent = `${v.toFixed(p.dp)}${p.unit ? " " + p.unit : ""}`;
+        if (state.mode === 0) api.hx_reset_live();
+      });
     });
-  });
+  }
 
   refreshPresetButtons();
   $("courseBtns").innerHTML = COURSES.map(
@@ -746,11 +755,13 @@ function buildStaticUI() {
   const lo = api.hx_cruise_lo();
   const hi = api.hx_cruise_hi();
   const r = $("rCruise");
-  r.min = lo;
-  r.max = hi;
-  r.step = isJump() ? 0.01 : 0.1;
-  r.value = state.cruise;
-  syncCruiseLabels();
+  if (r) {
+    r.min = lo;
+    r.max = hi;
+    r.step = isJump() ? 0.01 : 0.1;
+    r.value = state.cruise;
+    syncCruiseLabels();
+  }
 
   $("selServo").innerHTML =
     `<option value="-1">Generic 20 kg·cm digital</option>` +
@@ -798,6 +809,7 @@ function describeMachine() {
 }
 
 function syncSliders() {
+  if (!$("pv0")) return;
   PARAMS.forEach((p, i) => {
     const lo = api.hx_param_lo(i);
     const hi = api.hx_param_hi(i);
@@ -807,8 +819,11 @@ function syncSliders() {
     el.value = Math.round(((v - lo) / (hi - lo)) * 1000);
     el.disabled = state.mode !== 0;
   });
-  $("paramLock").textContent =
-    state.mode === 1 ? "set by policy" : state.mode === 2 ? "one-leg drill" : "crawl";
+  const lock = $("paramLock");
+  if (lock) {
+    lock.textContent =
+      state.mode === 1 ? "set by policy" : state.mode === 2 ? "one-leg drill" : "crawl";
+  }
 }
 
 function setMode(mode) {
@@ -827,8 +842,10 @@ function setMode(mode) {
   }
   state.mode = mode;
   api.hx_set_mode(mode);
-  $("btnBase").dataset.on = mode === 0;
-  $("btnLearn").dataset.on = mode === 1;
+  const btnBase = $("btnBase");
+  const btnLearn = $("btnLearn");
+  if (btnBase) btnBase.dataset.on = mode === 0;
+  if (btnLearn) btnLearn.dataset.on = mode === 1;
   const btnOl = $("btnOneleg");
   const btnWalk = $("btnWalk");
   if (btnOl) btnOl.dataset.on = String(mode === 2);
@@ -1408,10 +1425,14 @@ function updateTrainingPanel() {
     ? "stopped"
     : "idle";
   const trained = t[L.T_TRAINED] > 0.5;
-  $("btnLearn").disabled = !trained;
-  $("policyNote").textContent = trained
-    ? "Switch between the hand-tuned gait and the learned policy on the same course."
-    : "Train a policy to enable the comparison.";
+  const btnLearn = $("btnLearn");
+  if (btnLearn) btnLearn.disabled = !trained;
+  const policyNote = $("policyNote");
+  if (policyNote) {
+    policyNote.textContent = trained
+      ? "Switch between the hand-tuned gait and the learned policy on the same course."
+      : "Train a policy to enable the comparison.";
+  }
   if (!trained && state.mode === 1) setMode(0);
   refreshGaitTable();
 }
@@ -1456,8 +1477,10 @@ function wire() {
     log("sim.reset()");
   });
 
-  $("btnBase").addEventListener("click", () => setMode(0));
-  $("btnLearn").addEventListener("click", () => setMode(1));
+  const btnBase = $("btnBase");
+  const btnLearnWire = $("btnLearn");
+  if (btnBase) btnBase.addEventListener("click", () => setMode(0));
+  if (btnLearnWire) btnLearnWire.addEventListener("click", () => setMode(1));
   $("btnOneleg").addEventListener("click", () => setMode(2));
   $("btnWalk").addEventListener("click", () => setMode(0));
 
@@ -1584,11 +1607,14 @@ function wire() {
     log(`frame.legs(${got})`);
   });
 
-  $("rCruise").addEventListener("input", () => {
-    state.cruise = +$("rCruise").value;
-    api.hx_set_cruise(state.cruise);
-    syncCruiseLabels();
-  });
+  const rCruise = $("rCruise");
+  if (rCruise) {
+    rCruise.addEventListener("input", () => {
+      state.cruise = +rCruise.value;
+      api.hx_set_cruise(state.cruise);
+      syncCruiseLabels();
+    });
+  }
 
   $("selServo").addEventListener("change", () => {
     const i = +$("selServo").value;
@@ -1680,13 +1706,18 @@ function applyCourse() {
   const lo = api.hx_cruise_lo();
   const hi = api.hx_cruise_hi();
   const r = $("rCruise");
-  r.min = lo;
-  r.max = hi;
-  r.step = 0.1;
-  state.cruise = isJump() ? 4.5 : 4.0;
-  r.value = state.cruise;
-  api.hx_set_cruise(state.cruise);
-  syncCruiseLabels();
+  if (r) {
+    r.min = lo;
+    r.max = hi;
+    r.step = 0.1;
+    state.cruise = isJump() ? 4.5 : 4.0;
+    r.value = state.cruise;
+    api.hx_set_cruise(state.cruise);
+    syncCruiseLabels();
+  } else {
+    state.cruise = isJump() ? 4.5 : 4.0;
+    api.hx_set_cruise(state.cruise);
+  }
   drawProfile();
   drawCurve();
   updateTrainingPanel();
@@ -1695,6 +1726,7 @@ function applyCourse() {
 }
 
 function syncCruiseLabels() {
+  if (!$("cruiseTitle")) return;
   const lo = api.hx_cruise_lo();
   const hi = api.hx_cruise_hi();
   $("cruiseTitle").textContent = "Commanded speed";

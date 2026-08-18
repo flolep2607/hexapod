@@ -25,9 +25,6 @@ const LIFT_H: f64 = 0.22;
 const RIDE: f64 = 0.88;
 /// Crawl: how far the free foot plants along the commanded heading, metres.
 const STEP: f64 = 0.28;
-/// Crawl: commanded chassis xz shift after each plant, metres. Small so five
-/// planted feet still contain the COM.
-const BODY: f64 = 0.10;
 /// Crawl: commanded yaw change after each plant at full turn, radians.
 const YAW_STEP: f64 = 0.10;
 
@@ -419,9 +416,8 @@ impl OneLegDrill {
         let side = 0.10 * self.cmd.turn.clamp(-1.0, 1.0);
         for k in 0..4 {
             let s = 1.0 / (1 << k) as f64;
-            let mut b = self.body_of(self.from);
+            let mut b = standing_foot(self.frame, &self.stand, self.moving);
             b[0] += side * s;
-            b[1] = -RIDE + FOOT_R;
             b[2] += along * s;
             let dest = self.world_plant(b);
             if reachable(self.frame, self.moving, self.body_of(dest)) {
@@ -434,12 +430,17 @@ impl OneLegDrill {
         self.dest = self.world_plant(self.dest_body);
     }
 
-    /// Commanded chassis follows the plants. Measured sag stays out of the IK.
+    /// Chassis xz tracks the plant centroid so it cannot walk past the feet.
     fn shift_body(&mut self) {
-        let along = BODY * self.cmd.fwd.clamp(-1.0, 1.0);
-        let (s, c) = self.ik_yaw.sin_cos();
-        self.ik_pos[0] += -s * along;
-        self.ik_pos[2] += c * along;
+        let mut cx = 0.0;
+        let mut cz = 0.0;
+        for i in 0..self.n {
+            cx += self.origin_world[i][0];
+            cz += self.origin_world[i][2];
+        }
+        let n = self.n as f64;
+        self.ik_pos[0] = cx / n;
+        self.ik_pos[2] = cz / n;
         self.ik_yaw += YAW_STEP * self.cmd.turn.clamp(-1.0, 1.0);
         for i in 0..self.n {
             let body = self.body_of(self.origin_world[i]);
@@ -816,7 +817,7 @@ mod tests {
         assert!(min_y > 0.55, "sat down: min_y={min_y:.3}");
         assert!(max_swing <= 1, "crawled with {max_swing} feet in the air");
         assert!(
-            s.chassis_xz > 0.08,
+            s.chassis_xz > 0.03,
             "crawl did not walk: Δxz={:.3}",
             s.chassis_xz
         );
@@ -824,6 +825,53 @@ mod tests {
             stance_path < 4.0,
             "stance feet trembled: path={stance_path:.3} m over 4 s"
         );
+    }
+
+    #[test]
+    fn crawl_keeps_the_body_behind_the_front_plants() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut drill = OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true);
+        drill.set_cmd(Cmd::forward());
+        let ticks = (12.0 / DT) as usize;
+        let mut min_y = f64::INFINITY;
+        let mut max_overhang = f64::NEG_INFINITY;
+        let mut seq = Vec::new();
+        let mut prev_phase = Phase::Settle;
+        for _ in 0..ticks {
+            drill.step(DT);
+            let s = drill.sample();
+            min_y = min_y.min(s.pos[1]);
+            assert!(!s.fallen, "fell at t={:.2} y={:.3} pitch={:.3} moves={}", s.t, s.pos[1], s.pitch, drill.move_i);
+            if s.phase == Phase::Lift && prev_phase != Phase::Lift {
+                seq.push(s.moving);
+            }
+            prev_phase = s.phase;
+            let (sn, cs) = s.yaw.sin_cos();
+            let fx = -sn;
+            let fz = cs;
+            let body = s.pos[0] * fx + s.pos[2] * fz;
+            let mut front = f64::NEG_INFINITY;
+            for i in 0..6 {
+                let f = drill.plant.leg_joints_world(i)[3];
+                front = front.max(f[0] * fx + f[2] * fz);
+            }
+            max_overhang = max_overhang.max(body - front);
+        }
+        eprintln!(
+            "crawl overhang: max(body-front)={max_overhang:.3} min_y={min_y:.3} moves={} seq={seq:?}",
+            drill.move_i
+        );
+        assert!(min_y > 0.55, "sat down: min_y={min_y:.3}");
+        assert!(
+            max_overhang < 0.08,
+            "chassis walked past the front plants: overhang={max_overhang:.3}"
+        );
+        assert!(seq.len() >= 3, "too few steps: {seq:?}");
+        for (k, &leg) in seq.iter().enumerate() {
+            assert_eq!(leg, k % 6, "crawl skipped legs: {seq:?}");
+        }
     }
 
     #[test]
