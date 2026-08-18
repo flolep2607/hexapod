@@ -172,6 +172,13 @@ impl OneLegDrill {
         q
     }
 
+    /// Skip the standing pause and start a lift on the pinned leg immediately.
+    pub fn start_lifting(&mut self) {
+        self.begin_move();
+        self.phase = Phase::Lift;
+        self.phase_t = 0.0;
+    }
+
     pub fn step(&mut self, dt: f64) {
         if self.phase == Phase::Settle && self.phase_t == 0.0 && self.move_i == 0 {
             self.capture_origin();

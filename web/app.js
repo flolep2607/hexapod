@@ -843,11 +843,19 @@ function setMode(mode) {
     const stop = document.querySelector('[data-cmd="stop"]');
     if (stop) stop.dataset.on = "true";
     if (stage && stage.setView) {
-      stage.setView("side");
-      stage.dist = 9;
+      stage.setView("orbit");
+      stage.az = -1.05;
+      stage.el = 0.34;
+      stage.dist = 5.2;
     }
     log(`drill.oneleg("${legNames()[state.onelegLeg] || "L1"}")`);
   } else {
+    if (state.cmd.fwd === 0 && state.cmd.turn === 0) {
+      state.cmd = { fwd: 1, turn: 0 };
+      document.querySelectorAll("[data-cmd]").forEach((b) => (b.dataset.on = "false"));
+      const fwd = document.querySelector('[data-cmd="fwd"]');
+      if (fwd) fwd.dataset.on = "true";
+    }
     log(mode === 1 ? "policy.use(\"learned\")" : "policy.use(\"hand-tuned\")");
   }
 }
@@ -1259,6 +1267,15 @@ function updateReadouts(t) {
     $("hudOlXz").textContent = fmt(t[L.T_CHASSIS_XZ], 2);
     $("hState").textContent = phaseName;
     $("hudGait").textContent = "ONE LEG";
+    const callout = $("drillCallout");
+    const calloutLine = $("drillCalloutLine");
+    if (callout) callout.hidden = false;
+    if (calloutLine) {
+      calloutLine.textContent = `${legNames()[movingLeg] || "L1"} · ${phaseName} · the red leg is the only one commanded`;
+    }
+  } else {
+    const callout = $("drillCallout");
+    if (callout) callout.hidden = true;
   }
   $("banner").textContent = broken ? "BROKEN" : "DEAD";
   $("banner").dataset.on = String(fallen || broken);
@@ -1706,6 +1723,7 @@ async function boot() {
   updateSystem();
   updateTrainingPanel();
   describeMachine();
+  setMode(2);
 
   /* Hooks for the end-to-end test, which drives the real page rather than
    * reimplementing any of it. Nothing else uses them. */

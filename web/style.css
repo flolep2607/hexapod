@@ -605,6 +605,36 @@ input[type="number"] {
   display: none !important;
 }
 
+.drill-callout {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  padding: 12px 28px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  font-size: 22px;
+  letter-spacing: 0.22em;
+  text-align: center;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.drill-callout small {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: none;
+}
+
+.drill-callout[hidden] {
+  display: none !important;
+}
+
 .hud.br2 {
   bottom: 0;
   right: 0;

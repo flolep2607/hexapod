@@ -642,6 +642,7 @@ impl App {
         let n = self.frame.legs().max(1);
         let mut drill = OneLegDrill::spawn(self.frame, &self.phys, self.course_seed);
         drill.pin_leg(self.oneleg_leg % n);
+        drill.start_lifting();
         let (p, yaw, pitch, roll) = drill.plant.chassis_pose();
         self.live.observe_pose(p, yaw, pitch, roll, drill.plant.chassis_vel());
         self.live.t = 0.0;

@@ -89,7 +89,7 @@ async function openHarness(name) {
 
 async function bootAndStatic(h) {
   const { page, check, waitFor, setRange, screenshot, errors } = h;
-  await waitFor(() => parseFloat(document.getElementById("hudV")?.textContent) > 0.5);
+  await waitFor(() => /ONE/.test(document.getElementById("hPolicy")?.textContent || ""));
   check("no console errors on boot", errors.length === 0, errors.slice(0, 3).join(" | "));
   check(
     "wasm exports present",
@@ -111,8 +111,16 @@ async function bootAndStatic(h) {
     return seen.size;
   });
   check("3-D stage renders content", canvasPainted > 6, `${canvasPainted} distinct sampled colours`);
-  const speed = await page.textContent("#hudV");
-  check("robot is moving", parseFloat(speed) > 0.5, `${speed} m/s`);
+  const drill = await page.evaluate(() => window.__hxOneleg());
+  check(
+    "the page boots on the one-leg drill",
+    drill.on && /ONE/.test(drill.policy),
+    JSON.stringify({ on: drill.on, policy: drill.policy, phase: drill.phaseName })
+  );
+  check(
+    "the one-leg callout is on the stage",
+    await page.$eval("#drillCallout", (el) => !el.hidden)
+  );
 
   await page.click("#btnCamTop");
   check("top camera toggle", (await page.textContent("#hudCam")).includes("TOP"));
@@ -197,8 +205,15 @@ async function bootAndStatic(h) {
   check("page does not scroll sideways", noHScroll);
 }
 
+const clickWalk = async (page) => {
+  if ((await page.getAttribute("#btnWalk", "data-on")) !== "true") {
+    await page.click("#btnWalk");
+  }
+};
+
 async function speedAndPhysics(h) {
   const { page, check, setRange, stepSamples } = h;
+  await clickWalk(page);
   await page.click("#btnPause");
   const speedAt = async (target) => {
     await setRange("rCruise", target);
@@ -288,6 +303,7 @@ async function servo(h) {
 
 async function frameState(h, legs) {
   const { page, setRange, stepSamples, nextFrame } = h;
+  await clickWalk(page);
   if (/Pause/i.test((await page.textContent("#btnPause")) || "")) await page.click("#btnPause");
   await setRange("rRate", 1);
   await setRange("rLegs", legs);
@@ -499,7 +515,10 @@ async function onelegDrill(h) {
   }));
   check("HUD switches to the drill readout", hud.walk === true && hud.drill === false, JSON.stringify(hud));
   check("the empty field is FLAT", /FLAT/.test(hud.course), hud.course);
-  check("side camera shows the lift", /SIDE/.test(hud.cam), hud.cam);
+  check(
+    "the one-leg callout is on the stage",
+    await page.$eval("#drillCallout", (el) => !el.hidden)
+  );
   await screenshot("16-oneleg.png");
 
   await page.click("#btnWalk");
