@@ -1742,6 +1742,7 @@ async function boot() {
       clear: t[L.T_FOOT_CLEAR] || 0,
       drift: t[L.T_STANCE_DRIFT] || 0,
       chassis: t[L.T_CHASSIS_XZ] || 0,
+      dest: L.T_DEST != null ? [t[L.T_DEST], t[L.T_DEST + 1], t[L.T_DEST + 2]] : [0, 0, 0],
       stance,
       policy: $("hPolicy").textContent,
       state: $("hState").textContent,
