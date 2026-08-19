@@ -1413,6 +1413,8 @@ fn scenes(frame: Frame, mut phys: Physics, args: &[String]) {
     }
 }
 
+const TAU: f64 = std::f64::consts::TAU;
+
 fn run_scene(
     name: &'static str,
     frame: Frame,
@@ -1448,7 +1450,13 @@ fn run_scene(
         for i in 0..frame.legs() {
             let at = drill.plant.leg_q(i);
             for j in 0..3 {
-                track = track.max((at[j] - cmd[i][j]).abs());
+                // Wrap the difference. `leg_q` is unwrapped and the command is
+                // not, so a raw subtraction reports ~pi whenever they straddle
+                // the branch cut — which reads as a catastrophic tracking
+                // failure that isn't there.
+                let d = at[j] - cmd[i][j];
+                let d = d - TAU * (d / TAU).round();
+                track = track.max(d.abs());
             }
         }
         let mut feet = [[0.0; 3]; hexapod_core::robot::MAX_LEGS];

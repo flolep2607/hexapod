@@ -20,8 +20,20 @@ const SHIFT_T: f64 = 1.00;
 const PLACE_T: f64 = 0.70;
 const PAUSE: f64 = 0.55;
 const SWING_T: f64 = LIFT_T + SHIFT_T + PLACE_T;
-/// High enough that a watching eye can tell the sole left the floor.
+/// Shortest a swing may take, and how much longer per metre of foot travel.
+const SWING_MIN: f64 = 0.35;
+const SWING_PER_M: f64 = 1.6;
+/// High enough that a watching eye can tell the sole left the floor. This is
+/// the empty-field drill's lift: the drill exists to be watched.
 const LIFT_H: f64 = 0.22;
+/// The crawl's lift over ground with nothing on it. Walking is not a
+/// demonstration — clearing flat floor by a quarter of the ride height is
+/// travel the foot pays for and gets nothing back, so this is just enough to
+/// unstick the sole. Anything the foot actually has to clear is measured from
+/// the terrain and added on top.
+const LIFT_MIN: f64 = 0.05;
+/// Margin over whatever the chord passes above.
+const LIFT_CLEAR: f64 = 0.08;
 /// Ride height and radial plant, independent of any walk gait.
 const RIDE: f64 = 0.88;
 /// Crawl: how far ahead of its neutral stance the free foot will try to plant,
@@ -44,6 +56,8 @@ const LEAD_MAX: f64 = 0.06;
 /// throttle: the legs push against the lead the command holds over the real
 /// chassis, so raising it walks faster and skates the plants harder.
 const SHIFT_V: f64 = 0.10;
+/// How fast the commanded heading turns toward its goal, rad/s.
+const YAW_V: f64 = 1.20;
 /// Crawl: commanded yaw change after each plant at full turn, radians.
 const YAW_STEP: f64 = 0.10;
 
@@ -110,8 +124,20 @@ pub struct OneLegDrill {
     /// chassis travels to it at [`SHIFT_V`] over the whole swing.
     pub ik_goal: [f64; 2],
     pub ik_yaw: f64,
+    /// Where `ik_yaw` is turning to. Stepping the commanded heading straight
+    /// to its new value retargets all five stance legs in one tick, which is
+    /// an impulse the body has to absorb — and the faster the crawl plants,
+    /// the more of them per second. It rides there instead.
+    ik_yaw_goal: f64,
     pub phase: Phase,
     pub phase_t: f64,
+    /// Swing duration for the move in flight, seconds. Scaled by how far the
+    /// foot has to go, so a short correction does not take as long as a full
+    /// stride — the old fixed time made every step cost the same no matter
+    /// how little it achieved.
+    pub swing_t: f64,
+    /// Bezier control height for the move in flight.
+    arc_h: f64,
     pub move_i: usize,
     pub t: f64,
     rng: Rng,
@@ -209,8 +235,11 @@ impl OneLegDrill {
             ik_pos: origin_pos,
             ik_goal: [origin_pos[0], origin_pos[2]],
             ik_yaw: origin_yaw,
+            ik_yaw_goal: origin_yaw,
             phase: Phase::Settle,
             phase_t: 0.0,
+            swing_t: SWING_T,
+            arc_h: LIFT_H * 4.0 / 3.0,
             move_i: 0,
             t: 0.0,
             rng: Rng::new(seed ^ 0xA11E_65),
@@ -328,11 +357,23 @@ impl OneLegDrill {
     fn phase_dur(&self) -> f64 {
         match self.phase {
             Phase::Settle => SETTLE,
-            Phase::Lift => LIFT_T,
-            Phase::Shift => SHIFT_T,
-            Phase::Place => PLACE_T,
+            Phase::Lift => self.lift_t(),
+            Phase::Shift => self.shift_t(),
+            Phase::Place => self.place_t(),
             Phase::Pause => PAUSE,
         }
+    }
+
+    /// Size the swing to the step. A fixed duration means a 5 cm correction
+    /// costs the same as a 50 cm stride, which is most of why the crawl is
+    /// slow: most plants are short.
+    fn plan_swing(&mut self) {
+        let d = hypot2(self.dest[0] - self.from[0], self.dest[2] - self.from[2]);
+        // The drill is a demonstration and wants a visible lift; the crawl is
+        // locomotion and wants the least that clears.
+        let base = if self.crawl { LIFT_MIN } else { LIFT_H };
+        self.arc_h = Self::arc_h(self.from, self.dest, &self.terrain, base);
+        self.swing_t = (SWING_MIN + d * SWING_PER_M).clamp(SWING_MIN, SWING_T);
     }
 
     fn cmd_world(&self) -> V3 {
@@ -344,40 +385,75 @@ impl OneLegDrill {
     }
 
     fn swing_clock(&self) -> f64 {
+        let (l, sh) = (self.lift_t(), self.shift_t());
         let t = match self.phase {
             Phase::Lift => self.phase_t,
-            Phase::Shift => LIFT_T + self.phase_t,
-            Phase::Place => LIFT_T + SHIFT_T + self.phase_t,
+            Phase::Shift => l + self.phase_t,
+            Phase::Place => l + sh + self.phase_t,
             _ => 0.0,
         };
-        (t / SWING_T).clamp(0.0, 1.0)
+        (t / self.swing_t.max(1e-6)).clamp(0.0, 1.0)
     }
 
+    fn lift_t(&self) -> f64 {
+        self.swing_t * LIFT_T / SWING_T
+    }
+    fn shift_t(&self) -> f64 {
+        self.swing_t * SHIFT_T / SWING_T
+    }
+    fn place_t(&self) -> f64 {
+        self.swing_t * PLACE_T / SWING_T
+    }
+
+    /// One cubic Bezier from lift-off to landing, control points straight up
+    /// from each end.
+    ///
+    /// The old path was three straight segments — up, across, down — so the
+    /// foot stopped dead twice per step and travelled the two sides of a
+    /// rectangle instead of the diagonal. This is a single curve: it leaves
+    /// the ground vertically, arcs over, and comes down vertically, with no
+    /// interior stop to accelerate out of. Shorter path, no corners, and the
+    /// horizontal term works out to exactly the smoothstep the old version had
+    /// to apply by hand.
+    ///
+    /// With both control points at height `h` above their ends, the curve's
+    /// horizontal term is `lerp(from, dest, s²(3-2s))` and its vertical term
+    /// is that same interpolation plus `3h·s(1-s)`, which peaks at `0.75h`.
+    /// [`Self::arc_h`] inverts that to hit a wanted clearance.
     fn swing_world(&self, s: f64) -> V3 {
-        let a = LIFT_T / SWING_T;
-        let b = (LIFT_T + SHIFT_T) / SWING_T;
-        let apex_y = self.from[1].max(self.dest[1]) + LIFT_H;
-        // Each leg of the swing is eased in and out on its own, not just the
-        // clock that drives all three. The path is up, then across, then down:
-        // with linear segments the foot's velocity turns a right angle in one
-        // tick at each corner, which is an impulse into a very stiff motor and
-        // the reason the moving leg snatches. Easing per segment brings the
-        // foot to rest at both corners, so every direction change starts and
-        // ends at zero speed.
-        if s <= a {
-            let u = smooth((s / a).clamp(0.0, 1.0));
-            [self.from[0], lerp(self.from[1], apex_y, u), self.from[2]]
-        } else if s <= b {
-            let u = smooth(((s - a) / (b - a)).clamp(0.0, 1.0));
-            [
-                lerp(self.from[0], self.dest[0], u),
-                apex_y,
-                lerp(self.from[2], self.dest[2], u),
-            ]
-        } else {
-            let u = smooth(((s - b) / (1.0 - b).max(1e-9)).clamp(0.0, 1.0));
-            [self.dest[0], lerp(apex_y, self.dest[1], u), self.dest[2]]
+        let s = s.clamp(0.0, 1.0);
+        let e = s * s * (3.0 - 2.0 * s);
+        let bulge = 3.0 * self.arc_h * s * (1.0 - s);
+        [
+            lerp(self.from[0], self.dest[0], e),
+            lerp(self.from[1], self.dest[1], e) + bulge,
+            lerp(self.from[2], self.dest[2], e),
+        ]
+    }
+
+    /// Control-point height that clears whatever the chord passes over.
+    ///
+    /// The old code cleared a flat `LIFT_H` above the higher of the two ends,
+    /// which both says nothing about the ground in between — on rubble the
+    /// foot could arc straight through a rock it started and finished clear of
+    /// — and charges full height for crossing an empty floor.
+    fn arc_h(from: V3, dest: V3, terrain: &Terrain, base: f64) -> f64 {
+        let mut want = base;
+        for k in 1..8 {
+            let u = k as f64 / 8.0;
+            let x = lerp(from[0], dest[0], u);
+            let z = lerp(from[2], dest[2], u);
+            let line = lerp(from[1], dest[1], u);
+            // How far the ground pokes above the straight chord between the
+            // two plants. Zero across flat ground, so flat ground buys no
+            // height; only something actually in the way does.
+            let bump = terrain.height(x, z) + FOOT_R - line;
+            if bump > 0.0 {
+                want = want.max(bump + LIFT_CLEAR);
+            }
         }
+        // The bulge peaks at 0.75h, so scale up to deliver `want`.
+        want * 4.0 / 3.0
     }
 
     fn body_of(&self, world: V3) -> V3 {
@@ -408,7 +484,7 @@ impl OneLegDrill {
                 clamp_joints(&mut self.q_hold[self.moving]);
                 self.plant.lock(&[true; MAX_LEGS], &self.phys);
                 if self.crawl {
-                    self.ik_yaw += YAW_STEP * self.cmd.turn.clamp(-1.0, 1.0);
+                    self.ik_yaw_goal += YAW_STEP * self.cmd.turn.clamp(-1.0, 1.0);
                     self.move_i += 1;
                     self.begin_move();
                 }
@@ -441,6 +517,7 @@ impl OneLegDrill {
         self.ik_pos[2] = pos[2];
         self.ik_goal = [pos[0], pos[2]];
         self.ik_yaw = yaw;
+        self.ik_yaw_goal = yaw;
         let avoid = self.hold_body[self.moving];
         for _ in 0..80 {
             let cand = sample_plant(self.frame, &self.stand, self.moving, &mut self.rng, avoid);
@@ -450,11 +527,13 @@ impl OneLegDrill {
             {
                 self.dest_body = cand;
                 self.dest = dest;
+                self.plan_swing();
                 return;
             }
         }
         self.dest_body = standing_foot(self.frame, &self.stand, self.moving);
         self.dest = self.world_plant(self.dest_body);
+        self.plan_swing();
     }
 
     fn want_move(&self) -> bool {
@@ -473,6 +552,7 @@ impl OneLegDrill {
             self.move_i += 1;
         }
         self.pick_crawl_dest();
+        self.plan_swing();
     }
 
     /// One policy query per plant, on the state at the moment the leg lifts.
@@ -593,6 +673,9 @@ impl OneLegDrill {
     /// under it. Stance feet keep their world positions; only the joints that
     /// hold them there change, so the machine walks its body over its feet.
     fn ride_body(&mut self, dt: f64) {
+        let dy = self.ik_yaw_goal - self.ik_yaw;
+        self.ik_yaw += dy.clamp(-YAW_V * dt, YAW_V * dt);
+
         let dx = self.ik_goal[0] - self.ik_pos[0];
         let dz = self.ik_goal[1] - self.ik_pos[2];
         let d = hypot2(dx, dz);
@@ -731,10 +814,6 @@ fn reachable(frame: Frame, leg: usize, target: V3) -> bool {
     }
     let foot = fk_body(frame, leg, sol.q)[3];
     dist(foot, target) < 0.03
-}
-
-fn smooth(u: f64) -> f64 {
-    0.5 - 0.5 * (core::f64::consts::PI * u.clamp(0.0, 1.0)).cos()
 }
 
 fn dist(a: V3, b: V3) -> f64 {
@@ -923,13 +1002,25 @@ mod tests {
         drill.start_lifting();
         let dest0 = drill.dest;
         let mut pitch_seen = 0.0f64;
-        let ticks = ((LIFT_T + SHIFT_T + PLACE_T) / DT) as usize;
-        for _ in 0..ticks {
+        // The swing is sized to the step now, so this has to ask how long
+        // this one is rather than assume the old fixed duration — running past
+        // the landing just watches the next move being picked.
+        // Run until the foot is down rather than counting ticks: each phase
+        // transition drops the overshoot past its boundary, so the swing takes
+        // a few ticks longer than its nominal duration. The cap is only there
+        // so a stuck phase machine fails instead of hanging.
+        let cap = (2.0 * drill.swing_t / DT) as usize + 16;
+        for _ in 0..cap {
+            if !drill.phase.swinging() && drill.t > 0.0 {
+                break;
+            }
             drill.step(DT);
             let s = drill.sample();
             pitch_seen = pitch_seen.max(s.pitch.abs());
+            // Once the foot has landed the drill picks its next target, so
+            // only the flight itself is held to a fixed landing.
             assert!(
-                dist(s.dest_world, dest0) < 1e-9,
+                !s.phase.swinging() || dist(s.dest_world, dest0) < 1e-9,
                 "dest moved from {:?} to {:?} at t={:.3} pitch={:.3}",
                 dest0,
                 s.dest_world,
