@@ -37,6 +37,9 @@ pub mod plant;
 pub mod walker;
 #[cfg(feature = "rapier")]
 pub mod oneleg;
+// Trains against the articulated plant, so it needs one.
+#[cfg(feature = "rapier")]
+pub mod crawl_rl;
 
 pub use ars::{ArsConfig, Trainer};
 pub use dynamics::{Actuator, LegMass, Physics};

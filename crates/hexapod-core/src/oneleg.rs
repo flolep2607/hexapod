@@ -10,6 +10,7 @@ use crate::policy::Gait;
 use crate::robot::{
     clamp_joints, fk_body, solve_ik, to_body, Frame, FOOT_R, MAX_LEGS, REACH_MAX, REACH_MIN,
 };
+use crate::crawl_rl::{CrawlAction, CrawlObs, CrawlPolicy};
 use crate::sim::{Cmd, DT};
 use crate::terrain::{Course, Terrain};
 
@@ -119,6 +120,11 @@ pub struct OneLegDrill {
     terrain: Terrain,
     /// Walk: dest follows `cmd`, chassis shifts after each plant. Drill: random relocate.
     pub crawl: bool,
+    /// Learned crawl controller. `None` runs the hand-written constants, which
+    /// is what [`CrawlPolicy::seeded`] reproduces, so the two are comparable.
+    pub policy: Option<CrawlPolicy>,
+    /// Decided once per plant and held for that move.
+    act: CrawlAction,
     cmd: Cmd,
 }
 
@@ -212,6 +218,13 @@ impl OneLegDrill {
             fixed: None,
             terrain: terrain.clone(),
             crawl,
+            policy: None,
+            act: CrawlAction {
+                along: 1.0,
+                side: 0.0,
+                lean: 1.0,
+                lead: 1.0,
+            },
             cmd: Cmd {
                 nav: false,
                 ..Cmd::default()
@@ -446,12 +459,46 @@ impl OneLegDrill {
             self.moving = self.move_i % self.n;
             self.from = self.plant.leg_joints_world(self.moving)[3];
             self.origin_world[self.moving] = self.from;
+            self.act = self.decide();
             if self.shift_to_plants(self.moving) >= VETO {
                 break;
             }
             self.move_i += 1;
         }
         self.pick_crawl_dest();
+    }
+
+    /// One policy query per plant, on the state at the moment the leg lifts.
+    /// Held for the whole move so the swing is not chasing a target that moves
+    /// under it — the same reason the hand-written version freezes `dest`.
+    fn decide(&mut self) -> CrawlAction {
+        let Some(p) = self.policy.as_ref() else {
+            return CrawlAction {
+                along: 1.0,
+                side: 0.0,
+                lean: 1.0,
+                lead: 1.0,
+            };
+        };
+        let (pos, yaw, pitch, roll) = self.plant.chassis_pose();
+        let v = self.plant.chassis_vel();
+        let (s, c) = yaw.sin_cos();
+        let (fx, fz) = (-s, c);
+        let neutral = standing_foot(self.frame, &self.stand, self.moving);
+        let foot_b = to_body(self.from, pos, yaw, 0.0, 0.0);
+        let d = self.frame.dir(self.moving);
+        let obs = CrawlObs {
+            pitch,
+            roll,
+            vel_along: v[0] * fx + v[2] * fz,
+            vel_side: v[0] * fz - v[2] * fx,
+            margin: self.remaining_margin(self.moving, [pos[0], pos[2]]),
+            behind: neutral[2] - foot_b[2],
+            leg_fore: d[2],
+            cmd_fwd: self.cmd.fwd,
+            cmd_turn: self.cmd.turn,
+        };
+        p.act(&obs)
     }
 
     /// Can the chassis stand here through the coming swing? Two conditions, and
@@ -530,6 +577,7 @@ impl OneLegDrill {
                 hi = m;
             }
         }
+        let lo = lo * self.act.lean.clamp(0.0, 1.0);
         self.ik_goal = [cx + lo * fx, cz + lo * fz];
         self.remaining_margin(skip, self.ik_goal)
     }
@@ -557,9 +605,10 @@ impl OneLegDrill {
         let (cp, _, _, _) = self.plant.chassis_pose();
         let (lx, lz) = (self.ik_pos[0] - cp[0], self.ik_pos[2] - cp[2]);
         let lead = hypot2(lx, lz);
-        if lead > LEAD_MAX {
-            self.ik_pos[0] = cp[0] + lx * LEAD_MAX / lead;
-            self.ik_pos[2] = cp[2] + lz * LEAD_MAX / lead;
+        let cap = LEAD_MAX * self.act.lead.clamp(0.0, 1.0).max(0.05);
+        if lead > cap {
+            self.ik_pos[0] = cp[0] + lx * cap / lead;
+            self.ik_pos[2] = cp[2] + lz * cap / lead;
         }
         for i in 0..self.n {
             if i == self.moving && self.phase.swinging() {
@@ -582,7 +631,7 @@ impl OneLegDrill {
     /// for it. `u` runs from the neutral stance out to the full step.
     fn pick_crawl_dest(&mut self) {
         let along = STEP * self.cmd.fwd.clamp(-1.0, 1.0);
-        let side = STEP * SIDE * self.cmd.turn.clamp(-1.0, 1.0);
+        let side = STEP * (SIDE * self.cmd.turn.clamp(-1.0, 1.0) + self.act.side);
         let neutral = standing_foot(self.frame, &self.stand, self.moving);
         let at = |u: f64| {
             let b = [neutral[0] + side * u, neutral[1], neutral[2] + along * u];
@@ -598,7 +647,7 @@ impl OneLegDrill {
                 hi = m;
             }
         }
-        let dest = at(lo);
+        let dest = at(lo * self.act.along.clamp(0.0, 1.0));
         self.dest = dest;
         self.dest_body = self.body_of(dest);
     }

@@ -622,6 +622,43 @@ impl ArticulatedPlant {
         h.q0 + a
     }
 
+    /// How far each hinge on `leg` has come off its own axis, radians.
+    ///
+    /// A revolute joint has exactly one degree of freedom, so the child's
+    /// rotation relative to its parent must be a pure turn about the built
+    /// axis. Anything left over is the constraint being violated — the link
+    /// twisting about itself or rocking sideways, which no joint angle can
+    /// explain and which reads on a canvas as a leg that rotates when it
+    /// should only swing.
+    pub fn hinge_violation(&self, leg: usize) -> [f64; 3] {
+        let mut out = [0.0; 3];
+        let Some(l) = self.legs.get(leg).and_then(|l| l.as_ref()) else {
+            return out;
+        };
+        let child = [l._coxa, l._femur, l.tibia];
+        for j in 0..3 {
+            let h = l.hinges[j];
+            let Some(jt) = self.impulse_joints.get(h.joint) else {
+                continue;
+            };
+            let f1 = jt.data.local_frame1;
+            let f2 = jt.data.local_frame2;
+            // Relative orientation the joint actually has, and the one it
+            // would have at joint angle zero.
+            let rel = self.bodies[h.parent].rotation().inverse() * *self.bodies[child[j]].rotation();
+            let rel0 = f1.rotation * f2.rotation.inverse();
+            let delta = rel * rel0.inverse();
+            let axis = (f1.rotation * Vector::X).normalize();
+            // Strip the one turn the joint is allowed, and measure what is
+            // left. `to_scaled_axis` gives the rotation vector, so removing
+            // the component along the hinge leaves the violation directly.
+            let rv = delta.to_scaled_axis();
+            let along = rv.dot(axis);
+            out[j] = (rv - axis * along).length() as f64;
+        }
+        out
+    }
+
     /// Faults a gait can carry while still looking plausible on a canvas: legs
     /// fouling each other, the chassis touching anything at all, and joints
     /// pinned against the end of their mechanical travel. None of these are
@@ -838,6 +875,84 @@ impl ArticulatedPlant {
 }
 
 #[cfg(test)]
+mod axis_probe {
+    use super::tests::{hold, standing_q};
+    use super::*;
+    use crate::policy::{Policy, Preset};
+    use crate::terrain::{Course, Terrain};
+
+    /// Drive one joint and measure the axis its child link actually turns
+    /// about *relative to its parent* — the only frame in which a hinge's
+    /// axis means anything. Measuring the child in world instead folds in
+    /// whatever the chassis did, which is a different question.
+    #[test]
+    fn each_joint_turns_about_the_axis_it_was_given() {
+        let frame = crate::robot::Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let q0 = standing_q(frame, &gait);
+        let mut worst = (0.0f32, String::new());
+
+        for j in 0..3 {
+            let name = ["coxa", "femur", "tibia"][j];
+            for leg in 0..6 {
+                let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+                let rel = |p: &ArticulatedPlant| {
+                    let l = p.legs[leg].as_ref().unwrap();
+                    let h = l.hinges[j];
+                    let c = [l._coxa, l._femur, l.tibia][j];
+                    p.bodies[h.parent].rotation().inverse() * *p.bodies[c].rotation()
+                };
+                let built = {
+                    let l = plant.legs[leg].as_ref().unwrap();
+                    let h = l.hinges[j];
+                    let f = plant
+                        .impulse_joints
+                        .get(h.joint)
+                        .map(|jt| jt.data.local_frame1)
+                        .unwrap();
+                    (f.rotation * Vector::X).normalize()
+                };
+                let before = rel(&plant);
+                let mut cmd = q0;
+                cmd[leg][j] += 0.30;
+                hold(&mut plant, &cmd, &phys, 3.0);
+                let after = rel(&plant);
+                let (axis, ang) = (after * before.inverse()).to_axis_angle();
+                if ang.abs() < 0.02 {
+                    continue;
+                }
+                let got = (if ang < 0.0 { -axis } else { axis }).normalize();
+                let cos = got.dot(built).abs();
+                if std::env::var("HX_AXIS_VERBOSE").is_ok() {
+                    eprintln!(
+                        "{name:<6} leg{leg}  built ({:+.3},{:+.3},{:+.3})  actual ({:+.3},{:+.3},{:+.3})  |cos| {cos:.4}  turned {:.3}",
+                        built.x, built.y, built.z, got.x, got.y, got.z, ang.abs()
+                    );
+                }
+                if cos < worst.0 || worst.1.is_empty() {
+                    worst = (cos, format!("{name} leg{leg} |cos|={cos:.4}"));
+                }
+            }
+        }
+        eprintln!(
+            "worst hinge: {}   (solver {} pgs {} sub {})",
+            worst.1, phys.solver_iters, phys.pgs_iters, phys.substeps
+        );
+        // A revolute joint has one degree of freedom. If the child turns about
+        // anything else the constraint is being violated, and no amount of
+        // gait tuning on top of that is measuring the machine we think we
+        // have — it reads as the whole leg and body waggling.
+        assert!(
+            worst.0 > 0.99,
+            "a hinge turned off its own axis: {}",
+            worst.1
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::policy::{foot_in_body, foot_on_terrain, Policy, Preset};
@@ -848,7 +963,7 @@ mod tests {
         Physics::default().actuator.omega_max
     }
 
-    fn hold(plant: &mut ArticulatedPlant, q: &[[f64; 3]; MAX_LEGS], phys: &Physics, secs: f64) {
+    pub(super) fn hold(plant: &mut ArticulatedPlant, q: &[[f64; 3]; MAX_LEGS], phys: &Physics, secs: f64) {
         let n = (secs / crate::sim::DT).round() as usize;
         for _ in 0..n {
             plant.drive(q, phys, crate::sim::DT);
@@ -856,7 +971,7 @@ mod tests {
         }
     }
 
-    fn standing_q(frame: Frame, gait: &Gait) -> [[f64; 3]; MAX_LEGS] {
+    pub(super) fn standing_q(frame: Frame, gait: &Gait) -> [[f64; 3]; MAX_LEGS] {
         let mut q = [[0.0; 3]; MAX_LEGS];
         for i in 0..frame.legs() {
             let d = frame.dir(i);

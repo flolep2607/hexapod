@@ -140,6 +140,7 @@ fn main() {
         "scene" | "scenes" => scenes(frame, phys, &args),
         "legs" => legs_probe(frame, phys, course, &args),
         "churn" => churn(frame, phys, course, &args),
+        "crawl-train" => crawl_train(frame, phys, &args),
         "watch" => {
             let course = if flag(&args, "--course").is_some() {
                 course
@@ -1548,6 +1549,8 @@ struct LegTrace {
     swing_ticks: u32,
     fouled: u32,
     pinned: u32,
+    /// Worst off-axis twist seen on each hinge, radians. Should be zero.
+    twist: [f64; 3],
 }
 
 /// The plant knobs every diagnostic command accepts.
@@ -1635,6 +1638,10 @@ fn legs_probe(frame: Frame, mut phys: Physics, course: Course, args: &[String]) 
                 for j in 0..3 {
                     rot[j] += (qs[i][j] - pq[i][j]).abs();
                 }
+                let v = d.plant.hinge_violation(i);
+                for j in 0..3 {
+                    t.twist[j] = t.twist[j].max(v[j]);
+                }
             }
         }
         prev_pts = Some(pts);
@@ -1648,11 +1655,11 @@ fn legs_probe(frame: Frame, mut phys: Physics, course: Course, args: &[String]) 
         course,
         if drill { " (empty-field drill)" } else { "" }
     );
-    println!("leg   stance: hip    knee   ankle  foot  | coxa   femur  tibia  | swing foot | foul pin");
+    println!("leg   stance: hip    knee   ankle  foot  | coxa   femur  tibia  | off-axis twist rad | foul pin");
     for i in 0..n {
         let t = tr[i];
         println!(
-            "{:<5} {:6.3} {:6.3} {:6.3} {:6.3} | {:6.3} {:6.3} {:6.3} | {:9.3} | {:4} {:3}",
+            "{:<5} {:6.3} {:6.3} {:6.3} {:6.3} | {:6.3} {:6.3} {:6.3} | {:5.3} {:5.3} {:5.3}  | {:4} {:3}",
             frame.name(i),
             t.stance_path[0],
             t.stance_path[1],
@@ -1661,7 +1668,9 @@ fn legs_probe(frame: Frame, mut phys: Physics, course: Course, args: &[String]) 
             t.stance_rot[0],
             t.stance_rot[1],
             t.stance_rot[2],
-            t.swing_path[3],
+            t.twist[0],
+            t.twist[1],
+            t.twist[2],
             t.fouled,
             t.pinned
         );
@@ -1932,4 +1941,57 @@ fn churn(frame: Frame, mut phys: Physics, course: Course, args: &[String]) {
         100.0 * jw / jp.max(1e-9),
         100.0 * bw / bp.max(1e-9)
     );
+}
+
+// --------------------------------------------------------------- crawl-train
+
+/// Train the crawl controller on the articulated plant.
+///
+///   hexapod crawl-train [--iters 40] [--dirs 8] [--secs 25] [--seed 1]
+///
+/// Prints the seeded (hand-written) score first so every later number has
+/// something to be better than.
+fn crawl_train(frame: Frame, mut phys: Physics, args: &[String]) {
+    use hexapod_core::crawl_rl::{score, train, CrawlPolicy, TrainCfg};
+    motor_flags(&mut phys, args);
+    let iters: usize = flag(args, "--iters").and_then(|v| v.parse().ok()).unwrap_or(40);
+    let seed: u64 = flag(args, "--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let mut cfg = TrainCfg::default();
+    if let Some(v) = flag(args, "--dirs").and_then(|v| v.parse().ok()) {
+        cfg.n_dirs = v;
+        cfg.n_top = (v / 2).max(1);
+    }
+    if let Some(v) = flag(args, "--secs").and_then(|v| v.parse().ok()) {
+        cfg.secs = v;
+    }
+
+    let seeded = CrawlPolicy::seeded();
+    let report = |tag: &str, p: &CrawlPolicy| {
+        for c in [Course::Flat, Course::Rubble, Course::Steps] {
+            let s = score(p, frame, &phys, c, seed, cfg.secs);
+            println!(
+                "  {tag:<8} {c:<8?} progress {:7.3}  wasted {:7.3}  slip {:8.2}  sag {:6.3}  {}  reward {:7.3}",
+                s.progress,
+                s.wasted,
+                s.slip,
+                s.sag,
+                if s.fell { "FELL" } else { "ok  " },
+                s.reward()
+            );
+        }
+    };
+
+    println!("hand-written crawl (the policy seed reproduces it):");
+    report("seed", &seeded);
+
+    let t0 = Instant::now();
+    println!("\ntraining: {iters} iters x {} dirs x 2 rollouts x {} courses of {:.0}s",
+        cfg.n_dirs, cfg.courses.len(), cfg.secs);
+    let learned = train(frame, &phys, &cfg, iters, seed, |it, r, _| {
+        println!("  iter {it:3}  reward {r:8.3}   [{:5.0}s]", t0.elapsed().as_secs_f64());
+    });
+
+    println!("\nlearned:");
+    report("learned", &learned);
+    println!("\ntheta = {:?}", learned.theta.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>());
 }

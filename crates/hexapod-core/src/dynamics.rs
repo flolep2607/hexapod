@@ -168,11 +168,15 @@ pub struct Physics {
 impl Default for Physics {
     fn default() -> Self {
         Physics {
-            motor_stiff: 1.0e6,
-            motor_damp: 2.0e3,
+            motor_stiff: 5.0e6,
+            motor_damp: 3.0e4,
             substeps: 4,
-            solver_iters: 4,
-            pgs_iters: 1,
+            // Below 8x4 the revolute constraints are visibly violated: the hip
+            // hinge turns up to 42 degrees off its own axis, which reads on a
+            // canvas as the legs and body waggling. `plant::axis_probe`
+            // measures it. Cheaper is not faster, it is a different machine.
+            solver_iters: 8,
+            pgs_iters: 4,
             foot_mu: 1.15,
             motor_max: 50.0,
             mass_kg: 2.0,

@@ -9,19 +9,23 @@
  */
 
 const COL = {
-  shell: [0.925, 0.925, 0.915],
-  shellDark: [0.84, 0.84, 0.83],
-  carbon: [0.12, 0.13, 0.14],
-  carbonEdge: [0.22, 0.23, 0.24],
-  metal: [0.58, 0.60, 0.62],
-  metalLight: [0.78, 0.80, 0.81],
-  rubber: [0.10, 0.105, 0.11],
-  cable: [0.055, 0.06, 0.065],
-  lens: [0.06, 0.12, 0.15],
-  led: [0.18, 0.86, 0.52],
+  shell: [0.58, 0.61, 0.62],
+  shellBright: [0.82, 0.84, 0.84],
+  shellDark: [0.075, 0.08, 0.085],
+  carbon: [0.018, 0.021, 0.025],
+  carbonEdge: [0.14, 0.15, 0.16],
+  metal: [0.42, 0.44, 0.45],
+  metalLight: [0.76, 0.77, 0.76],
+  rubber: [0.018, 0.02, 0.023],
+  cable: [0.012, 0.014, 0.017],
+  pcb: [0.035, 0.20, 0.48],
+  pcbLight: [0.12, 0.42, 0.68],
+  wireRed: [0.72, 0.12, 0.055],
+  wireGold: [0.92, 0.48, 0.08],
+  wireBrown: [0.24, 0.055, 0.025],
+  led: [0.16, 0.82, 0.28],
   accent: [0.898, 0.224, 0.114],
   accentDark: [0.55, 0.105, 0.055],
-  joint: [0.32, 0.32, 0.33],
   block: [0.88, 0.88, 0.865],
   blockTop: [0.95, 0.95, 0.94],
   pit: [0.62, 0.62, 0.61],
@@ -309,8 +313,8 @@ class Stage {
     this._quad(nnp, pnp, pnn, nnn, side);
   }
 
-  /** One revolute actuator: one rectangular motor, one continuous shaft and
-   * one output horn. There are deliberately no spherical joint shapes here. */
+  /** One revolute actuator: a bolted rectangular motor, continuous output
+   * shaft and horn. There are deliberately no spherical joint shapes here. */
   _servo(p, axisHint, mountHint, r, hit) {
     const axis = norm(axisHint);
     const along = dot(mountHint, axis);
@@ -323,12 +327,40 @@ class Stage {
       mount = norm(cross(axis, [0, 1, 0]));
     }
     const upright = norm(cross(mount, axis));
-    const casing = hit ? COL.hit : COL.joint;
-    this._basisBox(p, [axis, upright, mount], [r * 0.56, r * 0.72, r * 0.88], casing, hit ? COL.hitTop : COL.carbonEdge);
+    const casing = hit ? COL.hit : COL.shellDark;
+    this._basisBox(
+      p,
+      [axis, upright, mount],
+      [r * 0.62, r * 0.82, r * 0.72],
+      casing,
+      hit ? COL.hitTop : COL.shell
+    );
+
+    // Thin mounting ears at both ends are the characteristic silhouette of
+    // the off-the-shelf digital servos used by the reference machine.
+    for (const d of [-r * 0.92, r * 0.92]) {
+      const tab = [p[0] + upright[0] * d, p[1] + upright[1] * d, p[2] + upright[2] * d];
+      this._basisBox(tab, [axis, upright, mount], [r * 0.82, r * 0.13, r * 0.30], casing, hit ? COL.hitTop : COL.shell);
+    }
 
     const at = (d) => [p[0] + axis[0] * d, p[1] + axis[1] * d, p[2] + axis[2] * d];
-    this._segment(at(-r * 0.82), at(r * 0.82), r * 0.20, COL.metalLight, 8);
-    this._segment(at(r * 0.55), at(r * 0.68), r * 0.52, hit ? COL.hitTop : COL.accent, 10);
+    const face = (a, b, c) => [
+      p[0] + axis[0] * a + upright[0] * b + mount[0] * c,
+      p[1] + axis[1] * a + upright[1] * b + mount[1] * c,
+      p[2] + axis[2] * a + upright[2] * b + mount[2] * c,
+    ];
+    // End caps and four visible fasteners give every joint a readable
+    // mechanical assembly instead of a generic grey block.
+    this._ellipsoid(at(-r * 0.90), r * 0.24, COL.metalLight, 8, 3);
+    this._ellipsoid(at(r * 0.90), r * 0.24, COL.metalLight, 8, 3);
+    for (const a of [-0.34, 0.34]) {
+      for (const b of [-0.42, 0.42]) {
+        const screw = face(a * r, b * r, r * 0.74);
+        this._ellipsoid(screw, r * 0.075, hit ? COL.hitTop : COL.metalLight, 7, 3);
+      }
+    }
+    this._segment(at(-r * 0.90), at(r * 0.90), r * 0.17, COL.metalLight, 8);
+    this._segment(at(r * 0.58), at(r * 0.72), r * 0.48, hit ? COL.hitTop : COL.shell, 10);
   }
 
   /** Walls plus one horizontal face: the lid of a block, the floor of a pit.
@@ -372,10 +404,11 @@ class Stage {
     }
   }
 
-  /** Layered aluminium/carbon chassis with an electronics enclosure, service
-   * hatch, fasteners, cooling ribs and a forward stereo rangefinder. */
+  /** Open aluminium chassis inspired by hobby and research hexapods: two side
+   * rails, crossmembers, visible control electronics and a serviceable wiring
+   * harness. Nothing is hidden under a cosmetic shell. */
   _chassis(pos, yaw, pitch, roll, R, hit) {
-    const H = 0.30;
+    const H = 0.13;
     const sy = Math.sin(yaw);
     const cyw = Math.cos(yaw);
     const sp = Math.sin(pitch);
@@ -391,73 +424,136 @@ class Stage {
       return [pos[0] + x * cyw - z * sy, pos[1] + y, pos[2] + x * sy + z * cyw];
     };
 
-    const ring = (r, y, zScale = 1.12) => {
-      const out = [];
-      for (let i = 0; i < 12; i++) {
-        const a = (i / 12) * Math.PI * 2 + Math.PI / 12;
-        out.push(xf([Math.cos(a) * r, y, Math.sin(a) * r * zScale]));
-      }
-      return out;
-    };
+    const frame = hit ? COL.hit : COL.shell;
+    const frameTop = hit ? COL.hitTop : COL.shellBright;
 
-    const shell = hit ? COL.hitTop : COL.shell;
-    const dark = hit ? COL.hit : COL.shellDark;
-    const bot = ring(R * 0.88, -H * 0.5);
-    const lower = ring(R, -H * 0.08);
-    const belt = ring(R * 1.01, H * 0.06);
-    const top = ring(R * 0.83, H * 0.5);
-
-    for (let i = 0; i < 12; i++) {
-      const j = (i + 1) % 12;
-      this._quad(bot[i], lower[i], lower[j], bot[j], hit ? dark : COL.carbonEdge);
-      this._quad(lower[i], belt[i], belt[j], lower[j], hit ? dark : COL.accentDark);
-      this._quad(belt[i], top[i], top[j], belt[j], shell);
+    // Four bolted rails leave the underside and most of the electronics open.
+    for (const sx of [-R * 0.55, R * 0.55]) {
+      this._localBox(xf, [sx, 0, 0], [R * 0.085, H * 0.50, R * 0.68], frame, frameTop);
     }
-    this.faces.push({ p: top, c: shell });
-    this.faces.push({ p: bot.slice().reverse(), c: hit ? dark : COL.carbon });
+    for (const sz of [-R * 0.59, R * 0.59]) {
+      this._localBox(xf, [0, 0, sz], [R * 0.55, H * 0.50, R * 0.085], frame, frameTop);
+    }
+    this._segment(xf([-R * 0.52, 0, -R * 0.55]), xf([R * 0.52, 0, R * 0.55]), 0.024, hit ? COL.hitTop : COL.carbonEdge, 6);
+    this._segment(xf([R * 0.52, 0, -R * 0.55]), xf([-R * 0.52, 0, R * 0.55]), 0.024, hit ? COL.hitTop : COL.carbonEdge, 6);
 
-    // Raised, gasketed electronics enclosure and battery/service hatch.
-    this._localBox(xf, [0, H * 0.78, -0.03], [R * 0.47, H * 0.28, R * 0.48], dark, shell);
-    this._localBox(xf, [0, H * 1.08, -0.08], [R * 0.36, 0.018, R * 0.35], COL.carbonEdge, COL.carbon);
-    this._localBox(xf, [0, H * 1.115, -0.08], [R * 0.29, 0.012, R * 0.015], COL.accentDark, COL.accent);
+    // Main controller PCB, daughterboard, pin headers and exposed components.
+    this._localBox(xf, [0, H * 0.78, R * 0.03], [R * 0.37, 0.026, R * 0.40], hit ? COL.hit : COL.pcb, hit ? COL.hitTop : COL.pcbLight);
+    this._localBox(xf, [-R * 0.14, H * 1.12, R * 0.04], [R * 0.12, 0.035, R * 0.15], frame, frameTop);
+    this._localBox(xf, [R * 0.17, H * 1.08, R * 0.13], [R * 0.105, 0.030, R * 0.10], COL.carbon, COL.carbonEdge);
+    this._localBox(xf, [R * 0.19, H * 1.08, -R * 0.20], [R * 0.12, 0.032, R * 0.08], COL.carbon, COL.carbonEdge);
 
-    // Cooling ribs make the top read as a working power enclosure, not a
-    // featureless polygon. They are shallow enough not to affect silhouette.
-    for (let i = -2; i <= 2; i++) {
+    // A row of pale servo headers makes the board read as functional at a
+    // glance, even from the default orbit camera.
+    for (let i = -3; i <= 3; i++) {
       this._localBox(
         xf,
-        [i * R * 0.105, H * 1.18, -R * 0.15],
-        [R * 0.025, 0.015, R * 0.12],
-        COL.carbon,
-        COL.metal
+        [i * R * 0.075, H * 1.11, R * 0.31],
+        [R * 0.022, 0.030, R * 0.035],
+        COL.metal,
+        COL.metalLight
       );
     }
 
-    // Stainless deck fasteners.
-    for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * Math.PI * 2 + Math.PI / 8;
-      const q = xf([Math.cos(a) * R * 0.67, H * 0.57, Math.sin(a) * R * 0.74]);
-      const q2 = xf([Math.cos(a) * R * 0.67, H * 0.63, Math.sin(a) * R * 0.74]);
-      this._segment(q, q2, 0.025, COL.metalLight, 8);
+    // Small heat sink and power-distribution hardware.
+    this._localBox(xf, [R * 0.25, H * 1.13, -R * 0.06], [R * 0.10, 0.035, R * 0.12], COL.carbon, COL.carbonEdge);
+    for (let i = -2; i <= 2; i++) {
+      this._localBox(xf, [R * 0.25 + i * R * 0.035, H * 1.42, -R * 0.06], [R * 0.010, 0.040, R * 0.10], COL.carbon, COL.shell);
+    }
+    for (const x of [-R * 0.29, -R * 0.23]) {
+      this._ellipsoid(xf([x, H * 1.19, -R * 0.25]), 0.020, hit ? COL.hitTop : COL.led, 8, 3);
     }
 
-    // Forward sensor bridge: stereo lenses, status LED and a short antenna.
-    const sensorZ = R * 0.88;
-    this._localBox(xf, [0, H * 0.64, sensorZ], [R * 0.29, 0.095, 0.085], COL.joint, COL.carbonEdge);
-    for (const sx of [-R * 0.16, R * 0.16]) {
-      const lens = xf([sx, H * 0.64, sensorZ + 0.095]);
-      const glass = xf([sx, H * 0.64, sensorZ + 0.14]);
-      this._segment(lens, glass, 0.064, COL.metal, 10);
-      this._ellipsoid(glass, [0.055, 0.055, 0.025], COL.lens, 10, 3);
+    // Stainless standoffs and deck bolts remain visible around the perimeter.
+    for (const [x, z] of [
+      [-0.55, -0.59], [0.55, -0.59], [0.55, 0.59], [-0.55, 0.59],
+      [-0.55, 0], [0.55, 0],
+    ]) {
+      const base = xf([x * R, H * 0.45, z * R]);
+      const cap = xf([x * R, H * 0.92, z * R]);
+      this._segment(base, cap, 0.022, COL.metalLight, 8);
     }
-    this._ellipsoid(xf([0, H * 0.74, sensorZ + 0.11]), 0.025, COL.led, 8, 3);
-    const mast = xf([R * 0.29, H * 0.98, 0]);
-    const tip = xf([R * 0.29, H * 1.72, 0]);
-    this._segment(mast, tip, 0.015, COL.joint, 6);
-    this._ellipsoid(tip, 0.026, COL.rubber, 8, 3);
+
+    // Routed signal and power harnesses are intentionally visible. Their
+    // slight doglegs keep the three conductors individually legible.
+    const wire = (points, color, radius = 0.009) => {
+      for (let i = 0; i + 1 < points.length; i++) this._segment(xf(points[i]), xf(points[i + 1]), radius, color, 5);
+    };
+    for (const side of [-1, 1]) {
+      wire([[0, H * 1.32, R * 0.25], [side * R * 0.18, H * 1.55, R * 0.18], [side * R * 0.51, H * 1.13, R * 0.39]], COL.wireGold);
+      wire([[0, H * 1.25, R * 0.22], [side * R * 0.20, H * 1.45, R * 0.13], [side * R * 0.51, H * 1.05, R * 0.35]], COL.wireRed);
+      wire([[0, H * 1.18, R * 0.19], [side * R * 0.22, H * 1.34, R * 0.08], [side * R * 0.51, H * 0.98, R * 0.31]], COL.wireBrown);
+    }
   }
 
   _legs(J, stance, legs, hitLegs, movingLeg) {
+    const at = (a, b, t) => [
+      a[0] + (b[0] - a[0]) * t,
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+    ];
+    const linkFrame = (a, b, height, spread, color, hit) => {
+      const p0 = at(a, b, 0.09);
+      const p1 = at(a, b, 0.91);
+      const axis = norm(sub(p1, p0));
+      let side = cross(axis, [0, 1, 0]);
+      if (Math.hypot(side[0], side[1], side[2]) < 1e-4) side = [1, 0, 0];
+      side = norm(side);
+      let up = norm(cross(side, axis));
+      if (up[1] < 0) up = [-up[0], -up[1], -up[2]];
+      const length = Math.hypot(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
+      const mid = at(p0, p1, 0.5);
+      const plateColor = hit ? COL.hit : color;
+      const topColor = hit ? COL.hitTop : COL.shellBright;
+
+      // A pair of thin perforated side plates carries each link, with steel
+      // spacers tying the assembly together at both ends.
+      for (const sign of [-1, 1]) {
+        const center = [
+          mid[0] + side[0] * spread * sign,
+          mid[1] + side[1] * spread * sign,
+          mid[2] + side[2] * spread * sign,
+        ];
+        this._basisBox(center, [side, up, axis], [0.017, height, length * 0.50], plateColor, topColor);
+        for (const t of [0.26, 0.50, 0.74]) {
+          const q0 = at(p0, p1, t);
+          const normal = [side[0] * sign, side[1] * sign, side[2] * sign];
+          const q = [
+            q0[0] + normal[0] * (spread + 0.020),
+            q0[1] + normal[1] * (spread + 0.020),
+            q0[2] + normal[2] * (spread + 0.020),
+          ];
+          this._segment(
+            [q[0] - normal[0] * 0.005, q[1] - normal[1] * 0.005, q[2] - normal[2] * 0.005],
+            [q[0] + normal[0] * 0.006, q[1] + normal[1] * 0.006, q[2] + normal[2] * 0.006],
+            height * 0.27,
+            hit ? COL.hitTop : COL.cable,
+            8
+          );
+        }
+      }
+      for (const p of [p0, p1]) {
+        this._segment(
+          [p[0] - side[0] * (spread + 0.035), p[1] - side[1] * (spread + 0.035), p[2] - side[2] * (spread + 0.035)],
+          [p[0] + side[0] * (spread + 0.035), p[1] + side[1] * (spread + 0.035), p[2] + side[2] * (spread + 0.035)],
+          0.018,
+          COL.metalLight,
+          8
+        );
+      }
+      return side;
+    };
+    const wireBundle = (a, b, side) => {
+      for (const [offset, color] of [[-0.014, COL.wireBrown], [0, COL.wireRed], [0.014, COL.wireGold]]) {
+        const lift = (p, y, s) => [p[0] + side[0] * s, p[1] + y, p[2] + side[2] * s];
+        const p0 = lift(at(a, b, 0.03), 0.075, offset);
+        const pm = lift(at(a, b, 0.48), 0.105, offset);
+        const p1 = lift(at(a, b, 0.96), 0.070, offset);
+        this._segment(p0, pm, 0.007, color, 5);
+        this._segment(pm, p1, 0.007, color, 5);
+      }
+    };
+
     for (let leg = 0; leg < legs; leg++) {
       const o = leg * 12;
       const hip = [J[o], J[o + 1], J[o + 2]];
@@ -479,30 +575,46 @@ class Stage {
       // transverse pitch axis each; their parallel shafts make the 3-DOF
       // serial chain explicit without implying ball-and-socket joints.
       const hit = hitLegs && hitLegs[leg];
+      const outward = norm(coxa);
+      const shoulder = [hip[0] - outward[0] * 0.20, hip[1] - outward[1] * 0.20, hip[2] - outward[2] * 0.20];
+      linkFrame(shoulder, hip, 0.060, 0.052, moving ? COL.accentDark : COL.shell, hit);
+      const side0 = linkFrame(hip, knee, 0.065, 0.052, shell, hit);
+      const side1 = linkFrame(knee, ankle, 0.058, 0.047, shell, hit);
+      const side2 = linkFrame(ankle, foot, 0.038, 0.032, moving ? COL.accentDark : COL.shell, hit);
+
+      // The servo boxes sit between each pair of plates, just as they do on
+      // the physical reference build.
       this._servo(hip, [0, 1, 0], coxa, 0.13, hit);
       this._servo(knee, pitchAxis, femur, 0.12, hit);
-      this._servo(ankle, pitchAxis, tibia, 0.105, hit);
+      this._servo(ankle, pitchAxis, tibia, 0.088, hit);
 
-      this._segment(hip, knee, 0.075, shell, 8);
+      wireBundle(hip, knee, side0);
+      wireBundle(knee, ankle, side1);
+      wireBundle(ankle, foot, side2);
 
-      this._segment(knee, ankle, 0.062, shell, 8);
+      // Open rectangular foot cage with triangular braces and four small
+      // rubber contact pads, rather than a moulded sci-fi shoe.
+      let toe = norm([tibia[0], 0, tibia[2]]);
+      if (Math.hypot(toe[0], toe[2]) < 1e-4) toe = [0, 0, 1];
+      const across = norm(cross([0, 1, 0], toe));
+      const corner = (s, f, y = 0.020) => [
+        foot[0] + across[0] * s * 0.09 + toe[0] * f * 0.072,
+        foot[1] + y,
+        foot[2] + across[2] * s * 0.09 + toe[2] * f * 0.072,
+      ];
+      const fl = corner(-1, 1);
+      const fr = corner(1, 1);
+      const rl = corner(-1, -1);
+      const rr = corner(1, -1);
+      const footColor = hit ? COL.hit : moving ? COL.accentDark : COL.shell;
+      for (const [a, b] of [[fl, fr], [fr, rr], [rr, rl], [rl, fl]]) this._segment(a, b, 0.014, footColor, 6);
+      const topL = corner(-0.56, -0.08, 0.10);
+      const topR = corner(0.56, -0.08, 0.10);
+      for (const [a, b] of [[fl, topL], [rl, topL], [fr, topR], [rr, topR], [topL, topR]]) this._segment(a, b, 0.012, footColor, 6);
+      for (const p of [fl, fr, rl, rr]) this._ellipsoid([p[0], p[1] - 0.010, p[2]], [0.026, 0.014, 0.026], COL.rubber, 8, 2);
 
-      this._segment(ankle, foot, 0.046, hitLegs && hitLegs[leg] ? COL.hit : moving ? COL.accentDark : COL.metal, 8);
-
-      // External loom follows the upper and lower links, as on a serviceable
-      // robot where each servo is daisy chained. Offset it slightly upward so
-      // it remains visible against the pale link tubes.
-      const up = (p) => [p[0], p[1] + 0.045, p[2]];
-      this._segment(up(hip), up(knee), 0.014, COL.cable, 5);
-      this._segment(up(knee), up(ankle), 0.012, COL.cable, 5);
-
-      // A compliant, broad rubber sole gives stance feet believable contact
-      // area instead of terminating in a sharp metal point.
-      this._ellipsoid([foot[0], foot[1] + 0.018, foot[2]], [0.12, 0.045, 0.105], COL.rubber, 10, 3);
-      this._ellipsoid([foot[0], foot[1] + 0.052, foot[2]], [0.052, 0.035, 0.052], COL.metal, 8, 3);
-
-      if (stance[leg] > 0.5) this._ellipsoid([foot[0], foot[1] + 0.024, foot[2]], [0.125, 0.022, 0.11], COL.accentDark, 10, 2);
-      if (moving) this._ellipsoid([foot[0], foot[1] + 0.06, foot[2]], [0.09, 0.09, 0.09], COL.accent, 10, 3);
+      if (stance[leg] > 0.5) this._ellipsoid([foot[0], foot[1] + 0.010, foot[2]], [0.068, 0.008, 0.052], COL.accentDark, 8, 2);
+      if (moving) this._ellipsoid([foot[0], foot[1] + 0.045, foot[2]], [0.065, 0.065, 0.065], COL.accent, 10, 3);
     }
   }
 
@@ -976,10 +1088,34 @@ class Stage {
     return [p[0] + LIGHT[0] * tHit, yHit + 0.004, p[2] + LIGHT[2] * tHit];
   }
 
-  _paintShadows(from) {
-    const end = this.faces.length;
-    for (let i = from; i < end; i++) {
-      this.faces.push({ p: this.faces[i].p.map((p) => this._shadowP(p)), a: 0.055 });
+  /** A few soft contact pools read much better than projecting every tiny
+   * robot polygon, which made overlapping shadows turn into a noisy stain. */
+  _paintShadows(pos, yaw, bodyR, joints, legs) {
+    const ellipse = (center, rx, rz, alpha, y) => {
+      const poly = [];
+      const cs = Math.cos(yaw);
+      const sn = Math.sin(yaw);
+      for (let i = 0; i < 16; i++) {
+        const a = (i / 16) * Math.PI * 2;
+        const x = Math.cos(a) * rx;
+        const z = Math.sin(a) * rz;
+        poly.push(this._shadowP([center[0] + x * cs - z * sn, y, center[2] + x * sn + z * cs]));
+      }
+      this.faces.push({ p: poly, a: alpha });
+    };
+
+    // Broad, low-opacity chassis shadow, layered to give it a soft edge.
+    ellipse(pos, bodyR * 1.30, bodyR * 1.45, 0.018, pos[1]);
+    ellipse(pos, bodyR * 1.03, bodyR * 1.17, 0.026, pos[1]);
+
+    // Small contact pools retain the legged silhouette without darkening the
+    // entire area beneath a swinging leg.
+    for (let leg = 0; leg < legs; leg++) {
+      const o = leg * 12 + 9;
+      const foot = [joints[o], joints[o + 1], joints[o + 2]];
+      const contact = Math.max(0.15, 1 - Math.min(1, Math.max(0, foot[1]) * 2.5));
+      ellipse(foot, 0.19, 0.16, 0.018 * contact, Math.max(foot[1], 0.08));
+      ellipse(foot, 0.12, 0.10, 0.026 * contact, Math.max(foot[1], 0.08));
     }
   }
 
@@ -1021,7 +1157,6 @@ class Stage {
       obstacles: nOb,
     };
     this._terrain(pos[2], hits.hitOb);
-    const robotFrom = this.faces.length;
     this._chassis(pos, t[L.T_YAW], t[L.T_PITCH], t[L.T_ROLL], bodyR, blocked || hits.chassis);
     const swinging = L.T_MOVE_PHASE != null && t[L.T_MOVE_PHASE] >= 1 && t[L.T_MOVE_PHASE] <= 3;
     const movingLeg = swinging ? Math.round(t[L.T_MOVE_LEG]) : -1;
@@ -1036,7 +1171,7 @@ class Stage {
       this._ellipsoid(com, 0.09, bad ? COL.hit : COL.accent, 10, 4);
     }
 
-    if (this.view !== "top") this._paintShadows(robotFrom);
+    if (this.view !== "top") this._paintShadows(pos, t[L.T_YAW], bodyR, joints, legs);
     this._paintFaces();
 
     // Support polygon on the ground, mass-weighted CoM in 3-D with its plumb.
