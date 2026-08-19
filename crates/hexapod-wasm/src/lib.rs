@@ -67,6 +67,10 @@ struct App {
     locks: hexapod_core::walker::StanceLocks,
     mode: u32,
     since_fall: f64,
+    /// Leftover sim time from the last frame. Playback speed buys more ticks,
+    /// never longer ones, so 10x is ten times the physics and not a coarser
+    /// integrator.
+    acc: f64,
 
     build: Build,
     /// Index into `SERVOS` of the servo driving the joints, or `None` for the
@@ -134,6 +138,7 @@ fn make(seed: u64) -> App {
         locks: hexapod_core::walker::StanceLocks::new(),
         mode: MODE_BASELINE,
         since_fall: 0.0,
+        acc: 0.0,
         build,
         servo: None,
         phys,
@@ -489,6 +494,21 @@ pub extern "C" fn hx_measure_torque() -> *const f32 {
     a.torque_buf.as_ptr()
 }
 
+/// How many fixed `DT` ticks a frame owes, banking the remainder. Playback
+/// speed buys ticks, never longer ones, so 10x is ten times the physics and
+/// not a coarser integrator. Capped so a slow frame cannot spiral; the surplus
+/// is dropped, which shows up honestly as playback running below the dial.
+fn ticks(acc: &mut f64, dt: f64) -> usize {
+    const MAX: usize = 64;
+    *acc += dt;
+    let n = ((*acc / hexapod_core::DT) as usize).min(MAX);
+    *acc -= n as f64 * hexapod_core::DT;
+    if *acc > hexapod_core::DT {
+        *acc = 0.0;
+    }
+    n
+}
+
 // -------------------------------------------------------------------- step
 
 #[unsafe(no_mangle)]
@@ -662,6 +682,10 @@ impl App {
         self.publish();
     }
 
+    fn ticks(&mut self, dt: f64) -> usize {
+        ticks(&mut self.acc, dt)
+    }
+
     fn step(&mut self, dt: f64, fwd: f64, turn: f64) {
         if self.oneleg.is_some() {
             let fallen = self
@@ -676,8 +700,8 @@ impl App {
                 }
                 return;
             }
-            let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
-            let h = dt / n as f64;
+            let n = self.ticks(dt);
+            let h = hexapod_core::DT;
             if let Some(drill) = self.oneleg.as_mut() {
                 if drill.crawl {
                     drill.set_cmd(Cmd {
@@ -721,15 +745,13 @@ impl App {
             cruise: self.cruise,
             nav: self.nav && turn.abs() < 0.02,
         };
+        let n = self.ticks(dt);
+        let h = hexapod_core::DT;
         let policy: &Policy = if self.mode == MODE_LEARNED && self.trained {
             &self.learned
         } else {
             &self.baseline
         };
-        // Substep so a long frame cannot destabilise the integrator.
-        // 16 ticks covers 4× playback at a slow 30 Hz frame.
-        let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
-        let h = dt / n as f64;
         for _ in 0..n {
             if self.plant.is_some() {
                 self.live
@@ -1269,5 +1291,36 @@ mod tests {
             "preset respawned the plant: t {t0} -> {t1}"
         );
         assert!(tel()[T_ONELEG] < 0.5);
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::ticks;
+    use hexapod_core::DT;
+
+    /// Playback speed has to buy ticks, not stretch them: one second of wall
+    /// clock at 10x owes ten seconds of fixed-DT physics.
+    #[test]
+    fn playback_speed_scales_tick_count() {
+        for scale in [1.0, 4.0, 10.0] {
+            let mut acc = 0.0;
+            let mut n = 0usize;
+            for _ in 0..60 {
+                n += ticks(&mut acc, (1.0 / 60.0) * scale);
+            }
+            let simulated = n as f64 * DT;
+            assert!(
+                (simulated - scale).abs() < 0.05,
+                "{scale}x simulated {simulated}s of sim time in 1s"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stalled_frame_drops_surplus_instead_of_spiralling() {
+        let mut acc = 0.0;
+        assert_eq!(ticks(&mut acc, 10.0), 64);
+        assert_eq!(acc, 0.0);
     }
 }

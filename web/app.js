@@ -1455,7 +1455,7 @@ function readKeys() {
 }
 
 function setRate(x) {
-  state.timeScale = Math.min(4, Math.max(0.25, Math.round(x * 4) / 4));
+  state.timeScale = Math.min(10, Math.max(0.25, Math.round(x * 4) / 4));
   $("rRate").value = state.timeScale;
   $("vRate").textContent = `${state.timeScale}×`;
 }
