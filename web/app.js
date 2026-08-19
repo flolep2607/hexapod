@@ -1193,19 +1193,56 @@ const traceFoot = new Trace($("cFoot"), [
   { color: COL.ink, fill: "rgba(20,20,22,0.07)" },
 ]);
 
-let lastFrame = performance.now();
+/* Nothing above 60 Hz reaches a screen, and a display that offers 120 would
+ * otherwise buy the sim nothing while costing it two draws. 30 is the floor:
+ * when the dial asks for more physics than a 60 Hz frame holds, half the frame
+ * rate is worth twice the sim budget — 30 still reads as motion, and dropping
+ * the sim instead is what made the speed dial a lie. */
+const RENDER_HZ = 60;
+const RENDER_HZ_MIN = 30;
+const FRAME_MS = 1000 / RENDER_HZ;
+const FRAME_MS_MAX = 1000 / RENDER_HZ_MIN;
+/* Playback speed is a request, not a promise. The physics runs at 800 Hz, so a
+ * 10x dial asks for more of it than a frame will fit, and handing the whole
+ * arrears to one hx_step call blocks for as long as it takes — the dial used to
+ * buy sim time by spending frame rate, and ended up short of both. Step in
+ * one-tick slices against a wall clock instead: the frame lands on time with
+ * whatever the machine reached, and the surplus is dropped the way it always
+ * was. Leave the rest of the frame for the draw and the panels. */
+const SIM_SLICE = 1 / 100;
+
+let lastDraw = performance.now();
+let drawMs = 2;
+let behind = false;
 let slowAcc = 0;
 
 function frame(now) {
-  const dt = Math.min(0.05, (now - lastFrame) / 1000) * state.timeScale;
-  lastFrame = now;
+  requestAnimationFrame(frame);
+  const slot = behind ? FRAME_MS_MAX : FRAME_MS;
+  const wall = (now - lastDraw) / 1000;
+  if (wall * 1000 < slot - 1) return;
+  const dt = Math.min(0.05, wall) * state.timeScale;
+  lastDraw = now;
 
   readKeys();
 
   if (!state.paused) {
     const t0 = performance.now();
-    api.hx_step(dt, state.cmd.fwd, state.cmd.turn);
+    // Whatever the draw is not going to need. Measured, not assumed: on a GPU
+    // the draw is a couple of ms and the sim gets nearly the whole frame; on a
+    // software canvas it is most of the frame and the sim gets the floor.
+    const budget = Math.max(slot - drawMs - 1, 3);
+    let owed = dt;
+    while (owed > 1e-9 && performance.now() - t0 < budget) {
+      const slice = Math.min(owed, SIM_SLICE);
+      api.hx_step_quiet(slice, state.cmd.fwd, state.cmd.turn);
+      owed -= slice;
+    }
+    api.hx_publish();
+    behind = owed > 1e-9;
     state.stepUs += ((performance.now() - t0) * 1000 - state.stepUs) * 0.1;
+  } else {
+    behind = false;
   }
 
   if (state.training) {
@@ -1219,13 +1256,15 @@ function frame(now) {
   }
 
   const t = telemetry();
+  const d0 = performance.now();
   stage.draw(t, L);
   if (!state.paused) {
     falls.push(t[L.T_TIME], t, L, Math.round(t[L.T_LEGS]) || 6);
   }
   drawGaitDiagram(t);
+  drawMs += (performance.now() - d0 - drawMs) * 0.1;
 
-  slowAcc += dt;
+  slowAcc += wall;
   if (slowAcc > 0.06) {
     slowAcc = 0;
     if (!state.paused) {
@@ -1236,8 +1275,6 @@ function frame(now) {
     traceFoot.draw();
     updateReadouts(t);
   }
-
-  requestAnimationFrame(frame);
 }
 
 function updateReadouts(t) {

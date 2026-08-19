@@ -518,6 +518,20 @@ pub extern "C" fn hx_step(dt: f64, fwd: f64, turn: f64) {
     a.publish();
 }
 
+/// Step without republishing. The frame loop slices the sim to fit a wall-clock
+/// budget and draws only the last slice, so publishing every one is forward
+/// kinematics for every leg computed a dozen times a frame and thrown away.
+/// Pair with [`hx_publish`] once the budget is spent.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_step_quiet(dt: f64, fwd: f64, turn: f64) {
+    app().step(dt, fwd, turn);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_publish() {
+    app().publish();
+}
+
 // ------------------------------------------------------------ data access
 
 #[unsafe(no_mangle)]
