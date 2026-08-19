@@ -67,6 +67,10 @@ struct App {
     locks: hexapod_core::walker::StanceLocks,
     mode: u32,
     since_fall: f64,
+    /// Leftover sim time from the last frame. Playback speed buys more ticks,
+    /// never longer ones, so 10x is ten times the physics and not a coarser
+    /// integrator.
+    acc: f64,
 
     build: Build,
     /// Index into `SERVOS` of the servo driving the joints, or `None` for the
@@ -134,6 +138,7 @@ fn make(seed: u64) -> App {
         locks: hexapod_core::walker::StanceLocks::new(),
         mode: MODE_BASELINE,
         since_fall: 0.0,
+        acc: 0.0,
         build,
         servo: None,
         phys,
@@ -271,7 +276,6 @@ pub extern "C" fn hx_set_preset(p: u32) {
     a.preset = Preset::from_u32(p);
     a.baseline = Policy::seeded(a.preset, a.frame);
     a.reset_training();
-    a.reset_live();
 }
 
 #[unsafe(no_mangle)]
@@ -280,6 +284,7 @@ pub extern "C" fn hx_set_mode(mode: u32) {
     if a.mode != mode {
         a.mode = mode;
         a.reset_live();
+        a.publish();
     }
 }
 
@@ -489,6 +494,21 @@ pub extern "C" fn hx_measure_torque() -> *const f32 {
     a.torque_buf.as_ptr()
 }
 
+/// How many fixed `DT` ticks a frame owes, banking the remainder. Playback
+/// speed buys ticks, never longer ones, so 10x is ten times the physics and
+/// not a coarser integrator. Capped so a slow frame cannot spiral; the surplus
+/// is dropped, which shows up honestly as playback running below the dial.
+fn ticks(acc: &mut f64, dt: f64) -> usize {
+    const MAX: usize = 64;
+    *acc += dt;
+    let n = ((*acc / hexapod_core::DT) as usize).min(MAX);
+    *acc -= n as f64 * hexapod_core::DT;
+    if *acc > hexapod_core::DT {
+        *acc = 0.0;
+    }
+    n
+}
+
 // -------------------------------------------------------------------- step
 
 #[unsafe(no_mangle)]
@@ -560,14 +580,6 @@ pub extern "C" fn hx_dist_curve_ptr() -> *const f32 {
 }
 
 impl App {
-    fn active_gait(&self) -> Gait {
-        if self.mode == MODE_LEARNED && self.trained {
-            self.learned.gait()
-        } else {
-            self.baseline.gait()
-        }
-    }
-
     fn apply_live_gait_limits(&mut self) {
         // The machine on screen is driven by real motors, so it does not get to
         // run a clock its servos cannot track: past their no-load speed a joint
@@ -575,17 +587,6 @@ impl App {
         // costs all of the accuracy. The trainer is deliberately left alone — it
         // optimises the centroidal model, and narrowing its action space is a
         // separate decision.
-        // And a leg is not thrown higher than a third of the ride height. The
-        // seeded 0.46 is over half of it: on the centroidal model that costs
-        // nothing, since its swing arc is decoration, but the articulated machine
-        // throws three legs that high every half cycle and spends the gait
-        // recovering from itself. Swept against the plant on both courses, at the
-        // clock below: 0.46 gives 0.26 m/s on the flat and 0.17 on the mixed
-        // course with 24 degrees of deck tilt, 0.28 gives 0.68 and 0.35 with the
-        // lateral drift down from 27% of forward travel to 4%. Obstacles are
-        // still cleared without the height — `foot_on_terrain` lifts the swing
-        // arc over whatever the foot is crossing, which is the job the hand-set
-        // height was doing badly.
         self.live_gait.step_h = self.live_gait.step_h.min(0.32 * self.live_gait.body_h);
 
         let g = self.live_gait;
@@ -606,32 +607,31 @@ impl App {
     fn reset_live(&mut self) {
         if self.mode == MODE_ONELEG {
             self.start_oneleg();
-            return;
+        } else {
+            self.start_crawl();
         }
-        self.oneleg = None;
-        self.live_gait = self.active_gait();
-        self.apply_live_gait_limits();
-        self.live.reset(&self.terrain, &self.live_gait, &self.phys);
-        self.plant = Some(ArticulatedPlant::standing(
-            self.frame,
-            &self.live_gait,
-            &self.phys,
-            &self.terrain,
-        ));
+    }
+
+    /// Crawl: five legs hold, one plants along the command, chassis shifts.
+    fn start_crawl(&mut self) {
+        let drill =
+            OneLegDrill::spawn_on(self.frame, &self.phys, &self.terrain, self.course_seed, true);
+        let (p, yaw, pitch, roll) = drill.plant.chassis_pose();
+        self.live.observe_pose(p, yaw, pitch, roll, drill.plant.chassis_vel());
+        self.live.t = 0.0;
+        self.live.fallen = false;
+        self.live.broken = false;
+        for i in 0..self.frame.legs() {
+            self.live.feet[i].world = drill.plant.leg_joints_world(i)[3];
+            self.live.feet[i].stance = true;
+        }
+        self.oneleg = Some(drill);
+        self.plant = None;
         self.locks.reset();
-        if let Some(plant) = self.plant.as_ref() {
-            let (p, yaw, pitch, roll) = plant.chassis_pose();
-            self.live.observe_pose(p, yaw, pitch, roll, plant.chassis_vel());
-            for i in 0..self.frame.legs() {
-                self.live.feet[i].world = plant.leg_joints_world(i)[3];
-            }
-            self.locks.capture(&self.live, plant);
-        }
         self.since_fall = 0.0;
     }
 
     /// Empty plane, five legs holding settled joints, one free foot.
-    /// The canvas draws this plant; the walking Rapier body is dropped.
     fn start_oneleg(&mut self) {
         if self.course != Course::Flat {
             self.course = Course::Flat;
@@ -682,6 +682,10 @@ impl App {
         self.publish();
     }
 
+    fn ticks(&mut self, dt: f64) -> usize {
+        ticks(&mut self.acc, dt)
+    }
+
     fn step(&mut self, dt: f64, fwd: f64, turn: f64) {
         if self.oneleg.is_some() {
             let fallen = self
@@ -692,13 +696,21 @@ impl App {
             if fallen {
                 self.since_fall += dt;
                 if self.since_fall > 1.2 {
-                    self.start_oneleg();
+                    self.reset_live();
                 }
                 return;
             }
-            let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
-            let h = dt / n as f64;
+            let n = self.ticks(dt);
+            let h = hexapod_core::DT;
             if let Some(drill) = self.oneleg.as_mut() {
+                if drill.crawl {
+                    drill.set_cmd(Cmd {
+                        fwd: fwd.clamp(-1.0, 1.0),
+                        turn: turn.clamp(-1.0, 1.0),
+                        cruise: self.cruise,
+                        nav: self.nav && turn.abs() < 0.02,
+                    });
+                }
                 for _ in 0..n {
                     drill.step(h);
                 }
@@ -733,15 +745,13 @@ impl App {
             cruise: self.cruise,
             nav: self.nav && turn.abs() < 0.02,
         };
+        let n = self.ticks(dt);
+        let h = hexapod_core::DT;
         let policy: &Policy = if self.mode == MODE_LEARNED && self.trained {
             &self.learned
         } else {
             &self.baseline
         };
-        // Substep so a long frame cannot destabilise the integrator.
-        // 16 ticks covers 4× playback at a slow 30 Hz frame.
-        let n = ((dt / hexapod_core::DT).round() as usize).clamp(1, 16);
-        let h = dt / n as f64;
         for _ in 0..n {
             if self.plant.is_some() {
                 self.live
@@ -979,7 +989,7 @@ impl App {
         if let Some(d) = self.oneleg.as_ref() {
             let s = d.sample();
             let qcmd = d.cmd_q();
-            t[T_ONELEG] = 1.0;
+            t[T_ONELEG] = if d.crawl { 0.0 } else { 1.0 };
             t[T_MOVE_LEG] = s.moving as f32;
             t[T_MOVE_PHASE] = s.phase.as_u32() as f32;
             t[T_MOVE_I] = s.move_i as f32;
@@ -989,7 +999,11 @@ impl App {
             t[T_TIME] = s.t as f32;
             t[T_SLIP_RATE] = s.slip as f32;
             t[T_FALLEN] = if s.fallen { 1.0 } else { 0.0 };
-            t[T_MODE] = MODE_ONELEG as f32;
+            t[T_MODE] = if d.crawl {
+                self.mode as f32
+            } else {
+                MODE_ONELEG as f32
+            };
             for i in 0..n {
                 let origin = d.origin_world[i];
                 t[T_ORIGIN + i * 3] = origin[0] as f32;
@@ -1232,5 +1246,81 @@ mod tests {
             dest_wander < 0.01,
             "landing mark crawled during the swing: {dest_wander}"
         );
+    }
+
+    #[test]
+    fn walk_mode_crawls_with_at_most_one_swing() {
+        hx_init(1);
+        hx_set_course(0, 1);
+        hx_set_mode(MODE_BASELINE);
+        assert!(tel()[T_ONELEG] < 0.5, "walk used the drill flag");
+        let dt = hexapod_core::DT;
+        let ticks = (3.0 / dt) as usize;
+        let mut max_swing = 0u32;
+        for _ in 0..ticks {
+            hx_step(dt, 1.0, 0.0);
+            let t = tel();
+            assert!(t[T_ONELEG] < 0.5);
+            let mut swing = 0u32;
+            for i in 0..6 {
+                if t[T_STANCE + i] < 0.5 {
+                    swing += 1;
+                }
+            }
+            max_swing = max_swing.max(swing);
+            assert!(swing <= 1, "walk swung {swing} legs");
+        }
+        assert!(max_swing <= 1);
+    }
+
+    #[test]
+    fn setting_a_preset_does_not_respawn_the_live_plant() {
+        hx_init(1);
+        hx_set_course(0, 1);
+        hx_set_mode(MODE_BASELINE);
+        let dt = hexapod_core::DT;
+        for _ in 0..20 {
+            hx_step(dt, 1.0, 0.0);
+        }
+        let t0 = tel()[T_TIME];
+        hx_set_preset(2);
+        hx_step(dt, 1.0, 0.0);
+        let t1 = tel()[T_TIME];
+        assert!(
+            t1 > t0,
+            "preset respawned the plant: t {t0} -> {t1}"
+        );
+        assert!(tel()[T_ONELEG] < 0.5);
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::ticks;
+    use hexapod_core::DT;
+
+    /// Playback speed has to buy ticks, not stretch them: one second of wall
+    /// clock at 10x owes ten seconds of fixed-DT physics.
+    #[test]
+    fn playback_speed_scales_tick_count() {
+        for scale in [1.0, 4.0, 10.0] {
+            let mut acc = 0.0;
+            let mut n = 0usize;
+            for _ in 0..60 {
+                n += ticks(&mut acc, (1.0 / 60.0) * scale);
+            }
+            let simulated = n as f64 * DT;
+            assert!(
+                (simulated - scale).abs() < 0.05,
+                "{scale}x simulated {simulated}s of sim time in 1s"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stalled_frame_drops_surplus_instead_of_spiralling() {
+        let mut acc = 0.0;
+        assert_eq!(ticks(&mut acc, 10.0), 64);
+        assert_eq!(acc, 0.0);
     }
 }

@@ -9,7 +9,7 @@
     </div>
     <div class="wordmark">HEXAPOD<small>GAIT LAB</small></div>
     <div class="chips right">
-      <div class="chip"><span class="k">Policy</span><b id="hPolicy" class="hot">ONE LEG</b></div>
+      <div class="chip"><span class="k">Mode</span><b id="hPolicy" class="hot">ONE LEG</b></div>
       <div class="chip"><span class="k">Course</span><b id="hCourse">MIXED</b></div>
       <div class="chip"><span class="k">State</span><b id="hState" class="hot">WALKING</b></div>
     </div>
@@ -90,17 +90,17 @@
         <div class="viewwrap">
           <canvas id="view"></canvas>
           <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
-<span id="hudGaitBits">GAIT <b id="hudGait">ONE LEG</b> · DUTY <b id="hudDuty">0.50</b></span></div>
+<span id="hudGaitBits" hidden>GAIT <b id="hudGait">ONE LEG</b> · DUTY <b id="hudDuty">0.50</b></span></div>
           <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
 SCROLL TO ZOOM · WASD / QE · [ ] SPEED
 <b id="hudHit"></b></div>
           <div class="hud bl" id="hudWalk" hidden>BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm
 vx <b id="hudVx">+0.00</b>  vy <b id="hudVy">+0.00</b>  vz <b id="hudVz">+0.00</b>  slip <b id="hudSlip">0.00</b></div>
-          <div class="hud bl" id="hudDrill">ONE LEG <b id="hudOlLeg">L1</b> · <b id="hudOlPhase">LIFT</b> · move <b id="hudOlMove">0</b>
+          <div class="hud bl" id="hudDrill"> <span id="hudDrillKind">CRAWL</span> <b id="hudOlLeg">L1</b> · <b id="hudOlPhase">LIFT</b> · move <b id="hudOlMove">0</b>
 clearance <b id="hudOlClear">0.00</b> m · stance drift <b id="hudOlDrift">0.00</b> m
 chassis Δxz <b id="hudOlXz">0.00</b> m · grey X = plant start</div>
-          <div class="hud br2" id="hudWalkMore">V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · HEAD <b id="hudHead">+0°</b> · ω <b id="hudW">0.00</b>
+          <div class="hud br2" id="hudWalkMore" hidden>V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · HEAD <b id="hudHead">+0°</b> · ω <b id="hudW">0.00</b>
 CYCLE <b id="hudCycle">0.47</b> s · STRIDE <b id="hudStride">1.08</b> m
 NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b> m · BRG <b id="hudBrg">+0°</b></div>
           <div class="drill-callout" id="drillCallout">ONE LEG MOVING<small id="drillCalloutLine">L1 · LIFT · the red leg is the only one commanded</small></div>
@@ -162,8 +162,8 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
               </table>
             </div>
             <p class="note">Phase offsets decide which legs swing together. Starting from a tripod, the
-            learner is free to invent any coordination pattern it likes — watch the gait diagram on the
-            right redraw itself as it trains.</p>
+            learner is free to invent any coordination pattern it likes — the table is the
+            nominal gait it ended up with, not what the live crawl is doing.</p>
           </div>
         </div>
       </div>
@@ -436,7 +436,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnReset">Reset</button>
         </div>
         <label class="slider"><span class="hd"><span class="k">Sim speed</span><b id="vRate">1×</b></span>
-          <input type="range" id="rRate" min="0.25" max="4" step="0.25" value="1"></label>
+          <input type="range" id="rRate" min="0.25" max="10" step="0.25" value="1"></label>
       </div>
 
       <div class="sec">
@@ -446,48 +446,15 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnWalk">Walk</button>
         </div>
         <div class="row3" id="onelegBtns"></div>
-        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost.</p>
-      </div>
-
-      <div class="sec">
-        <div class="sec-bar"><h2>Policy</h2></div>
-        <div class="row2">
-          <button class="btn" id="btnBase">Hand-tuned</button>
-          <button class="btn" id="btnLearn" disabled>Learned</button>
-        </div>
-        <p class="note" id="policyNote">Train a policy to enable the comparison.</p>
+        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost. Walk is the same plant, one foot at a time, along the command.</p>
       </div>
 
       <div class="sec">
         <div class="sec-bar"><h2>Frame</h2><span class="k" id="legsNote"></span></div>
         <label class="slider"><span class="hd"><span class="k">Legs</span><b id="vLegs">6 legs</b></span>
           <input type="range" id="rLegs" min="4" max="10" step="2" value="6"></label>
-        <p class="note">Four legs to ten, in pairs. The chassis grows, the policy is
-        reshaped around the new observation and action counts, and anything learned for the
-        old frame is discarded. A quadruped starts on the crawl: a trot stands on two
-        diagonal feet, which is dynamically stable and not statically stable, and this
-        simulator judges stability statically.</p>
-      </div>
-
-      <div class="sec" id="secGait">
-        <div class="sec-bar"><h2>Gait pattern</h2><span class="k" id="presetNote"></span></div>
-        <div class="row3" id="presetBtns"></div>
-        <div class="br"><i></i><canvas id="cGait" height="124"></canvas></div>
-        <p class="note">Footfalls as they happen, not the schedule they were meant to follow:
-        each row is one leg over the last four seconds, dark where the foot was down and
-        darker the more weight it carried. Everything under it — cycle time, duty per leg,
-        how many legs are ever in the air at once, and which named pattern that adds up to —
-        is measured from the same recording, so a learned policy that invents a coordination
-        nobody has a name for reads as <b>IRREGULAR</b> rather than as whatever it started from.</p>
-      </div>
-
-      <div class="sec" id="secCruise">
-        <div class="sec-bar"><h2 id="cruiseTitle">Commanded speed</h2><span class="k" id="cruiseNote"></span></div>
-        <label class="slider"><span class="hd"><span class="k" id="cruiseHold">Hold this cruise</span><b id="vCruise">4.0 m/s</b></span>
-          <input type="range" id="rCruise" min="1.5" max="6" step="0.1" value="4"></label>
-        <p class="note" id="cruiseHelp">The reward is speed tracking, not distance, and the command is an input to the
-        policy. Move it and watch the learned gait change its cycle time, stride and duty factor to keep up
-        — the hand-tuned one cannot, because it has no feedback layer.</p>
+        <p class="note">Four legs to ten, in pairs. A quadruped crawls; six and up
+        can stand on a pentagon while one foot relocates.</p>
       </div>
 
       <div class="sec">
@@ -509,13 +476,9 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnCamTop">Top</button>
           <button class="btn" id="btnCamSide">Side</button>
         </div>
-        <p class="note">Every course carries a route, and the corridor is fenced by two
-        invisible walls. With the autopilot on, the machine yaws toward the next waypoint
-        and the policy's steering action is a residual on top of that — on the slalom that
-        is the only way past, because the walls are taller than a leg can reach and cannot
-        be jumped. Touch the turn keys and steering hands back to you until you let go. Orbit, Top and Side lock the camera
-        (keys 1 / 2 / 3); drag the stage to take orbit back. Obstacles are coloured by kind,
-        and a solid the chassis or a link is inside turns red.</p>
+        <p class="note">Follow route yaws toward the next waypoint. Touch the turn
+        keys to take steering back. Orbit, Top and Side lock the camera (1 / 2 / 3);
+        drag the stage to orbit. A solid the chassis or a link is inside turns red.</p>
       </div>
 
       <div class="sec">
@@ -531,11 +494,6 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" data-cmd="back">▼</button>
           <span></span>
         </div>
-      </div>
-
-      <div class="sec">
-        <div class="sec-bar"><h2>Parameters</h2><span class="k" id="paramLock"></span></div>
-        <div id="sliders"></div>
       </div>
     </aside>
   </main>
