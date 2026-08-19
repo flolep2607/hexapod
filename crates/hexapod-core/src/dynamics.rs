@@ -154,6 +154,10 @@ pub struct Physics {
     /// realtime multiple they buy.
     pub substeps: usize,
     pub solver_iters: usize,
+    /// Inner PGS passes per solver iteration.
+    pub pgs_iters: usize,
+    /// Foot-on-ground friction. Was pinned at a 1.15 floor.
+    pub foot_mu: f64,
     /// Ceiling on joint force, simulator units. Not a servo rating — there is
     /// no torque-speed line, no stall derating and no backdrive any more. It
     /// exists because an unbounded motor lets the solver inject unbounded
@@ -168,6 +172,8 @@ impl Default for Physics {
             motor_damp: 2.0e3,
             substeps: 4,
             solver_iters: 4,
+            pgs_iters: 1,
+            foot_mu: 1.15,
             motor_max: 50.0,
             mass_kg: 2.0,
             scale: 0.10,

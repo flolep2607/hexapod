@@ -97,6 +97,19 @@ fn dir_from_to(a: Vector, b: Vector) -> Vector {
     }
 }
 
+/// Contacts and travel limits that a fall check will never see.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Faults {
+    /// Contact pairs between two different legs.
+    pub leg_leg: u32,
+    /// Contact pairs involving the chassis. Should always be zero.
+    pub chassis_hit: u32,
+    /// Joints sitting on a mechanical stop.
+    pub at_limit: u32,
+    pub fouled: [bool; MAX_LEGS],
+    pub pinned: [bool; MAX_LEGS],
+}
+
 /// One Rapier hinge, remembered so we can retarget it every tick.
 #[derive(Clone, Copy)]
 struct Hinge {
@@ -393,7 +406,7 @@ impl ArticulatedPlant {
             let foot_col = colliders.insert_with_parent(
                 ColliderBuilder::ball(FOOT_R * s)
                     .mass(tibia_kg * 0.15)
-                    .friction((phys.mu as f32).max(1.15))
+                    .friction(phys.foot_mu as f32)
                     .friction_combine_rule(CoefficientCombineRule::Max)
                     .restitution(0.0)
                     .collision_groups(groups_foot)
@@ -463,7 +476,7 @@ impl ArticulatedPlant {
         let integration = IntegrationParameters {
             dt: crate::sim::DT as f32,
             num_solver_iterations: phys.solver_iters,
-            num_internal_pgs_iterations: 1,
+            num_internal_pgs_iterations: phys.pgs_iters,
             length_unit: 1.0,
             ..Default::default()
         };
@@ -510,6 +523,14 @@ impl ArticulatedPlant {
                 };
                 let h = leg.hinges[j];
                 let target = wrap(q_cmd[i][j] as f32 - h.q0);
+                // Only touch a motor whose command actually moved. Taking a
+                // mutable handle marks the joint modified, which throws away
+                // the solver's warm-start impulses — so rewriting an unchanged
+                // setpoint every tick makes a standing leg re-converge from
+                // zero, forever, and that residual is what shakes the body.
+                if (target - h.set).abs() < 1.0e-6 {
+                    continue;
+                }
                 if let Some(leg) = self.legs[i].as_mut() {
                     leg.hinges[j].set = target;
                 }
@@ -599,6 +620,56 @@ impl ArticulatedPlant {
             self.bodies[h.child].rotation(),
         );
         h.q0 + a
+    }
+
+    /// Faults a gait can carry while still looking plausible on a canvas: legs
+    /// fouling each other, the chassis touching anything at all, and joints
+    /// pinned against the end of their mechanical travel. None of these are
+    /// falls, so nothing else catches them.
+    pub fn faults(&self) -> Faults {
+        let mut f = Faults::default();
+        // Body handle -> leg, so a contact pair can be named.
+        let mut owner = std::collections::HashMap::new();
+        for (i, leg) in self.legs.iter().enumerate().take(self.n) {
+            let Some(leg) = leg.as_ref() else { continue };
+            owner.insert(leg._coxa, i);
+            owner.insert(leg._femur, i);
+            owner.insert(leg.tibia, i);
+        }
+        for pair in self.narrow_phase.contact_pairs() {
+            if !pair.has_any_active_contact() {
+                continue;
+            }
+            let (Some(a), Some(b)) = (
+                self.colliders.get(pair.collider1).and_then(|c| c.parent()),
+                self.colliders.get(pair.collider2).and_then(|c| c.parent()),
+            ) else {
+                continue;
+            };
+            if a == self.chassis || b == self.chassis {
+                f.chassis_hit += 1;
+            }
+            match (owner.get(&a), owner.get(&b)) {
+                (Some(x), Some(y)) if x != y => {
+                    f.leg_leg += 1;
+                    f.fouled[*x.min(y)] = true;
+                    f.fouled[*x.max(y)] = true;
+                }
+                _ => {}
+            }
+        }
+        for i in 0..self.n {
+            let q = self.leg_q(i);
+            for (j, (lo, hi)) in Q_LIMIT.iter().enumerate() {
+                // Within a degree of the stop is a joint that has run out of
+                // travel, whatever the gait thinks it commanded.
+                if q[j] <= lo + 0.017 || q[j] >= hi - 0.017 {
+                    f.at_limit += 1;
+                    f.pinned[i] = true;
+                }
+            }
+        }
+        f
     }
 
     /// Rapier hinge angles for one leg, in the same coxa/femur/tibia order as

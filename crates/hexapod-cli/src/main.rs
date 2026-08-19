@@ -138,6 +138,8 @@ fn main() {
         "system" => system(frame, course, seed, iters, cfg, phys, &args),
         "oneleg" | "reach" => oneleg(frame, seed, phys, &args),
         "scene" | "scenes" => scenes(frame, phys, &args),
+        "legs" => legs_probe(frame, phys, course, &args),
+        "churn" => churn(frame, phys, course, &args),
         "watch" => {
             let course = if flag(&args, "--course").is_some() {
                 course
@@ -1357,21 +1359,7 @@ impl Report {
 }
 
 fn scenes(frame: Frame, mut phys: Physics, args: &[String]) {
-    if let Some(v) = flag(args, "--stiff").and_then(|v| v.parse().ok()) {
-        phys.motor_stiff = v;
-    }
-    if let Some(v) = flag(args, "--damp").and_then(|v| v.parse().ok()) {
-        phys.motor_damp = v;
-    }
-    if let Some(v) = flag(args, "--substeps").and_then(|v| v.parse().ok()) {
-        phys.substeps = v;
-    }
-    if let Some(v) = flag(args, "--solver").and_then(|v| v.parse().ok()) {
-        phys.solver_iters = v;
-    }
-    if let Some(v) = flag(args, "--maxf").and_then(|v| v.parse().ok()) {
-        phys.motor_max = v;
-    }
+    motor_flags(&mut phys, args);
     // args[0] is the subcommand. A scene name is the next bare word that is
     // not the value of a flag.
     let mut want = String::new();
@@ -1536,4 +1524,412 @@ fn run_tripod(
         fell,
         rt,
     }
+}
+
+// -------------------------------------------------------------- leg diagnostics
+
+/// Per-leg motion, split by whether the leg was supposed to be moving.
+///
+///   hexapod legs [--seconds 20] [--course flat] [--drill]
+///
+/// A stance leg is holding a world plant: every number on its row should be
+/// near zero. Anything else is the machine walking on legs it believes are
+/// still, which reads on a canvas as the untouched legs swaying about.
+#[derive(Default, Clone, Copy)]
+struct LegTrace {
+    /// Path length of hip, knee, ankle and foot while the leg is planted.
+    stance_path: [f64; 4],
+    /// Summed absolute joint rotation while planted, per joint, radians.
+    stance_rot: [f64; 3],
+    /// Same two, while the leg is deliberately swinging.
+    swing_path: [f64; 4],
+    swing_rot: [f64; 3],
+    stance_ticks: u32,
+    swing_ticks: u32,
+    fouled: u32,
+    pinned: u32,
+}
+
+/// The plant knobs every diagnostic command accepts.
+fn motor_flags(phys: &mut Physics, args: &[String]) {
+    if let Some(v) = flag(args, "--stiff").and_then(|v| v.parse().ok()) {
+        phys.motor_stiff = v;
+    }
+    if let Some(v) = flag(args, "--damp").and_then(|v| v.parse().ok()) {
+        phys.motor_damp = v;
+    }
+    if let Some(v) = flag(args, "--maxf").and_then(|v| v.parse().ok()) {
+        phys.motor_max = v;
+    }
+    if let Some(v) = flag(args, "--substeps").and_then(|v| v.parse().ok()) {
+        phys.substeps = v;
+    }
+    if let Some(v) = flag(args, "--solver").and_then(|v| v.parse().ok()) {
+        phys.solver_iters = v;
+    }
+    if let Some(v) = flag(args, "--pgs").and_then(|v| v.parse().ok()) {
+        phys.pgs_iters = v;
+    }
+    if let Some(v) = flag(args, "--footmu").and_then(|v| v.parse().ok()) {
+        phys.foot_mu = v;
+    }
+}
+
+fn legs_probe(frame: Frame, mut phys: Physics, course: Course, args: &[String]) {
+    use hexapod_core::sim::DT;
+    motor_flags(&mut phys, args);
+    let secs: f64 = flag(args, "--seconds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20.0);
+    let drill = args.iter().any(|a| a == "--drill");
+    let terrain = Terrain::new(course, 1);
+    let mut d = if drill {
+        OneLegDrill::spawn(frame, &phys, 1)
+    } else {
+        OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true)
+    };
+    d.set_cmd(Cmd {
+        fwd: 1.0,
+        turn: 0.0,
+        cruise: 0.35,
+        nav: false,
+    });
+    let n = frame.legs();
+    let mut tr = vec![LegTrace::default(); n];
+    let mut prev_pts: Option<Vec<[[f64; 3]; 4]>> = None;
+    let mut prev_q: Option<Vec<[f64; 3]>> = None;
+    let mut leg_leg = 0u32;
+    let mut chassis_hit = 0u32;
+
+    for _ in 0..(secs / DT) as usize {
+        d.step(DT);
+        let s = d.sample();
+        let f = d.plant.faults();
+        leg_leg += f.leg_leg;
+        chassis_hit += f.chassis_hit;
+        let pts: Vec<[[f64; 3]; 4]> = (0..n).map(|i| d.plant.leg_joints_world(i)).collect();
+        let qs: Vec<[f64; 3]> = (0..n).map(|i| d.plant.leg_q(i)).collect();
+        if let (Some(pp), Some(pq)) = (&prev_pts, &prev_q) {
+            for i in 0..n {
+                let swinging = i == s.moving && s.phase.swinging();
+                let t = &mut tr[i];
+                if f.fouled[i] {
+                    t.fouled += 1;
+                }
+                if f.pinned[i] {
+                    t.pinned += 1;
+                }
+                let (path, rot) = if swinging {
+                    t.swing_ticks += 1;
+                    (&mut t.swing_path, &mut t.swing_rot)
+                } else {
+                    t.stance_ticks += 1;
+                    (&mut t.stance_path, &mut t.stance_rot)
+                };
+                for k in 0..4 {
+                    let dx = pts[i][k][0] - pp[i][k][0];
+                    let dy = pts[i][k][1] - pp[i][k][1];
+                    let dz = pts[i][k][2] - pp[i][k][2];
+                    path[k] += (dx * dx + dy * dy + dz * dz).sqrt();
+                }
+                for j in 0..3 {
+                    rot[j] += (qs[i][j] - pq[i][j]).abs();
+                }
+            }
+        }
+        prev_pts = Some(pts);
+        prev_q = Some(qs);
+    }
+
+    println!(
+        "{} legs, {:.0}s, course {:?}{}",
+        n,
+        secs,
+        course,
+        if drill { " (empty-field drill)" } else { "" }
+    );
+    println!("leg   stance: hip    knee   ankle  foot  | coxa   femur  tibia  | swing foot | foul pin");
+    for i in 0..n {
+        let t = tr[i];
+        println!(
+            "{:<5} {:6.3} {:6.3} {:6.3} {:6.3} | {:6.3} {:6.3} {:6.3} | {:9.3} | {:4} {:3}",
+            frame.name(i),
+            t.stance_path[0],
+            t.stance_path[1],
+            t.stance_path[2],
+            t.stance_path[3],
+            t.stance_rot[0],
+            t.stance_rot[1],
+            t.stance_rot[2],
+            t.swing_path[3],
+            t.fouled,
+            t.pinned
+        );
+    }
+    let sf: f64 = tr.iter().map(|t| t.stance_path[3]).sum();
+    let sr: f64 = tr.iter().map(|t| t.stance_rot.iter().sum::<f64>()).sum();
+    println!(
+        "\ntotals: stance foot travel {sf:.3}  stance joint rotation {sr:.3} rad  \
+         leg-leg contact ticks {leg_leg}  chassis contact ticks {chassis_hit}"
+    );
+    println!("(a planted leg should score near zero on both stance columns)");
+}
+
+// ------------------------------------------------------------------- churn
+
+/// Motion that goes one way and comes back: it costs the machine everything
+/// and nets it nothing. Tracked per axis as total variation against net
+/// displacement, so a signal that travels 1.0 and ends where it started scores
+/// 100% wasted, while one that travels 1.0 in a straight line scores 0%.
+///
+///   hexapod churn [--seconds 20] [--drill] [--course flat] [--eps 1e-4]
+///
+/// The leg currently under command is excluded throughout — it is *supposed*
+/// to move. Everything reported here is the rest of the machine reacting.
+#[derive(Default, Clone, Copy)]
+struct Churn {
+    path: f64,
+    first: f64,
+    last: f64,
+    dir: i8,
+    rev: u32,
+    started: bool,
+}
+
+impl Churn {
+    fn push(&mut self, v: f64, eps: f64) {
+        if !self.started {
+            self.first = v;
+            self.last = v;
+            self.started = true;
+            return;
+        }
+        let d = v - self.last;
+        // Below the deadband it is solver noise, not a direction the machine
+        // chose. Counting it would drown the reversal rate in numerical dither.
+        if d.abs() < eps {
+            return;
+        }
+        self.last = v;
+        self.path += d.abs();
+        let s = if d > 0.0 { 1 } else { -1 };
+        if self.dir != 0 && s != self.dir {
+            self.rev += 1;
+        }
+        self.dir = s;
+    }
+    fn net(&self) -> f64 {
+        self.last - self.first
+    }
+    fn wasted(&self) -> f64 {
+        (self.path - self.net().abs()).max(0.0)
+    }
+    fn pct(&self) -> f64 {
+        if self.path > 1e-9 {
+            100.0 * self.wasted() / self.path
+        } else {
+            0.0
+        }
+    }
+    fn row(&self, name: &str, secs: f64) -> String {
+        format!(
+            "  {:<7} {:8.3} {:8.3} {:8.3}  {:5.1}%  {:6.2}",
+            name,
+            self.path,
+            self.net(),
+            self.wasted(),
+            self.pct(),
+            self.rev as f64 / secs
+        )
+    }
+}
+
+fn churn(frame: Frame, mut phys: Physics, course: Course, args: &[String]) {
+    use hexapod_core::sim::DT;
+    motor_flags(&mut phys, args);
+    let secs: f64 = flag(args, "--seconds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20.0);
+    let eps: f64 = flag(args, "--eps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0e-4);
+    let drill = args.iter().any(|a| a == "--drill");
+    // Zero command keeps the crawl in Pause forever: six feet down, nothing
+    // swinging, every joint setpoint frozen. A body that still moves here has
+    // no excuse — nothing is driving it.
+    let still = args.iter().any(|a| a == "--still");
+    let terrain = Terrain::new(course, 1);
+    let mut d = if drill {
+        OneLegDrill::spawn(frame, &phys, 1)
+    } else {
+        OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true)
+    };
+    d.set_cmd(Cmd {
+        fwd: if still { 0.0 } else { 1.0 },
+        turn: 0.0,
+        cruise: 0.35,
+        nav: false,
+    });
+    let n = frame.legs();
+    let mut body = [Churn::default(); 6];
+    let mut by_phase = [0.0f64; 5];
+    let mut phase_ticks = [0u32; 5];
+    let mut prev_pos: Option<[f64; 3]> = None;
+    let (mut lag_sum, mut lag_max, mut lag_n) = (0.0f64, 0.0f64, 0u32);
+    let mut joints = vec![[Churn::default(); 3]; n];
+    let mut cmds = vec![[Churn::default(); 3]; n];
+    let mut feet = vec![[Churn::default(); 3]; n];
+
+    // After `--settle T`, stop asking for moves and keep measuring. If the
+    // sway is a transient response to each step it decays away here; if the
+    // machine is holding internal strain it will not.
+    let settle_at: f64 = flag(args, "--settle")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(f64::INFINITY);
+    let mut quiesced = false;
+    for tick in 0..(secs / DT) as usize {
+        if !quiesced && tick as f64 * DT >= settle_at {
+            quiesced = true;
+            d.set_cmd(Cmd {
+                fwd: 0.0,
+                turn: 0.0,
+                cruise: 0.35,
+                nav: false,
+            });
+            // Restart the accumulators so only the quiet tail is scored.
+            body = [Churn::default(); 6];
+            joints = vec![[Churn::default(); 3]; n];
+            cmds = vec![[Churn::default(); 3]; n];
+            feet = vec![[Churn::default(); 3]; n];
+            by_phase = [0.0; 5];
+            phase_ticks = [0; 5];
+            lag_sum = 0.0;
+            lag_max = 0.0;
+            lag_n = 0;
+        }
+        d.step(DT);
+        let s = d.sample();
+        let cmd_q = d.cmd_q();
+        // Which phase the body actually moves in. A kick concentrated on one
+        // boundary is a step in the controller, not compliance under load.
+        if let Some(p) = prev_pos {
+            let dx = s.pos[0] - p[0];
+            let dy = s.pos[1] - p[1];
+            let dz = s.pos[2] - p[2];
+            by_phase[s.phase.as_u32() as usize] += (dx * dx + dy * dy + dz * dz).sqrt();
+            phase_ticks[s.phase.as_u32() as usize] += 1;
+        }
+        prev_pos = Some(s.pos);
+        // The crawl propels itself by holding the commanded body frame ahead
+        // of the real chassis; the legs push against that lead. A lead that
+        // does not go to zero when the command does is stored strain.
+        let dxl = d.ik_pos[0] - s.pos[0];
+        let dzl = d.ik_pos[2] - s.pos[2];
+        let l = (dxl * dxl + dzl * dzl).sqrt();
+        lag_sum += l;
+        lag_max = lag_max.max(l);
+        lag_n += 1;
+        for (k, v) in [s.pos[0], s.pos[1], s.pos[2], s.yaw, s.pitch, s.roll]
+            .into_iter()
+            .enumerate()
+        {
+            body[k].push(v, eps);
+        }
+        for i in 0..n {
+            // The commanded leg is meant to be moving. Everything else is not.
+            if i == s.moving {
+                continue;
+            }
+            let q = d.plant.leg_q(i);
+            let c = cmd_q[i];
+            for j in 0..3 {
+                joints[i][j].push(q[j], eps);
+                cmds[i][j].push(c[j], eps);
+            }
+            let f = d.plant.leg_joints_world(i)[3];
+            for j in 0..3 {
+                feet[i][j].push(f[j], eps);
+            }
+        }
+    }
+
+    println!(
+        "{n} legs, {secs:.0}s, {}{}  (leg under command excluded)",
+        if drill { "empty-field drill" } else { "crawl" },
+        if drill {
+            String::new()
+        } else {
+            format!(", course {course:?}")
+        }
+    );
+    println!("\nchassis        path      net   wasted  wasted%   rev/s");
+    for (k, name) in ["x", "y", "z", "yaw", "pitch", "roll"].into_iter().enumerate() {
+        println!("{}", body[k].row(name, secs));
+    }
+
+    println!("\nstance joints  path      net   wasted  wasted%   rev/s");
+    for (j, name) in ["coxa", "femur", "tibia"].into_iter().enumerate() {
+        let mut agg = Churn::default();
+        for i in 0..n {
+            agg.path += joints[i][j].path;
+            agg.rev += joints[i][j].rev;
+            agg.first += joints[i][j].first;
+            agg.last += joints[i][j].last;
+        }
+        println!("{}", agg.row(name, secs));
+    }
+
+    println!("\ncommanded      path      net   wasted  wasted%   rev/s");
+    for (j, name) in ["coxa", "femur", "tibia"].into_iter().enumerate() {
+        let mut agg = Churn::default();
+        for i in 0..n {
+            agg.path += cmds[i][j].path;
+            agg.rev += cmds[i][j].rev;
+            agg.first += cmds[i][j].first;
+            agg.last += cmds[i][j].last;
+        }
+        println!("{}", agg.row(name, secs));
+    }
+
+    println!("\nstance feet    path      net   wasted  wasted%   rev/s");
+    for (j, name) in ["x", "y", "z"].into_iter().enumerate() {
+        let mut agg = Churn::default();
+        for i in 0..n {
+            agg.path += feet[i][j].path;
+            agg.rev += feet[i][j].rev;
+            agg.first += feet[i][j].first;
+            agg.last += feet[i][j].last;
+        }
+        println!("{}", agg.row(name, secs));
+    }
+
+    println!(
+        "\ncommanded-body lead over the real chassis: mean {:.4}  peak {:.4}",
+        lag_sum / lag_n.max(1) as f64,
+        lag_max
+    );
+    println!("\nchassis motion by phase   path    ticks   per-tick");
+    for (k, name) in ["settle", "lift", "shift", "place", "pause"]
+        .into_iter()
+        .enumerate()
+    {
+        println!(
+            "  {:<8} {:16.4} {:7} {:10.6}",
+            name,
+            by_phase[k],
+            phase_ticks[k],
+            by_phase[k] / phase_ticks[k].max(1) as f64
+        );
+    }
+
+    let jp: f64 = joints.iter().flatten().map(|c| c.path).sum();
+    let jw: f64 = joints.iter().flatten().map(|c| c.wasted()).sum();
+    let bp: f64 = body.iter().map(|c| c.path).sum();
+    let bw: f64 = body.iter().map(|c| c.wasted()).sum();
+    println!(
+        "\nwasted: {:.0}% of stance joint rotation ({jw:.2} of {jp:.2} rad), \
+         {:.0}% of chassis motion ({bw:.2} of {bp:.2})",
+        100.0 * jw / jp.max(1e-9),
+        100.0 * bw / bp.max(1e-9)
+    );
 }

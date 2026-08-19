@@ -19,8 +19,6 @@
     <button class="tab" role="tab" data-tab="kinematics" aria-selected="true">Kinematics</button>
     <button class="tab" role="tab" data-tab="training" aria-selected="false">Training</button>
     <button class="tab" role="tab" data-tab="terrain" aria-selected="false">Terrain</button>
-    <button class="tab" role="tab" data-tab="hardware" aria-selected="false">Servos</button>
-    <button class="tab" role="tab" data-tab="system" aria-selected="false">System</button>
     <button class="tab" role="tab" data-tab="about" aria-selected="false">About</button>
   </nav>
 
@@ -187,126 +185,6 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         <p class="note" id="tNote"></p>
       </div>
 
-      <div class="pane scroll" data-pane="hardware">
-        <div class="sec-bar"><h2>Servo sizing</h2><span class="k">from the running gait</span></div>
-        <p class="lede">The simulated gait gives a per-foot load and a leg pose every tick. Multiply the load
-        by the horizontal lever arm from each joint to the foot and you get the torque that joint must hold —
-        the Jacobian transpose for a vertical force. Change the build below and the shopping list changes with
-        it. <b>A wider stance costs torque; more feet on the ground saves it.</b></p>
-
-        <div class="grid2">
-          <div class="sec">
-            <div class="sec-bar"><h2>Build</h2></div>
-            <label class="slider"><span class="hd"><span class="k">All-up mass</span><b id="vMass">2.0 kg</b></span>
-              <input type="range" id="rMass" min="0.3" max="12" step="0.1" value="2"></label>
-            <label class="slider"><span class="hd"><span class="k">Femur length</span><b id="vScale">80 mm</b></span>
-              <input type="range" id="rScale" min="30" max="220" step="5" value="80"></label>
-            <label class="slider"><span class="hd"><span class="k">Safety factor</span><b id="vSafety">1.35×</b></span>
-              <input type="range" id="rSafety" min="1" max="3" step="0.05" value="1.35"></label>
-            <p class="note" id="hwDims">—</p>
-          </div>
-
-          <div class="sec">
-            <div class="sec-bar"><h2>Peak joint torque</h2></div>
-            <div class="statrow">
-              <div class="stat mute"><span class="k">Coxa</span><b id="tqCoxa">—</b><span class="k">kg·cm</span></div>
-              <div class="stat"><span class="k">Femur</span><b id="tqFemur">—</b><span class="k">kg·cm · sizing case</span></div>
-              <div class="stat mute"><span class="k">Tibia</span><b id="tqTibia">—</b><span class="k">kg·cm</span></div>
-            </div>
-            <div class="stat"><span class="k">Servo must be rated for</span><b id="tqReq">—</b><span class="k">kg·cm stall, including safety factor</span></div>
-            <p class="note" id="tqNote">—</p>
-          </div>
-        </div>
-
-        <div class="sec">
-          <div class="sec-bar"><h2>Off-the-shelf servos</h2><span class="k">18 per robot</span></div>
-          <div class="scrollx">
-            <table id="tblServo">
-              <thead><tr>
-                <th>Part</th><th>Stall</th><th>Head</th><th>Mass ×18</th><th>Bus</th>
-                <th>Marketplace ×18</th><th>Distributor ×18</th><th>Verdict</th>
-              </tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <p class="note" id="priceNote"></p>
-        </div>
-      </div>
-
-
-      <div class="pane scroll" data-pane="system">
-        <div class="sec-bar"><h2>Whole-machine sizing</h2><span class="k" id="sysStatus">—</span></div>
-        <p class="lede">Battery mass is part of all-up mass, all-up mass sets joint torque, torque sets
-        current, and current sets the battery you need. That is a loop, and it is solved here by iteration
-        rather than guessed — <b id="sysIters">—</b>. Past a certain endurance it has no solution at all:
-        the robot cannot carry the battery its own runtime demands, and the table says so instead of
-        inventing a number.</p>
-
-        <div class="grid2">
-          <div class="sec">
-            <div class="sec-bar"><h2>Assumptions</h2></div>
-            <label class="slider"><span class="hd"><span class="k">Chassis, brackets, wiring</span><b id="vChassis">0.45 kg</b></span>
-              <input type="range" id="rChassis" min="0.1" max="4" step="0.05" value="0.45"></label>
-            <label class="slider"><span class="hd"><span class="k">Target endurance</span><b id="vRuntime">20 min</b></span>
-              <input type="range" id="rRuntime" min="5" max="90" step="5" value="20"></label>
-            <p class="note">Femur length and safety factor come from the Servos tab. Current is modelled
-            from torque — a brushed motor's torque is proportional to its current — so it ignores gearbox
-            friction and reversal inrush and reads slightly optimistic.</p>
-          </div>
-
-          <div class="sec">
-            <div class="sec-bar"><h2>Mass budget</h2><span class="k" id="sysAllUp">—</span></div>
-            <div class="bars" id="massBars"></div>
-            <div class="statrow" style="margin-top:8px">
-              <div class="stat"><span class="k">Mean draw</span><b id="sysMeanA">—</b><span class="k">A at the pack</span></div>
-              <div class="stat mute"><span class="k">Peak</span><b id="sysPeakA">—</b><span class="k">A at the pack</span></div>
-              <div class="stat mute"><span class="k">Power</span><b id="sysWatts">—</b><span class="k">W mean</span></div>
-              <div class="stat"><span class="k">Endurance</span><b id="sysRuntime">—</b><span class="k">minutes walking</span></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="sec">
-          <div class="sec-bar"><h2>Every servo, sized as a complete robot</h2><span class="k">click a row to build it</span></div>
-          <div class="scrollx">
-            <table id="tblSystem">
-              <thead><tr>
-                <th>Servo</th><th>All-up</th><th>Needs</th><th>Stall</th><th>Battery</th>
-                <th>Mean A</th><th>Peak A</th><th>Endurance</th><th>Total</th><th>Verdict</th>
-              </tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <p class="note">“Needs” is peak joint torque at the converged mass, including the safety factor.
-          A heavier servo makes the robot heavier, which raises the torque it has to produce — which is why
-          the requirement moves from row to row.</p>
-        </div>
-
-        <div class="sec">
-          <div class="sec-bar"><h2>Parts list</h2><span class="k" id="sysPick">—</span></div>
-          <div class="scrollx">
-            <table id="tblParts">
-              <thead><tr><th>Role</th><th>Part</th><th>Qty</th><th>Mass</th><th>Cost</th><th>Why this one</th></tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="sec">
-          <div class="sec-bar"><h2>What the policy demands of the sensors</h2></div>
-          <p class="lede">The observation vector is not free. The policy reads six terrain heights, a pitch,
-          a roll and a stability margin every control tick; on a real robot each of those is a measurement
-          with a range, a rate and a resolution.</p>
-          <div class="scrollx">
-            <table id="tblSense">
-              <thead><tr><th>Observation</th><th>Needs</th><th>Part</th><th>Provides</th><th>Verdict</th></tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <p class="note" id="senseNote"></p>
-        </div>
-      </div>
-
       <div class="pane scroll" data-pane="about">
         <div class="sec-bar"><h2>What this is</h2></div>
         <p class="lede">A legged-locomotion simulator with a policy-search trainer, written in Rust and
@@ -318,22 +196,21 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             <div class="sec-bar"><h2>The simulator</h2></div>
             <p class="note">The live robot is <b>Rapier</b>: a chassis, three revolute joints per leg
             (eighteen on a hexapod), and Coulomb friction at the feet. Gait, analytic 3-DOF IK and the servo
-            torque-speed cap are written here; the engine is not. Motors track the IK solution with the
-            stall torque of the servo you picked. That is the first milestone — standing on a plane, then a
-            tripod gait — and it already uses the engine.</p>
+            torque-speed cap are written here; the engine is not. Motors track the IK solution against a
+            fixed torque-speed model. That is the first milestone — standing on a plane, then a tripod
+            gait — and it already uses the engine.</p>
             <p class="note">A <b>centroidal rigid-body</b> model still runs the learner. A Rapier step is
             too expensive for in-page ARS (the centroidal tick is about seven microseconds). Training
             therefore keeps the fast plant; the dashboard shows the articulated one. Both are driven by the
-            same gait, IK and servo numbers.</p>
+            same gait, IK and actuator model.</p>
             <p class="note">The chassis carries linear and angular momentum; it cannot change speed faster
             than traction allows, it coasts when a foot slips, and its own acceleration throws the centre of
             mass around — braking hard pitches the mass forward over the toes.</p>
             <p class="note">Contact is <b>Coulomb friction</b>: a stance foot transmits at most μ·N, and past
             that it skids and its contact point moves in the world, corrupting the support polygon for every
             tick after. Loose rubble grips about two thirds of what firm ground does.</p>
-            <p class="note">Joints are driven by a <b>real servo</b> — the one selected in the control rail —
-            along its torque-speed line: full speed at no load, zero speed at stall, and past stall the joint
-            back-drives, the leg folds and the chassis sags. The gait you train is a gait for that servo.</p>
+            <p class="note">Joints follow a torque-speed model: full speed at no load, zero speed at stall,
+            and past stall the joint back-drives, the leg folds and the chassis sags.</p>
             <p class="note"><b>Leg mass</b> is real and it is not small — on a machine this size the
             legs are about half of it. A swinging leg holds itself up against gravity and has to be
             accelerated and stopped, its joints pay for both in torque, and the reaction goes back into the
@@ -442,7 +319,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
       <div class="sec">
         <div class="sec-bar"><h2>Empty-field drill</h2></div>
         <div class="row2">
-          <button class="btn primary" id="btnOneleg" data-on="true">One leg</button>
+          <button class="btn" id="btnOneleg" data-on="true">One leg</button>
           <button class="btn" id="btnWalk">Walk</button>
         </div>
         <div class="row3" id="onelegBtns"></div>
@@ -455,14 +332,6 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <input type="range" id="rLegs" min="4" max="10" step="2" value="6"></label>
         <p class="note">Four legs to ten, in pairs. A quadruped crawls; six and up
         can stand on a pentagon while one foot relocates.</p>
-      </div>
-
-      <div class="sec">
-        <div class="sec-bar"><h2>The machine</h2><span class="k" id="machineNote"></span></div>
-        <select id="selServo" class="sel"></select>
-        <p class="note">The servo's torque-speed line drives the joints. Pick an undersized one and the legs
-        give way under load and the chassis sags. Changing it changes the robot, so anything already learned
-        is discarded.</p>
       </div>
 
       <div class="sec">

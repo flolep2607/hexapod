@@ -660,13 +660,14 @@ function drawProfile() {
 
 /* ------------------------------------------------------------------- UI */
 
-/* The alternating preset is named for what it produces on this frame: a
- * tripod on six legs, a trot on four. */
-/* Simulator units to metres, the same number the hardware tab is built on. */
+// The simulator continues to report distances in its native units; this
+// fixed conversion keeps the visible telemetry in metres and millimetres.
 function simScale() {
   return state.build.femurMm / 1000 / 0.8;
 }
 
+/* The alternating preset is named for what it produces on this frame: a
+ * tripod on six legs, a trot on four. */
 function presetName(i) {
   if (i !== 0) return PRESETS[i];
   return { 4: "Trot", 6: "Tripod", 8: "Tetrapod" }[state.legs] || "Alternate";
@@ -763,15 +764,6 @@ function buildStaticUI() {
     syncCruiseLabels();
   }
 
-  $("selServo").innerHTML =
-    `<option value="-1">Generic 20 kg·cm digital</option>` +
-    CATALOGUE.servos
-      .map(
-        (v, i) =>
-          `<option value="${i}">${v.part} — ${v.stall} kg·cm, ${v.speed}s/60°</option>`
-      )
-      .join("");
-  $("selServo").value = String(state.servo);
 }
 
 /* A different machine cannot use a policy learned for the old one, so
@@ -782,8 +774,6 @@ function afterMachineChange() {
   $("btnTrain").textContent = "Train";
   setMode(0);
   updateTrainingPanel();
-  updateHardware();
-  updateSystem();
 }
 
 /* One line describing the machine the simulator is currently driving. Read
@@ -796,9 +786,12 @@ function describeMachine() {
   const rpm = 60 / (6 * s60);
   const label =
     { 4: "QUADRUPED", 6: "HEXAPOD", 8: "OCTOPOD", 10: "DECAPOD" }[state.legs] || "WALKER";
-  $("machineNote").textContent = `${state.build.mass.toFixed(1)} kg · ${stall.toFixed(
-    1
-  )} kg·cm · ${rpm.toFixed(0)} rpm`;
+  const machineNote = $("machineNote");
+  if (machineNote) {
+    machineNote.textContent = `${state.build.mass.toFixed(1)} kg · ${stall.toFixed(
+      1
+    )} kg·cm · ${rpm.toFixed(0)} rpm`;
+  }
   $("hModel").textContent = `${label} · ${state.legs * 3} DOF`;
   $("hudDof").textContent = String(state.legs * 3);
   $("hudLegs").textContent = String(state.legs);
@@ -857,7 +850,6 @@ function setMode(mode) {
   if (secCruise) secCruise.hidden = mode === 2;
   syncSliders();
   refreshGaitTable();
-  updateHardware();
   if (mode === 2) {
     api.hx_set_oneleg_leg(state.onelegLeg);
     state.cmd = { fwd: 0, turn: 0 };
@@ -891,8 +883,6 @@ function setTab(name) {
   });
   if (name === "terrain") drawProfile();
   if (name === "training") drawCurve();
-  if (name === "hardware") updateHardware();
-  if (name === "system") updateSystem();
 }
 
 function refreshGaitTable() {
@@ -1653,45 +1643,6 @@ function wire() {
     });
   }
 
-  $("selServo").addEventListener("change", () => {
-    const i = +$("selServo").value;
-    state.servo = i;
-    // Changing the machine invalidates anything learned for the old one.
-    if (api.hx_set_servo(i < 0 ? 0xffffffff : i)) afterMachineChange();
-    describeMachine();
-    log(`sim.servo("${i < 0 ? "generic 20 kg-cm" : CATALOGUE.servos[i].part}")`);
-  });
-
-  const hw = () => {
-    state.build.mass = +$("rMass").value;
-    state.build.femurMm = +$("rScale").value;
-    state.build.safety = +$("rSafety").value;
-    $("vMass").textContent = `${state.build.mass.toFixed(1)} kg`;
-    $("vScale").textContent = `${state.build.femurMm} mm`;
-    $("vSafety").textContent = `${state.build.safety.toFixed(2)}×`;
-    updateHardware();
-    describeMachine();
-  };
-  ["rMass", "rScale", "rSafety"].forEach((id) => $(id).addEventListener("input", hw));
-
-  const sz = () => {
-    state.sizing.chassis = +$("rChassis").value;
-    state.sizing.runtime = +$("rRuntime").value;
-    $("vChassis").textContent = `${state.sizing.chassis.toFixed(2)} kg`;
-    $("vRuntime").textContent = `${state.sizing.runtime} min`;
-    updateSystem();
-  };
-  ["rChassis", "rRuntime"].forEach((id) => $(id).addEventListener("input", sz));
-
-  $("tblSystem").addEventListener("click", (e) => {
-    const row = e.target.closest("[data-servo]");
-    if (!row) return;
-    state.pick = +row.dataset.servo;
-    state.pickLocked = true;
-    updateSystem();
-    log(`build.servo("${CATALOGUE.servos[state.pick].part}")`);
-  });
-
   addEventListener("keydown", (e) => {
     const k = e.key.toLowerCase();
     if ("wsqe".includes(k) && k.length === 1) {
@@ -1758,7 +1709,6 @@ function applyCourse() {
   drawProfile();
   drawCurve();
   updateTrainingPanel();
-  updateHardware();
   log(`course.set("${name.toLowerCase()}", seed=${state.seed})`);
 }
 
@@ -1792,8 +1742,6 @@ async function boot() {
     `MIXED · seed 1 · ${api.hx_course_len()} obstacles · ${api.hx_route_len()} waypoints`;
   $("tNote").textContent = COURSE_NOTES.MIXED;
   refreshGaitTable();
-  updateHardware();
-  updateSystem();
   updateTrainingPanel();
   describeMachine();
   setMode(2);

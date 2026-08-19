@@ -143,52 +143,17 @@ async function bootAndStatic(h) {
   check("course switches", /STEPS/.test(stepsSummary), stepsSummary);
   await screenshot("05-terrain.png");
 
-  await page.click('[data-tab="hardware"]');
-  const req = parseFloat(await page.textContent("#tqReq"));
-  const femur = parseFloat(await page.textContent("#tqFemur"));
-  const rows = await page.$$eval("#tblServo tbody tr", (items) => items.length);
-  const passing = await page.$$eval('#tblServo tbody tr[data-pass="true"]', (items) => items.length);
-  check("torque requirement computed", req > 1 && req < 200, `${req} kg-cm`);
-  check("femur is the sizing joint", femur > 0, `${femur} kg-cm`);
-  check("servo table populated", rows === 8, `${rows} rows`);
-  check("some servos qualify, some do not", passing > 0 && passing < rows, `${passing}/${rows} pass`);
-
-  await setRange("rMass", 8);
-  const req2 = parseFloat(await page.textContent("#tqReq"));
-  const passing2 = await page.$$eval('#tblServo tbody tr[data-pass="true"]', (items) => items.length);
-  check("torque scales with mass", req2 > req * 2, `${req} -> ${req2} kg-cm at 8 kg`);
-  check("shortlist shrinks as mass grows", passing2 <= passing, `${passing} -> ${passing2} pass`);
-  await setRange("rMass", 2);
-  await screenshot("06-hardware.png");
-
-  await page.click('[data-tab="system"]');
-  const system = await page.evaluate(() => ({
-    rows: document.querySelectorAll("#tblSystem tbody tr").length,
-    pass: document.querySelectorAll('#tblSystem tbody tr[data-pass="true"]').length,
-    parts: document.querySelectorAll("#tblParts tbody tr").length,
-    sensors: document.querySelectorAll("#tblSense tbody tr").length,
-    allUp: document.getElementById("sysAllUp").textContent,
-    meanA: parseFloat(document.getElementById("sysMeanA").textContent),
-    runtime: parseFloat(document.getElementById("sysRuntime").textContent),
-  }));
-  check("system table sizes every servo", system.rows === 8, `${system.rows} rows, ${system.pass} viable`);
-  check("some servos cannot build the robot", system.pass > 0 && system.pass < system.rows, `${system.pass}/${system.rows}`);
-  check("parts list populated", system.parts >= 8, `${system.parts} rows`);
-  check("sensor requirements derived", system.sensors === 5, `${system.sensors} rows`);
-  check("current draw computed", system.meanA > 0.2 && system.meanA < 40, `${system.meanA} A`);
-  check("endurance computed", system.runtime > 1 && system.runtime < 400, `${system.runtime} min`);
-  check("all-up mass shown", /kg/.test(system.allUp), system.allUp);
-  const massBefore = parseFloat(system.allUp);
-  await setRange("rRuntime", 90);
-  const massAfter = parseFloat(await page.textContent("#sysAllUp"));
-  check("longer endurance costs mass", massAfter > massBefore, `${massBefore} -> ${massAfter} kg`);
-  await setRange("rRuntime", 20);
-  await screenshot("07-system.png");
+  check(
+    "servo and battery pages are removed",
+    (await page.$('[data-tab="hardware"]')) === null &&
+      (await page.$('[data-tab="system"]')) === null &&
+      (await page.$("#selServo")) === null
+  );
   await page.click('[data-tab="about"]');
-  await screenshot("08-about.png");
+  await screenshot("06-about.png");
 
   const canvasFit = await page.evaluate(() =>
-    ["dSolver", "dStab", "cTorque", "cFoot", "cGait"].map((id) => {
+    ["dSolver", "dStab", "cTorque", "cFoot"].map((id) => {
       const cv = document.getElementById(id);
       const rect = cv.getBoundingClientRect();
       return { id, ax: cv.width / rect.width, ay: cv.height / rect.height };
@@ -254,51 +219,6 @@ async function speedAndPhysics(h) {
     hull.n >= 3 && hull.span < 1.5,
     `${hull.n} pts, ${hull.span.toFixed(2)} m`
   );
-}
-
-async function servo(h) {
-  const { page, check, setRange, screenshot, stepSamples } = h;
-  await setRange("rRate", 2);
-  const pickServo = async (label) => {
-    const index = await page.evaluate((wanted) => {
-      const select = document.getElementById("selServo");
-      const option = [...select.options].findIndex((item) => item.textContent.startsWith(wanted));
-      select.value = select.options[option].value;
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-      return select.value;
-    }, label);
-    await stepSamples(132);
-    return {
-      index,
-      load: parseFloat(await page.textContent("#mServo")),
-      note: await page.textContent("#machineNote"),
-    };
-  };
-
-  const strong = await pickServo("DS3218MG");
-  const weak = await pickServo("SG90");
-  check("servo selector changes the machine", strong.note !== weak.note, `${strong.note} | ${weak.note}`);
-  check(
-    "an undersized servo is driven past stall",
-    weak.load > strong.load && weak.load > 100,
-    `${strong.load}% -> ${weak.load}% of stall`
-  );
-  const sag = parseFloat(await page.textContent("#pDroop"));
-  check("an undersized servo sags the chassis", Math.abs(sag) > 0.5, `${sag} mm`);
-
-  await page.evaluate(() => {
-    const select = document.getElementById("selServo");
-    select.value = "-1";
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-  });
-  await stepSamples(48);
-  const leg = await page.evaluate(() => ({
-    torque: document.getElementById("pLegTq").textContent,
-    reaction: document.getElementById("pReact").textContent,
-  }));
-  check("leg weight costs joint torque", parseFloat(leg.torque) > 0, `${leg.torque} kg-cm`);
-  check("swinging legs kick the chassis", parseFloat(leg.reaction) > 0, `${leg.reaction} N`);
-  await screenshot("09-physics.png");
 }
 
 async function frameState(h, legs) {
@@ -537,14 +457,17 @@ async function onelegDrill(h) {
   await page.click("#btnWalk");
   check("walk restores the gait", (await page.getAttribute("#btnWalk", "data-on")) === "true");
   check("one-leg turns off", (await page.getAttribute("#btnOneleg", "data-on")) !== "true");
+  check(
+    "inactive one-leg button is not the orange primary action",
+    !(await page.$eval("#btnOneleg", (button) => button.classList.contains("primary")))
+  );
 }
 
 const scenarios = [
   ["dashboard", bootAndStatic],
   ["courses", courses],
-  ["physics + servo", async (harness) => {
+  ["physics", async (harness) => {
     await speedAndPhysics(harness);
-    await servo(harness);
   }],
   ["frames", async (harness) => {
     await decapod(harness);

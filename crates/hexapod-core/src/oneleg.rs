@@ -34,6 +34,11 @@ const SIDE: f64 = 0.2;
 const MARGIN: f64 = 0.12;
 /// Below this margin a leg is not liftable at all and the crawl tries the next.
 const VETO: f64 = 0.02;
+/// How far the commanded body may lead the real chassis. This is the crawl's
+/// drive — the legs push against it — so raising it walks harder. It is also
+/// the only strain the machine is allowed to store, so it is what a stopped
+/// machine has to shed before it stands still.
+const LEAD_MAX: f64 = 0.06;
 /// How fast the commanded chassis rides to its goal, m/s. This is the crawl's
 /// throttle: the legs push against the lead the command holds over the real
 /// chassis, so raising it walks faster and skates the plants harder.
@@ -542,6 +547,20 @@ impl OneLegDrill {
         let k = (SHIFT_V * dt / d).min(1.0);
         self.ik_pos[0] += dx * k;
         self.ik_pos[2] += dz * k;
+
+        // The lead of the commanded body over the real chassis is what the
+        // stance legs push against — it is the drive, so it cannot be zero.
+        // Left unbounded it is also a stored position error: the chassis never
+        // catches up, so when the command stops the legs keep shoving a body
+        // that has nowhere to go, and it rings. Cap it and the strain drains
+        // away with the command instead of outliving it.
+        let (cp, _, _, _) = self.plant.chassis_pose();
+        let (lx, lz) = (self.ik_pos[0] - cp[0], self.ik_pos[2] - cp[2]);
+        let lead = hypot2(lx, lz);
+        if lead > LEAD_MAX {
+            self.ik_pos[0] = cp[0] + lx * LEAD_MAX / lead;
+            self.ik_pos[2] = cp[2] + lz * LEAD_MAX / lead;
+        }
         for i in 0..self.n {
             if i == self.moving && self.phase.swinging() {
                 continue;
