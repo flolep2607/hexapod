@@ -23,12 +23,21 @@ const SWING_T: f64 = LIFT_T + SHIFT_T + PLACE_T;
 const LIFT_H: f64 = 0.22;
 /// Ride height and radial plant, independent of any walk gait.
 const RIDE: f64 = 0.88;
-/// Crawl: how far the free foot plants ahead of its hip, metres.
-const STEP: f64 = 0.10;
-/// Keep the commanded COM this far behind the front remaining plant.
-const BACK: f64 = 0.14;
-/// Cap a body recenter so stance IK cannot yank the chassis past the feet.
-const SHIFT_MAX: f64 = 0.08;
+/// Crawl: how far ahead of its neutral stance the free foot will try to plant,
+/// metres. A ceiling, not a setpoint — the leg's workspace usually binds first.
+const STEP: f64 = 0.50;
+/// Lateral share of a STEP given to a full turn command.
+const SIDE: f64 = 0.2;
+/// Support margin the commanded COM leans up to, metres. The lean stops here,
+/// so this is the whole stability budget for a swing: raise it for a machine
+/// that wobbles, lower it to walk closer to the edge.
+const MARGIN: f64 = 0.12;
+/// Below this margin a leg is not liftable at all and the crawl tries the next.
+const VETO: f64 = 0.02;
+/// How fast the commanded chassis rides to its goal, m/s. This is the crawl's
+/// throttle: the legs push against the lead the command holds over the real
+/// chassis, so raising it walks faster and skates the plants harder.
+const SHIFT_V: f64 = 0.10;
 /// Crawl: commanded yaw change after each plant at full turn, radians.
 const YAW_STEP: f64 = 0.10;
 
@@ -91,6 +100,9 @@ pub struct OneLegDrill {
     /// Lagged yaw-only chassis the IK uses. Pitch/roll stay out: feeding them
     /// back into the swing retargets the free foot and tips the machine.
     pub ik_pos: V3,
+    /// Where `ik_pos` is riding to. The crawl aims this once per plant; the
+    /// chassis travels to it at [`SHIFT_V`] over the whole swing.
+    pub ik_goal: [f64; 2],
     pub ik_yaw: f64,
     pub phase: Phase,
     pub phase_t: f64,
@@ -184,6 +196,7 @@ impl OneLegDrill {
             dest: origin_world[0],
             dest_body: hold_body[0],
             ik_pos: origin_pos,
+            ik_goal: [origin_pos[0], origin_pos[2]],
             ik_yaw: origin_yaw,
             phase: Phase::Settle,
             phase_t: 0.0,
@@ -234,6 +247,9 @@ impl OneLegDrill {
     }
 
     pub fn step(&mut self, dt: f64) {
+        if self.crawl {
+            self.ride_body(dt);
+        }
         let q = self.cmd_q();
         self.plant.drive(&q, &self.phys, dt);
         substep(&mut self.plant, dt);
@@ -398,6 +414,7 @@ impl OneLegDrill {
         let (pos, yaw, _, _) = self.plant.chassis_pose();
         self.ik_pos[0] = pos[0];
         self.ik_pos[2] = pos[2];
+        self.ik_goal = [pos[0], pos[2]];
         self.ik_yaw = yaw;
         let avoid = self.hold_body[self.moving];
         for _ in 0..80 {
@@ -424,20 +441,32 @@ impl OneLegDrill {
             self.moving = self.move_i % self.n;
             self.from = self.plant.leg_joints_world(self.moving)[3];
             self.origin_world[self.moving] = self.from;
-            self.secure_support(self.moving);
-            if self.remaining_margin(self.moving, [self.ik_pos[0], self.ik_pos[2]]) >= 0.02 {
-                self.pick_crawl_dest();
-                return;
+            if self.shift_to_plants(self.moving) >= VETO {
+                break;
             }
             self.move_i += 1;
         }
         self.pick_crawl_dest();
     }
 
-    /// Pull the chassis onto the plants that will remain, so lifting `skip`
-    /// cannot dump the COM outside the support polygon.
-    fn secure_support(&mut self, skip: usize) {
-        self.shift_to_plants(Some(skip));
+    /// Can the chassis stand here through the coming swing? Two conditions, and
+    /// both bind: the COM has to sit MARGIN inside the feet that stay down, and
+    /// every one of those feet has to remain inside its leg's workspace. Lean
+    /// on stability alone and the body walks out past its own rear legs, which
+    /// then stop holding their plants and are dragged along the floor.
+    fn body_holds(&self, skip: usize, at: [f64; 2]) -> bool {
+        if self.remaining_margin(skip, at) < MARGIN {
+            return false;
+        }
+        let pos = [at[0], self.ik_pos[1], at[1]];
+        (0..self.n).all(|i| {
+            i == skip
+                || reachable(
+                    self.frame,
+                    i,
+                    to_body(self.origin_world[i], pos, self.ik_yaw, 0.0, 0.0),
+                )
+        })
     }
 
     fn remaining_margin(&self, skip: usize, com: [f64; 2]) -> f64 {
@@ -456,44 +485,67 @@ impl OneLegDrill {
         polygon_margin(&hull[..h], com)
     }
 
-    fn shift_to_plants(&mut self, skip: Option<usize>) {
+    /// Commanded chassis for the coming swing, and the support margin it
+    /// bought. A walking animal does not balance on the centre of its support
+    /// polygon; it leans onto the edge it is about to walk over, and that lean
+    /// is what lets the next foot reach. So: laterally on the plants, and as
+    /// far along the heading as the feet that stay down still allow. Standing
+    /// on the centroid instead wastes the whole front half of the polygon, and
+    /// caps the stride at what a foot can reach from a centred hip.
+    fn shift_to_plants(&mut self, skip: usize) -> f64 {
         let (s, c) = self.ik_yaw.sin_cos();
         let fx = -s;
         let fz = c;
         let mut cx = 0.0;
         let mut cz = 0.0;
         let mut n = 0.0;
-        let mut front = f64::NEG_INFINITY;
         for i in 0..self.n {
-            if Some(i) == skip {
-                continue;
-            }
             let p = self.plant.leg_joints_world(i)[3];
             self.origin_world[i] = p;
             cx += p[0];
             cz += p[2];
             n += 1.0;
-            front = front.max(p[0] * fx + p[2] * fz);
         }
         if n < 1.0 {
-            return;
+            return 0.0;
         }
         cx /= n;
         cz /= n;
-        let along_c = cx * fx + cz * fz;
-        let along = along_c.min(front - BACK);
-        let mut tx = cx + (along - along_c) * fx;
-        let mut tz = cz + (along - along_c) * fz;
-        let dx = tx - self.ik_pos[0];
-        let dz = tz - self.ik_pos[2];
-        let d = hypot2(dx, dz);
-        if d > SHIFT_MAX {
-            tx = self.ik_pos[0] + dx * SHIFT_MAX / d;
-            tz = self.ik_pos[2] + dz * SHIFT_MAX / d;
+
+        // Furthest forward lean that still keeps MARGIN inside the plants that
+        // stay down. The centroid end is the one known to be safe, so a bisect
+        // that never finds room simply leaves the body centred.
+        let mut lo = 0.0;
+        let mut hi = self.stand.stance_w;
+        for _ in 0..12 {
+            let m = 0.5 * (lo + hi);
+            if self.body_holds(skip, [cx + m * fx, cz + m * fz]) {
+                lo = m;
+            } else {
+                hi = m;
+            }
         }
-        self.ik_pos[0] = tx;
-        self.ik_pos[2] = tz;
+        self.ik_goal = [cx + lo * fx, cz + lo * fz];
+        self.remaining_margin(skip, self.ik_goal)
+    }
+
+    /// Carry the commanded chassis toward its goal and re-solve the plants
+    /// under it. Stance feet keep their world positions; only the joints that
+    /// hold them there change, so the machine walks its body over its feet.
+    fn ride_body(&mut self, dt: f64) {
+        let dx = self.ik_goal[0] - self.ik_pos[0];
+        let dz = self.ik_goal[1] - self.ik_pos[2];
+        let d = hypot2(dx, dz);
+        if d < 1e-9 {
+            return;
+        }
+        let k = (SHIFT_V * dt / d).min(1.0);
+        self.ik_pos[0] += dx * k;
+        self.ik_pos[2] += dz * k;
         for i in 0..self.n {
+            if i == self.moving && self.phase.swinging() {
+                continue;
+            }
             let body = self.body_of(self.origin_world[i]);
             if !reachable(self.frame, i, body) {
                 continue;
@@ -504,26 +556,32 @@ impl OneLegDrill {
         }
     }
 
+    /// Furthest plant along the command this leg can actually reach, up to
+    /// STEP. Halving a nominal offset until it fits lands back near the neutral
+    /// stance nearly every time, which caps the stride at whatever the nominal
+    /// happened to be; the leg's own workspace is the honest limit, so search
+    /// for it. `u` runs from the neutral stance out to the full step.
     fn pick_crawl_dest(&mut self) {
-        let mut along = STEP * self.cmd.fwd.clamp(-1.0, 1.0);
-        if along.abs() < 0.04 && self.cmd.turn.abs() > 0.08 {
-            along = 0.12;
-        }
-        let side = 0.10 * self.cmd.turn.clamp(-1.0, 1.0);
-        for k in 0..4 {
-            let s = 1.0 / (1 << k) as f64;
-            let mut b = standing_foot(self.frame, &self.stand, self.moving);
-            b[0] += side * s;
-            b[2] += along * s;
-            let dest = self.world_plant(b);
-            if reachable(self.frame, self.moving, self.body_of(dest)) {
-                self.dest_body = self.body_of(dest);
-                self.dest = dest;
-                return;
+        let along = STEP * self.cmd.fwd.clamp(-1.0, 1.0);
+        let side = STEP * SIDE * self.cmd.turn.clamp(-1.0, 1.0);
+        let neutral = standing_foot(self.frame, &self.stand, self.moving);
+        let at = |u: f64| {
+            let b = [neutral[0] + side * u, neutral[1], neutral[2] + along * u];
+            self.world_plant(b)
+        };
+        let mut lo = 0.0;
+        let mut hi = 1.0;
+        for _ in 0..10 {
+            let m = 0.5 * (lo + hi);
+            if reachable(self.frame, self.moving, self.body_of(at(m))) {
+                lo = m;
+            } else {
+                hi = m;
             }
         }
-        self.dest_body = standing_foot(self.frame, &self.stand, self.moving);
-        self.dest = self.world_plant(self.dest_body);
+        let dest = at(lo);
+        self.dest = dest;
+        self.dest_body = self.body_of(dest);
     }
 
     fn world_plant(&self, body: V3) -> V3 {
@@ -851,7 +909,9 @@ mod tests {
         let terrain = Terrain::new(Course::Flat, 1);
         let mut drill = OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true);
         drill.set_cmd(Cmd::forward());
-        let ticks = (4.0 / DT) as usize;
+        // One plant every ~3 s, six to a cycle: a window shorter than a couple
+        // of cycles measures the settle transient, not the walking.
+        let ticks = (60.0 / DT) as usize;
         let mut min_y = f64::INFINITY;
         let mut max_swing = 0u32;
         let mut stance_path = 0.0f64;
@@ -890,13 +950,13 @@ mod tests {
         assert!(min_y > 0.55, "sat down: min_y={min_y:.3}");
         assert!(max_swing <= 1, "crawled with {max_swing} feet in the air");
         assert!(
-            s.chassis_xz > 0.03,
+            s.chassis_xz > 3.0,
             "crawl did not walk: Δxz={:.3}",
             s.chassis_xz
         );
         assert!(
-            stance_path < 4.0,
-            "stance feet trembled: path={stance_path:.3} m over 4 s"
+            stance_path < 9.0,
+            "stance feet skated: path={stance_path:.3} m over 60 s"
         );
     }
 
@@ -967,8 +1027,11 @@ mod tests {
             drill.remaining_margin(0, [drill.ik_pos[0], drill.ik_pos[2]]) < 0.0,
             "COM on a plant should be outside the other five"
         );
-        for _ in 0..16 {
-            drill.shift_to_plants(Some(0));
+        drill.shift_to_plants(0);
+        // The body rides at SHIFT_V now, so give it time to cover a full
+        // stance radius rather than the old snap-per-call.
+        for _ in 0..(30.0 / DT) as usize {
+            drill.ride_body(DT);
         }
         assert!(
             drill.remaining_margin(0, [drill.ik_pos[0], drill.ik_pos[2]]) > 0.04,
