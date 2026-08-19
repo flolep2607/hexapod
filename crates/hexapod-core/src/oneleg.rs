@@ -339,7 +339,7 @@ impl OneLegDrill {
         match self.phase {
             Phase::Settle => self.from,
             Phase::Pause => self.dest,
-            Phase::Lift | Phase::Shift | Phase::Place => self.swing_world(smooth(self.swing_clock())),
+            Phase::Lift | Phase::Shift | Phase::Place => self.swing_world(self.swing_clock()),
         }
     }
 
@@ -357,18 +357,25 @@ impl OneLegDrill {
         let a = LIFT_T / SWING_T;
         let b = (LIFT_T + SHIFT_T) / SWING_T;
         let apex_y = self.from[1].max(self.dest[1]) + LIFT_H;
+        // Each leg of the swing is eased in and out on its own, not just the
+        // clock that drives all three. The path is up, then across, then down:
+        // with linear segments the foot's velocity turns a right angle in one
+        // tick at each corner, which is an impulse into a very stiff motor and
+        // the reason the moving leg snatches. Easing per segment brings the
+        // foot to rest at both corners, so every direction change starts and
+        // ends at zero speed.
         if s <= a {
-            let u = (s / a).clamp(0.0, 1.0);
+            let u = smooth((s / a).clamp(0.0, 1.0));
             [self.from[0], lerp(self.from[1], apex_y, u), self.from[2]]
         } else if s <= b {
-            let u = ((s - a) / (b - a)).clamp(0.0, 1.0);
+            let u = smooth(((s - a) / (b - a)).clamp(0.0, 1.0));
             [
                 lerp(self.from[0], self.dest[0], u),
                 apex_y,
                 lerp(self.from[2], self.dest[2], u),
             ]
         } else {
-            let u = ((s - b) / (1.0 - b).max(1e-9)).clamp(0.0, 1.0);
+            let u = smooth(((s - b) / (1.0 - b).max(1e-9)).clamp(0.0, 1.0));
             [self.dest[0], lerp(apex_y, self.dest[1], u), self.dest[2]]
         }
     }

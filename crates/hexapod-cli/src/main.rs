@@ -1504,13 +1504,24 @@ fn run_tripod(
     let n = (secs / DT) as usize;
     let mut min_y = f64::INFINITY;
     let mut fell = false;
+    // A tripod is symmetric, so the two sides should push equally. Any bias
+    // shows up as yaw, and yaw is why this gait walks off its own line.
+    let mut push = [0.0f64; 2];
+    let mut prev: Option<Vec<[f64; 3]>> = None;
+    let _ = &push;
     let t0 = Instant::now();
     for _ in 0..n {
         walker.step(&terrain, &policy, &gait, DT, cmd);
         let s = walker.sample();
         min_y = min_y.min(s.pos[1]);
         fell |= s.fallen;
+        let _ = (&mut push, &mut prev);
     }
+    let s = walker.sample();
+    eprintln!(
+        "  tripod detail: yaw {:+.3} rad  x {:+.3}  z {:+.3}",
+        s.yaw, s.pos[0], s.pos[2]
+    );
     let rt = (n as f64 * DT) / t0.elapsed().as_secs_f64();
     let s = walker.sample();
     let w = terrain.waypoint(0);
@@ -1576,6 +1587,7 @@ fn motor_flags(phys: &mut Physics, args: &[String]) {
     if let Some(v) = flag(args, "--footmu").and_then(|v| v.parse().ok()) {
         phys.foot_mu = v;
     }
+
 }
 
 fn legs_probe(frame: Frame, mut phys: Physics, course: Course, args: &[String]) {

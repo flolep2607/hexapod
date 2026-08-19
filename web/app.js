@@ -1188,7 +1188,7 @@ const traceFoot = new Trace($("cFoot"), [
  * when the dial asks for more physics than a 60 Hz frame holds, half the frame
  * rate is worth twice the sim budget — 30 still reads as motion, and dropping
  * the sim instead is what made the speed dial a lie. */
-const RENDER_HZ = 60;
+const RENDER_HZ = 30;
 const RENDER_HZ_MIN = 30;
 const FRAME_MS = 1000 / RENDER_HZ;
 const FRAME_MS_MAX = 1000 / RENDER_HZ_MIN;

@@ -158,6 +158,7 @@ pub struct Physics {
     pub pgs_iters: usize,
     /// Foot-on-ground friction. Was pinned at a 1.15 floor.
     pub foot_mu: f64,
+
     /// Ceiling on joint force, simulator units. Not a servo rating — there is
     /// no torque-speed line, no stall derating and no backdrive any more. It
     /// exists because an unbounded motor lets the solver inject unbounded
@@ -169,7 +170,10 @@ impl Default for Physics {
     fn default() -> Self {
         Physics {
             motor_stiff: 5.0e6,
-            motor_damp: 3.0e4,
+            // 8e3 is the only damping both gaits survive: the crawl tolerates
+            // a wide band but the tripod falls above about 1e4, and it is the
+            // tripod that has three feet down instead of five.
+            motor_damp: 8.0e3,
             substeps: 4,
             // Below 8x4 the revolute constraints are visibly violated: the hip
             // hinge turns up to 42 degrees off its own axis, which reads on a
