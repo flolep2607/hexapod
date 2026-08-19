@@ -14,7 +14,14 @@ server, no network, no dependencies.
 ./build.sh          # test, compile wasm, emit dist/hexapod-simulator.html
 node test/smoke.mjs # run five browser scenarios in parallel
 SMOKE_SCREENSHOTS=1 node test/smoke.mjs # optionally save the 15 visual snapshots
+
+# Native all-terrain training, checkpointing, and held-out evaluation.
+cargo run --release -p hexapod-cli -- train-all --iters 200 --train-seeds 2 --output policy.txt
+cargo run --release -p hexapod-cli -- eval-all --policy policy.txt --eval-seeds 3
 ```
+
+A pre-trained all-terrain controller and its held-out evaluation are in
+[`checkpoints/README.md`](checkpoints/README.md).
 
 ## What it does
 
@@ -191,6 +198,28 @@ and having it changes nothing, which is the point — the old behaviour is a
 special case, not a thing that was replaced. On the courses with something in
 the way, the generator lays the route through the gaps as it builds them, so
 there is no search and no chance of a route through a wall.
+
+The native `train-all` curriculum assigns every ARS direction a rotating
+mini-batch of terrain/seed scenarios from all ten course families. Both sides
+of each finite difference see the same scenarios and speeds, reducing the bias
+from ranking one easy course directly against one hard course. The
+default batch is three (`--batch N`). Its 45-second horizon is long enough to
+reach the 64 m finish at evaluation speed;
+an episode terminates as soon as it enters the final waypoint. A route is only
+reported complete when every ordered waypoint was reached first. The command
+then evaluates the selected policy on unseen seeds and prints per-course route
+coverage and completion rates. `--output PATH` writes the policy parameters,
+observation normaliser, frame, and feedback scale to a versioned checkpoint;
+`eval-all --policy PATH` reloads it for a separate evaluation run, and
+`train-all --resume PATH --output PATH` continues training from it.
+
+The initial policy is evaluated before training and unfinished scenarios are
+repeated in proportion to their failure rate, without removing any easy course.
+`--hard-repeat 0` disables this weighting; the default allows up to three extra
+copies of a scenario that the seed cannot complete. For staged curricula,
+`--focus JUMP --focus-repeat 20` adds more copies of one hard family while all
+other terrains remain in the suite; combine it with `--resume` for successive
+hard-course and balanced passes.
 
 The policy gets one new action, **steer**, and four new kinds of observation:
 bearing and range to the next waypoint, where it sits between the two walls, and
@@ -430,6 +459,11 @@ update from the spread of returns across sampled directions, so the sample it
 needs scales with the parameter count, and the parameter count grew by seventy
 per cent when the policy gained something to look at and somewhere to go. See
 the section above for what happens if you leave it at 8.
+
+Native direction pairs run in parallel. Observation normalisers are accumulated
+per rollout and merged back in direction/sign order, so worker scheduling does
+not change a seeded result. `--workers N` caps the worker count; zero or an
+omitted flag selects available parallelism. WASM remains single-threaded.
 
 ## Servo sizing
 

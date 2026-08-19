@@ -745,7 +745,11 @@ impl App {
         }
 
         // Auto-recover so the viewport never gets stuck on a fallen robot.
-        if self.live.fallen || self.live.broken || self.live.pos[2] > Z_MAX - 8.0 {
+        if self.live.fallen
+            || self.live.broken
+            || self.live.finished
+            || self.live.pos[2] > Z_MAX + 2.0
+        {
             self.since_fall += dt;
             if self.since_fall > 1.2 {
                 self.reset_live();

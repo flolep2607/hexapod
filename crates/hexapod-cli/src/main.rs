@@ -7,6 +7,8 @@
 //! hexapod watch  [--course flat] [--seconds 8] [--speed 1.5]
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
+//! hexapod train-all [--iters 200] [--train-seeds 1] [--eval-seeds 2]
+//! hexapod eval-all --policy policy.txt [--eval-seeds 2]
 //! hexapod speed  [--iters 200]      commanded vs achieved speed
 //! hexapod jump   [--iters 200]      parkour: distance, waypoints, jumps
 //! hexapod servo                     the same gait on every servo
@@ -42,10 +44,10 @@ use hexapod_core::ars::ArsConfig;
 use hexapod_core::hardware::{shortlist, Build, Provenance, TorqueMeter, PRICES_CHECKED, SERVOS};
 use hexapod_core::sim::Sim;
 use hexapod_core::power::{parts_of, solve, Kind, Sizing, TorqueTrace};
-use hexapod_core::policy::Preset;
+use hexapod_core::policy::{Normalizer, Preset, MAX_OBS};
 use hexapod_core::sim::{
-    evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
-    JUMP_EVAL_SPEEDS,
+    evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, EVAL_SPEEDS, JUMP_CRUISE_MAX,
+    JUMP_CRUISE_MIN, JUMP_EVAL_SPEEDS,
 };
 use hexapod_core::oneleg::{OneLegDrill, Phase};
 use hexapod_core::walker::WalkSample;
@@ -124,11 +126,19 @@ fn main() {
     if let Some(v) = flag(&args, "--horizon").and_then(|v| v.parse().ok()) {
         cfg.horizon = v;
     }
+    if let Some(v) = flag(&args, "--workers").and_then(|v| v.parse().ok()) {
+        cfg.workers = v;
+    }
+    if let Some(v) = flag(&args, "--batch").and_then(|v| v.parse().ok()) {
+        cfg.scenarios_per_direction = v;
+    }
 
     match cmd {
         "bench" => bench(frame, course, seed, phys),
         "bom" => bom(frame, course, seed, iters, cfg, phys, build),
         "sweep" => sweep(frame, iters, cfg, phys, seed),
+        "train-all" | "all-terrain" => all_terrain(frame, seed, iters, cfg, phys, &args),
+        "eval-all" => eval_all(seed, cfg, phys, &args),
         "speed" => speed(frame, course, seed, iters, cfg, phys),
         "jump" => jump(frame, seed, iters, cfg, phys),
         "servo" => servo_shootout(frame, course, seed, iters, cfg, build),
@@ -784,6 +794,482 @@ fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
          evaluation speeds. Reward is not distance: a policy can score better\n\
          by taking fewer penalties over less ground."
     );
+}
+
+/// Train one policy across every terrain family, then evaluate on held-out
+/// seeds. Long episodes are intentional: the finish is at 64 m, so an
+/// eight-second gait-tuning horizon cannot possibly supervise completion.
+fn all_terrain(
+    frame: Frame,
+    seed: u64,
+    iters: usize,
+    mut cfg: ArsConfig,
+    phys: Physics,
+    args: &[String],
+) {
+    if flag(args, "--horizon").is_none() {
+        cfg.horizon = 45.0;
+    }
+    if flag(args, "--batch").is_none() {
+        cfg.scenarios_per_direction = 3;
+    }
+    let train_seeds = flag(args, "--train-seeds")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let eval_seeds = flag(args, "--eval-seeds")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1);
+    let unique_suite = terrain_suite(seed, train_seeds);
+    let hard_repeat = flag(args, "--hard-repeat")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3);
+    if cfg.n_dirs < hexapod_core::terrain::COURSES.len() {
+        eprintln!(
+            "note: {} directions cover the 10 terrain families over multiple iterations; --dirs 10 or more covers every family per update",
+            cfg.n_dirs
+        );
+    }
+
+    let starting = if let Some(path) = flag(args, "--resume") {
+        let policy = load_policy(&path).unwrap_or_else(|error| {
+            eprintln!("could not load policy {path:?}: {error}");
+            std::process::exit(2);
+        });
+        println!("resuming checkpoint: {path}");
+        policy
+    } else {
+        Policy::seeded(Preset::default_for(frame), frame)
+    };
+    let frame = starting.frame;
+    let baseline = Policy::seeded(Preset::default_for(frame), frame);
+    let mut train_suite = difficulty_weighted_suite(
+        &unique_suite,
+        &starting,
+        &phys,
+        cfg.horizon,
+        hard_repeat,
+    );
+    if let Some(name) = flag(args, "--focus") {
+        let Some(course) = hexapod_core::terrain::COURSES
+            .iter()
+            .copied()
+            .find(|course| course.name().eq_ignore_ascii_case(&name))
+        else {
+            eprintln!("unknown focus course {name:?}");
+            std::process::exit(2);
+        };
+        let repeats = flag(args, "--focus-repeat")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(20);
+        let focused: Vec<Terrain> = unique_suite
+            .iter()
+            .filter(|terrain| terrain.course == course)
+            .cloned()
+            .collect();
+        for _ in 0..repeats {
+            train_suite.extend(focused.iter().cloned());
+        }
+        println!("focus: {} (+{repeats} copies per seed)", course.name());
+    }
+    let mut trainer = Trainer::new(starting, cfg, phys, seed ^ 0xA5A5);
+    println!(
+        "all-terrain curriculum: {} weighted scenarios from {} unique (10 courses x {train_seeds} seeds), {}s horizon",
+        train_suite.len(),
+        unique_suite.len(),
+        cfg.horizon
+    );
+    println!(
+        "ARS dirs={} top={} batch={} alpha={} sigma={} | final waypoint is terminal",
+        cfg.n_dirs, cfg.n_top, cfg.scenarios_per_direction, cfg.alpha, cfg.sigma
+    );
+
+    let wall = Instant::now();
+    trainer.record_suite_baseline(&unique_suite);
+    println!(
+        "start     reward {:8.2}  route {:6.1}%  completion {:6.1}%",
+        trainer.baseline_reward,
+        trainer.last_eval.waypoint_fraction * 100.0,
+        trainer.baseline_completion_rate * 100.0
+    );
+    println!(
+        "\n{:>5} {:>9} {:>9} {:>8} {:>9} {:>9} {:>8}",
+        "iter", "reward", "best", "route", "complete", "best cmp", "roll/s"
+    );
+    for i in 1..=iters {
+        trainer.iterate_suite_with_eval(&train_suite, &unique_suite);
+        if i % (iters / 20).max(1) == 0 || i == iters {
+            let elapsed = wall.elapsed().as_secs_f64().max(1e-9);
+            println!(
+                "{i:>5} {:>9.2} {:>9.2} {:>7.1}% {:>8.1}% {:>8.1}% {:>8.1}",
+                trainer.last_eval.reward,
+                trainer.best_reward,
+                trainer.last_eval.waypoint_fraction * 100.0,
+                trainer.last_eval.completion_rate * 100.0,
+                trainer.best_completion_rate * 100.0,
+                trainer.rollouts as f64 / elapsed
+            );
+        }
+    }
+
+    let learned = trainer.best_policy();
+    let heldout_seed = seed.wrapping_add(1_000_000);
+    let (mean_completion, worst_completion) = print_heldout_matrix(
+        &baseline,
+        &learned,
+        &phys,
+        cfg.horizon,
+        heldout_seed,
+        eval_seeds,
+    );
+    println!(
+        "\nheld-out completion: mean {:.1}%, worst course {:.1}% | {} exploratory rollouts in {:.1}s",
+        mean_completion * 100.0,
+        worst_completion * 100.0,
+        trainer.rollouts,
+        wall.elapsed().as_secs_f64()
+    );
+    println!(
+        "best policy: feedback norm {:.3}, route {:.1}%, completion {:.1}%",
+        learned.feedback_norm(),
+        trainer.best_waypoint_fraction * 100.0,
+        trainer.best_completion_rate * 100.0
+    );
+    if let Some(path) = flag(args, "--output") {
+        if let Err(error) = save_policy(&path, &learned) {
+            eprintln!("could not write policy {path:?}: {error}");
+            std::process::exit(1);
+        }
+        println!("checkpoint: {path}");
+    }
+}
+
+fn print_heldout_matrix(
+    baseline: &Policy,
+    learned: &Policy,
+    phys: &Physics,
+    horizon: f64,
+    seed: u64,
+    eval_seeds: usize,
+) -> (f64, f64) {
+    println!(
+        "\nheld-out evaluation: {eval_seeds} unseen seed(s) per course, 3 speed commands each"
+    );
+    println!(
+        "{:<10} {:>10} {:>10} {:>10} {:>10} {:>9}",
+        "course", "base cmp", "learn cmp", "base route", "learn route", "finish s"
+    );
+    let mut worst_completion = 1.0f64;
+    let mut mean_completion = 0.0;
+    for (course_i, course) in hexapod_core::terrain::COURSES.iter().copied().enumerate() {
+        let mut base_completion = 0.0;
+        let mut learned_completion = 0.0;
+        let mut base_route = 0.0;
+        let mut learned_route = 0.0;
+        let mut finish_time = 0.0;
+        for seed_i in 0..eval_seeds {
+            let scenario_seed = seed
+                .wrapping_add((course_i as u64).wrapping_mul(10_000))
+                .wrapping_add(seed_i as u64);
+            let terrain = Terrain::new(course, scenario_seed);
+            let a = evaluate(&terrain, baseline, phys, horizon);
+            let b = evaluate(&terrain, learned, phys, horizon);
+            base_completion += a.completion_rate;
+            learned_completion += b.completion_rate;
+            base_route += a.waypoint_fraction;
+            learned_route += b.waypoint_fraction;
+            finish_time += b.finish_time;
+        }
+        let n = eval_seeds as f64;
+        base_completion /= n;
+        learned_completion /= n;
+        base_route /= n;
+        learned_route /= n;
+        finish_time /= n;
+        worst_completion = worst_completion.min(learned_completion);
+        mean_completion += learned_completion / hexapod_core::terrain::COURSES.len() as f64;
+        println!(
+            "{:<10} {:>9.1}% {:>9.1}% {:>9.1}% {:>9.1}% {:>9.2}",
+            course.name(),
+            base_completion * 100.0,
+            learned_completion * 100.0,
+            base_route * 100.0,
+            learned_route * 100.0,
+            finish_time
+        );
+    }
+    (mean_completion, worst_completion)
+}
+
+fn terrain_suite(seed: u64, seeds_per_course: usize) -> Vec<Terrain> {
+    hexapod_core::terrain::COURSES
+        .iter()
+        .copied()
+        .enumerate()
+        .flat_map(|(course_i, course)| {
+            (0..seeds_per_course).map(move |seed_i| {
+                let scenario_seed = seed
+                    .wrapping_add((course_i as u64).wrapping_mul(10_000))
+                    .wrapping_add(seed_i as u64);
+                Terrain::new(course, scenario_seed)
+            })
+        })
+        .collect()
+}
+
+/// Repeat scenarios in proportion to the seeded policy's failure rate. Every
+/// terrain remains present once; `hard_repeat` only spends more of the finite
+/// rollout budget where the current controller cannot yet finish.
+fn difficulty_weighted_suite(
+    terrains: &[Terrain],
+    baseline: &Policy,
+    phys: &Physics,
+    horizon: f64,
+    hard_repeat: usize,
+) -> Vec<Terrain> {
+    let copies = terrains
+        .iter()
+        .map(|terrain| {
+            let completion = evaluate(terrain, baseline, phys, horizon).completion_rate;
+            1 + ((1.0 - completion) * hard_repeat as f64).ceil() as usize
+        })
+        .collect::<Vec<_>>();
+    let mut weighted = Vec::new();
+    for round in 0..copies.iter().copied().max().unwrap_or(0) {
+        for (terrain, &n) in terrains.iter().zip(&copies) {
+            if round < n {
+                weighted.push(terrain.clone());
+            }
+        }
+    }
+    weighted
+}
+
+const POLICY_MAGIC: &str = "hexapod-policy-v1";
+
+fn save_policy(path: &str, policy: &Policy) -> std::io::Result<()> {
+    let values = |xs: &[f64]| {
+        xs.iter()
+            .map(|v| format!("{v:.17e}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let text = format!(
+        "{POLICY_MAGIC}\nframe={}\nfeedback={:.17e}\nbase_offsets={}\nnorm_n={:.17e}\nnorm_mean={}\nnorm_m2={}\ntheta={}\n",
+        policy.frame.legs(),
+        policy.feedback,
+        values(&policy.base_offsets),
+        policy.norm.n,
+        values(&policy.norm.mean),
+        values(&policy.norm.m2),
+        values(&policy.theta),
+    );
+    std::fs::write(path, text)
+}
+
+fn load_policy(path: &str) -> Result<Policy, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut lines = text.lines();
+    if lines.next() != Some(POLICY_MAGIC) {
+        return Err(format!("not a {POLICY_MAGIC} checkpoint"));
+    }
+    let mut fields = std::collections::HashMap::new();
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("invalid checkpoint line {line:?}"));
+        };
+        fields.insert(key, value);
+    }
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("checkpoint is missing {name}"))
+    };
+    let numbers = |name: &str| -> Result<Vec<f64>, String> {
+        field(name)?
+            .split_whitespace()
+            .map(|v| {
+                v.parse::<f64>()
+                    .map_err(|_| format!("invalid number {v:?} in {name}"))
+            })
+            .collect()
+    };
+    let legs = field("frame")?
+        .parse::<usize>()
+        .map_err(|_| "invalid frame".to_string())?;
+    let frame = Frame::new(legs);
+    if frame.legs() != legs {
+        return Err(format!("unsupported frame with {legs} legs"));
+    }
+    let feedback = field("feedback")?
+        .parse::<f64>()
+        .map_err(|_| "invalid feedback".to_string())?;
+    let norm_n = field("norm_n")?
+        .parse::<f64>()
+        .map_err(|_| "invalid norm_n".to_string())?;
+    let offsets = numbers("base_offsets")?;
+    let means = numbers("norm_mean")?;
+    let m2 = numbers("norm_m2")?;
+    let theta = numbers("theta")?;
+    if offsets.len() != hexapod_core::MAX_LEGS {
+        return Err(format!("expected {} base offsets", hexapod_core::MAX_LEGS));
+    }
+    if means.len() != MAX_OBS || m2.len() != MAX_OBS {
+        return Err(format!("expected {MAX_OBS} normalizer entries"));
+    }
+    if theta.len() != hexapod_core::n_theta(frame) {
+        return Err(format!(
+            "expected {} parameters for {} legs, found {}",
+            hexapod_core::n_theta(frame),
+            legs,
+            theta.len()
+        ));
+    }
+    if !offsets
+        .iter()
+        .chain(&means)
+        .chain(&m2)
+        .chain(&theta)
+        .chain([feedback, norm_n].iter())
+        .all(|v| v.is_finite())
+    {
+        return Err("checkpoint contains NaN or infinity".to_string());
+    }
+    let mut base_offsets = [0.0; hexapod_core::MAX_LEGS];
+    base_offsets.copy_from_slice(&offsets);
+    let mut mean = [0.0; MAX_OBS];
+    mean.copy_from_slice(&means);
+    let mut norm_m2 = [0.0; MAX_OBS];
+    norm_m2.copy_from_slice(&m2);
+    Ok(Policy {
+        frame,
+        theta,
+        base_offsets,
+        norm: Normalizer {
+            n: norm_n,
+            mean,
+            m2: norm_m2,
+            frozen: true,
+        },
+        feedback,
+    })
+}
+
+fn eval_all(seed: u64, mut cfg: ArsConfig, phys: Physics, args: &[String]) {
+    if flag(args, "--horizon").is_none() {
+        cfg.horizon = 45.0;
+    }
+    let eval_seeds = flag(args, "--eval-seeds")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1);
+    let Some(path) = flag(args, "--policy") else {
+        eprintln!("eval-all requires --policy PATH");
+        std::process::exit(2);
+    };
+    let learned = load_policy(&path).unwrap_or_else(|error| {
+        eprintln!("could not load policy {path:?}: {error}");
+        std::process::exit(2);
+    });
+    let baseline = Policy::seeded(Preset::default_for(learned.frame), learned.frame);
+    println!(
+        "policy {path} | {} legs | horizon {}s | seed {seed}",
+        learned.frame.legs(),
+        cfg.horizon
+    );
+    if let Some(name) = flag(args, "--course") {
+        let Some(course) = hexapod_core::terrain::COURSES
+            .iter()
+            .copied()
+            .find(|course| course.name().eq_ignore_ascii_case(&name))
+        else {
+            eprintln!("unknown course {name:?}");
+            std::process::exit(2);
+        };
+        print_course_detail(
+            course,
+            &baseline,
+            &learned,
+            &phys,
+            cfg.horizon,
+            seed,
+            eval_seeds,
+        );
+        return;
+    }
+    let (mean, worst) = print_heldout_matrix(
+        &baseline,
+        &learned,
+        &phys,
+        cfg.horizon,
+        seed,
+        eval_seeds,
+    );
+    println!(
+        "\ncompletion: mean {:.1}%, worst course {:.1}%",
+        mean * 100.0,
+        worst * 100.0
+    );
+}
+
+fn print_course_detail(
+    course: Course,
+    baseline: &Policy,
+    learned: &Policy,
+    phys: &Physics,
+    horizon: f64,
+    seed: u64,
+    eval_seeds: usize,
+) {
+    let speeds: &[f64] = if course.is_jump() {
+        &JUMP_EVAL_SPEEDS
+    } else {
+        &EVAL_SPEEDS
+    };
+    println!(
+        "\n{:<7} {:>5} {:>5} {:>9} {:>8} {:>10} {:>8} {:>7} {:>7} {:>9}",
+        "policy", "seed", "m/s", "reward", "z m", "waypoints", "time s", "x m", "jumps", "state"
+    );
+    for seed_i in 0..eval_seeds {
+        let scenario_seed = seed.wrapping_add(seed_i as u64);
+        let terrain = Terrain::new(course, scenario_seed);
+        for (label, policy) in [("base", baseline), ("learn", learned)] {
+            for &speed in speeds {
+                let result = rollout(
+                    &terrain,
+                    policy,
+                    phys,
+                    horizon,
+                    Cmd::at(speed),
+                    None,
+                );
+                let state = if result.completed {
+                    "FINISH"
+                } else if result.broken {
+                    "BROKE"
+                } else if result.fell {
+                    "FELL"
+                } else if result.finished {
+                    "SKIPPED"
+                } else {
+                    "TIMEOUT"
+                };
+                println!(
+                    "{label:<7} {scenario_seed:>5} {speed:>5.1} {:>9.2} {:>8.2} {:>4}/{:<5} {:>8.2} {:>7.2} {:>7} {:>9}",
+                    result.reward,
+                    result.distance,
+                    result.reached,
+                    terrain.waypoints.len(),
+                    result.elapsed,
+                    result.end_x,
+                    result.jumps,
+                    state
+                );
+            }
+        }
+    }
 }
 
 /// Size the servos for a build, comparing the hand-tuned gait against a
@@ -2014,4 +2500,70 @@ fn crawl_train(frame: Frame, mut phys: Physics, args: &[String]) {
     println!("\nlearned:");
     report("learned", &learned);
     println!("\ntheta = {:?}", learned.theta.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terrain_suite_contains_every_course_and_seed() {
+        let suite = terrain_suite(11, 2);
+        assert_eq!(suite.len(), hexapod_core::terrain::COURSES.len() * 2);
+        for course in hexapod_core::terrain::COURSES {
+            assert_eq!(suite.iter().filter(|t| t.course == course).count(), 2);
+        }
+    }
+
+    #[test]
+    fn difficulty_weighting_keeps_easy_scenarios_and_repeats_failures() {
+        let suite = terrain_suite(3, 1);
+        let frame = Frame::default();
+        let baseline = Policy::seeded(Preset::default_for(frame), frame);
+        let uniform = difficulty_weighted_suite(
+            &suite,
+            &baseline,
+            &Physics::default(),
+            0.0,
+            0,
+        );
+        let weighted = difficulty_weighted_suite(
+            &suite,
+            &baseline,
+            &Physics::default(),
+            0.0,
+            3,
+        );
+        assert_eq!(uniform.len(), suite.len());
+        assert_eq!(weighted.len(), suite.len() * 4);
+        for course in hexapod_core::terrain::COURSES {
+            assert!(weighted.iter().any(|t| t.course == course));
+        }
+    }
+
+    #[test]
+    fn policy_checkpoint_round_trips_exactly() {
+        let frame = Frame::default();
+        let mut policy = Policy::seeded(Preset::default_for(frame), frame);
+        policy.theta[7] = 0.123456789;
+        policy.norm.n = 42.0;
+        policy.norm.mean[3] = -0.75;
+        policy.norm.m2[5] = 9.25;
+        let path = std::env::temp_dir().join(format!(
+            "hexapod-policy-{}-{}.txt",
+            std::process::id(),
+            0x5eed_u64
+        ));
+        save_policy(path.to_str().unwrap(), &policy).unwrap();
+        let loaded = load_policy(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.frame, policy.frame);
+        assert_eq!(loaded.theta, policy.theta);
+        assert_eq!(loaded.base_offsets, policy.base_offsets);
+        assert_eq!(loaded.feedback, policy.feedback);
+        assert_eq!(loaded.norm.n, policy.norm.n);
+        assert_eq!(loaded.norm.mean, policy.norm.mean);
+        assert_eq!(loaded.norm.m2, policy.norm.m2);
+        assert!(loaded.norm.frozen);
+    }
 }

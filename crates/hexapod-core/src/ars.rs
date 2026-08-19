@@ -14,6 +14,12 @@ use crate::sim::{
 };
 use crate::terrain::Terrain;
 
+/// Suite training is a navigation task first and a gait-quality task second.
+/// These scales make reaching one more ordered waypoint dominate plausible
+/// reward noise, and completing the route dominate any partial trajectory.
+const ROUTE_OBJECTIVE_SCALE: f64 = 5_000.0;
+const COMPLETION_OBJECTIVE_SCALE: f64 = 10_000.0;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ArsConfig {
     /// Random directions sampled per iteration. Each costs two rollouts.
@@ -26,6 +32,14 @@ pub struct ArsConfig {
     pub sigma: f64,
     /// Rollout horizon, seconds of simulated time.
     pub horizon: f64,
+    /// Native rollout worker count. Zero uses available parallelism; WASM is
+    /// always sequential because browser threads require a separate runtime.
+    pub workers: usize,
+    /// Terrain/seed scenarios averaged for each perturbation sign. A suite
+    /// uses mini-batches to keep direction ranking from comparing an easy
+    /// course's absolute return with a hard course's; single-course training
+    /// needs only one.
+    pub scenarios_per_direction: usize,
 }
 
 impl Default for ArsConfig {
@@ -45,6 +59,8 @@ impl Default for ArsConfig {
             alpha: 0.025,
             sigma: 0.04,
             horizon: 8.0,
+            workers: 0,
+            scenarios_per_direction: 1,
         }
     }
 }
@@ -63,23 +79,24 @@ pub struct Trainer {
     pub dist_curve: Vec<f32>,
     pub best_reward: f64,
     pub best_distance: f64,
+    pub best_completion_rate: f64,
+    pub best_waypoint_fraction: f64,
     pub best_theta: Vec<f64>,
     /// The normaliser is part of the policy, not a training detail: replaying
     /// `best_theta` against a later normaliser does not reproduce the run.
     pub best_norm: Normalizer,
     pub baseline_reward: f64,
     pub baseline_distance: f64,
+    pub baseline_completion_rate: f64,
     pub last_eval: Rollout,
 
     deltas: Vec<f64>,
-    scratch: Policy,
 }
 
 impl Trainer {
     pub fn new(policy: Policy, cfg: ArsConfig, phys: Physics, seed: u64) -> Trainer {
         let policy_frame = policy.frame;
         let best_theta = policy.theta.clone();
-        let scratch = policy.clone();
         Trainer {
             policy,
             cfg,
@@ -91,13 +108,15 @@ impl Trainer {
             dist_curve: Vec::new(),
             best_reward: f64::NEG_INFINITY,
             best_distance: 0.0,
+            best_completion_rate: 0.0,
+            best_waypoint_fraction: 0.0,
             best_theta,
             best_norm: Normalizer::default(),
             baseline_reward: 0.0,
             baseline_distance: 0.0,
+            baseline_completion_rate: 0.0,
             last_eval: Rollout::default(),
             deltas: vec![0.0; cfg.n_dirs * n_theta(policy_frame)],
-            scratch,
         }
     }
 
@@ -117,19 +136,81 @@ impl Trainer {
 
     pub fn record_baseline(&mut self, terrain: &Terrain) {
         let r = self.evaluate(terrain);
+        self.record_baseline_result(r);
+    }
+
+    /// Record a baseline against a balanced terrain suite. The best policy is
+    /// subsequently selected against this same aggregate task, not whichever
+    /// individual terrain happened to be sampled last.
+    pub fn record_suite_baseline(&mut self, terrains: &[Terrain]) {
+        let r = self.evaluate_suite(terrains);
+        self.record_baseline_result(r);
+    }
+
+    fn record_baseline_result(&mut self, r: Rollout) {
         self.baseline_reward = r.reward;
         self.baseline_distance = r.distance;
+        self.baseline_completion_rate = r.completion_rate;
         self.best_reward = r.reward;
         self.best_distance = self.baseline_distance;
+        self.best_completion_rate = r.completion_rate;
+        self.best_waypoint_fraction = r.waypoint_fraction;
         self.best_theta.copy_from_slice(&self.policy.theta);
         self.best_norm = self.policy.norm.clone();
         self.curve.push(r.reward as f32);
         self.dist_curve.push(r.distance as f32);
     }
 
+    /// Evaluate equally across all supplied terrain/seed scenarios and the
+    /// normal per-course speed schedule.
+    pub fn evaluate_suite(&mut self, terrains: &[Terrain]) -> Rollout {
+        assert!(!terrains.is_empty(), "training suite must contain terrain");
+        let mut p = self.policy.clone();
+        p.norm.frozen = true;
+        let mut acc = Rollout::default();
+        acc.finished = true;
+        acc.completed = true;
+        let n = terrains.len() as f64;
+        for terrain in terrains {
+            let r = evaluate(terrain, &p, &self.phys, self.cfg.horizon);
+            merge_rollout(&mut acc, r, 1.0 / n);
+        }
+        self.last_eval = acc;
+        acc
+    }
+
     /// One ARS iteration: `2 * n_dirs` exploratory rollouts plus one
     /// evaluation rollout.
     pub fn iterate(&mut self, terrain: &Terrain) -> f64 {
+        self.iterate_suite(core::slice::from_ref(terrain))
+    }
+
+    /// One stochastic ARS iteration over a balanced terrain suite.
+    ///
+    /// Direction `k` is assigned a deterministic rotating mini-batch. Both
+    /// perturbation signs see exactly the same terrains and speeds, so their
+    /// difference remains a valid finite difference. When the iteration's
+    /// direction-batches contain at least as many slots as the suite, every
+    /// scenario contributes to every update; smaller searches cover the whole
+    /// suite over successive iterations.
+    pub fn iterate_suite(&mut self, terrains: &[Terrain]) -> f64 {
+        self.iterate_suite_with_eval(terrains, terrains)
+    }
+
+    /// Train from a weighted curriculum but select checkpoints on a separate,
+    /// balanced validation suite. Duplicating a hard scenario should change
+    /// the gradient budget, not make a specialist checkpoint look globally
+    /// better merely because that course was counted many more times.
+    pub fn iterate_suite_with_eval(
+        &mut self,
+        terrains: &[Terrain],
+        eval_terrains: &[Terrain],
+    ) -> f64 {
+        assert!(!terrains.is_empty(), "training suite must contain terrain");
+        assert!(
+            !eval_terrains.is_empty(),
+            "evaluation suite must contain terrain"
+        );
         let n = n_theta(self.policy.frame);
         let cfg = self.cfg;
 
@@ -145,47 +226,110 @@ impl Trainer {
         let mut norm_accum: Normalizer = self.policy.norm.clone();
         norm_accum.frozen = false;
 
-        let mut rewards = vec![(0.0f64, 0.0f64); cfg.n_dirs];
+        // One command per direction, shared by both sides of the finite
+        // difference — otherwise the difference measures the command draw
+        // rather than the perturbation. JUMP samples a faster band: the
+        // trenches are a running jump, not a walk.
+        let batch = cfg.scenarios_per_direction.max(1);
+        let assignments: Vec<Vec<(usize, Cmd)>> = (0..cfg.n_dirs)
+            .map(|k| {
+                (0..batch)
+                    .map(|sample| {
+                        let slot = k * batch + sample;
+                        let terrain_i = suite_terrain_index(
+                            self.iter,
+                            slot,
+                            cfg.n_dirs * batch,
+                            terrains.len(),
+                        );
+                        let terrain = &terrains[terrain_i];
+                        let cmd = if terrain.course.is_jump() {
+                            Cmd::at(
+                                JUMP_CRUISE_MIN
+                                    + self.rng.unit()
+                                        * (JUMP_CRUISE_MAX - JUMP_CRUISE_MIN),
+                            )
+                        } else {
+                            Cmd::at(
+                                CRUISE_MIN + self.rng.unit() * (CRUISE_MAX - CRUISE_MIN),
+                            )
+                        };
+                        (terrain_i, cmd)
+                    })
+                    .collect()
+            })
+            .collect();
 
-        for k in 0..cfg.n_dirs {
-            let base = k * n;
-
-            // One command per direction, shared by both sides of the finite
-            // difference — otherwise the difference measures the command draw
-            // rather than the perturbation. JUMP samples a faster band: the
-            // trenches are a running jump, not a walk.
-            let cmd = if terrain.course.is_jump() {
-                Cmd::at(JUMP_CRUISE_MIN + self.rng.unit() * (JUMP_CRUISE_MAX - JUMP_CRUISE_MIN))
+        #[cfg(not(target_family = "wasm"))]
+        let mut results = {
+            let workers = if cfg.workers == 0 {
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
             } else {
-                Cmd::at(CRUISE_MIN + self.rng.unit() * (CRUISE_MAX - CRUISE_MIN))
-            };
-
-            for sign in [1.0f64, -1.0f64] {
-                for j in 0..n {
-                    self.scratch.theta[j] =
-                        self.policy.theta[j] + sign * cfg.sigma * self.deltas[base + j];
-                }
-                self.scratch.norm = self.policy.norm.clone();
-                self.scratch.frame = self.policy.frame;
-                self.scratch.base_offsets = self.policy.base_offsets;
-                self.scratch.feedback = self.policy.feedback;
-
-                let r = rollout(
-                    terrain,
-                    &self.scratch,
-                    &self.phys,
-                    cfg.horizon,
-                    cmd,
-                    Some(&mut norm_accum),
-                );
-                self.rollouts += 1;
-                if sign > 0.0 {
-                    rewards[k].0 = r.reward;
-                } else {
-                    rewards[k].1 = r.reward;
-                }
+                cfg.workers
             }
+            .max(1)
+            .min(cfg.n_dirs.max(1));
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                for worker in 0..workers {
+                    let assignments = &assignments;
+                    let deltas = &self.deltas;
+                    let policy = &self.policy;
+                    let phys = &self.phys;
+                    handles.push(scope.spawn(move || {
+                        let mut out = Vec::new();
+                        for k in (worker..cfg.n_dirs).step_by(workers) {
+                            let base = k * n;
+                            out.push(run_direction(
+                                k,
+                                policy,
+                                &deltas[base..base + n],
+                                terrains,
+                                &assignments[k],
+                                phys,
+                                cfg,
+                            ));
+                        }
+                        out
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("ARS rollout worker panicked"))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        #[cfg(target_family = "wasm")]
+        let mut results = assignments
+            .iter()
+            .enumerate()
+            .map(|(k, scenarios)| {
+                let base = k * n;
+                run_direction(
+                    k,
+                    &self.policy,
+                    &self.deltas[base..base + n],
+                    terrains,
+                    scenarios,
+                    &self.phys,
+                    cfg,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // Worker completion order must not affect the policy. Merge both
+        // returns and observation statistics in direction/sign order.
+        results.sort_by_key(|r| r.k);
+        let mut rewards = vec![(0.0f64, 0.0f64); cfg.n_dirs];
+        for r in results {
+            rewards[r.k] = (r.plus_reward, r.minus_reward);
+            norm_accum.merge(&r.plus_norm, self.policy.n_obs());
+            norm_accum.merge(&r.minus_norm, self.policy.n_obs());
         }
+        self.rollouts += 2 * cfg.n_dirs * batch;
 
         // Rank directions by their best side, keep the top b.
         let mut order: Vec<usize> = (0..cfg.n_dirs).collect();
@@ -227,12 +371,26 @@ impl Trainer {
         self.policy.norm = norm_accum;
         self.iter += 1;
 
-        let ev = self.evaluate(terrain);
+        let ev = if eval_terrains.len() == 1 {
+            self.evaluate(&eval_terrains[0])
+        } else {
+            self.evaluate_suite(eval_terrains)
+        };
         self.curve.push(ev.reward as f32);
         self.dist_curve.push(ev.distance as f32);
-        if ev.reward > self.best_reward {
+        let better = if eval_terrains.len() == 1 {
+            ev.reward > self.best_reward
+        } else {
+            training_objective(&ev)
+                > COMPLETION_OBJECTIVE_SCALE * self.best_completion_rate
+                    + ROUTE_OBJECTIVE_SCALE * self.best_waypoint_fraction
+                    + self.best_reward
+        };
+        if better {
             self.best_reward = ev.reward;
             self.best_distance = ev.distance;
+            self.best_completion_rate = ev.completion_rate;
+            self.best_waypoint_fraction = ev.waypoint_fraction;
             self.best_theta.copy_from_slice(&self.policy.theta);
             self.best_norm = self.policy.norm.clone();
         }
@@ -247,6 +405,117 @@ impl Trainer {
         p.norm.frozen = true;
         p
     }
+}
+
+struct DirectionResult {
+    k: usize,
+    plus_reward: f64,
+    minus_reward: f64,
+    plus_norm: Normalizer,
+    minus_norm: Normalizer,
+}
+
+fn run_direction(
+    k: usize,
+    policy: &Policy,
+    delta: &[f64],
+    terrains: &[Terrain],
+    scenarios: &[(usize, Cmd)],
+    phys: &Physics,
+    cfg: ArsConfig,
+) -> DirectionResult {
+    let completion_objective = terrains.len() > 1;
+    let run = |sign: f64| {
+        let mut candidate = policy.clone();
+        for ((theta, base), d) in candidate.theta.iter_mut().zip(&policy.theta).zip(delta) {
+            *theta = *base + sign * cfg.sigma * d;
+        }
+        let mut norm = Normalizer::empty();
+        let reward = scenarios
+            .iter()
+            .map(|&(terrain_i, cmd)| {
+                let result = rollout(
+                    &terrains[terrain_i],
+                    &candidate,
+                    phys,
+                    cfg.horizon,
+                    cmd,
+                    Some(&mut norm),
+                );
+                if completion_objective {
+                    training_objective(&result)
+                } else {
+                    result.reward
+                }
+            })
+            .sum::<f64>()
+            / scenarios.len() as f64;
+        (reward, norm)
+    };
+    let (plus_reward, plus_norm) = run(1.0);
+    let (minus_reward, minus_norm) = run(-1.0);
+    DirectionResult {
+        k,
+        plus_reward,
+        minus_reward,
+        plus_norm,
+        minus_norm,
+    }
+}
+
+#[inline]
+fn training_objective(result: &Rollout) -> f64 {
+    COMPLETION_OBJECTIVE_SCALE * result.completion_rate
+        + ROUTE_OBJECTIVE_SCALE * result.waypoint_fraction
+        + result.reward
+}
+
+#[inline]
+fn suite_terrain_index(iter: usize, direction: usize, n_dirs: usize, n_terrains: usize) -> usize {
+    let mut stride = n_terrains / 2 + 1;
+    while gcd(stride, n_terrains) != 1 {
+        stride += 1;
+    }
+    ((iter * n_dirs + direction) * stride) % n_terrains
+}
+
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Add a rollout summary into an aggregate. Counts which are meaningful as
+/// totals (`steps`, `reached`, jumps) remain totals; physical and task metrics
+/// are weighted means. Completion booleans mean every episode succeeded.
+fn merge_rollout(acc: &mut Rollout, r: Rollout, weight: f64) {
+    acc.reward += r.reward * weight;
+    acc.distance += r.distance * weight;
+    acc.elapsed += r.elapsed * weight;
+    acc.end_x += r.end_x * weight;
+    acc.steps += r.steps;
+    acc.fell |= r.fell;
+    acc.stub_total += r.stub_total * weight;
+    acc.work += r.work * weight;
+    acc.slip += r.slip * weight;
+    acc.cot += r.cot * weight;
+    acc.speed_error += r.speed_error * weight;
+    acc.peak_servo_load = acc.peak_servo_load.max(r.peak_servo_load);
+    acc.reached += r.reached;
+    acc.finished &= r.finished;
+    acc.completed &= r.completed;
+    acc.waypoint_fraction += r.waypoint_fraction * weight;
+    acc.completion_rate += r.completion_rate * weight;
+    acc.finish_time += r.finish_time * weight;
+    acc.collisions += r.collisions * weight;
+    acc.mean_cycle += r.mean_cycle * weight;
+    acc.mean_stride += r.mean_stride * weight;
+    acc.mean_duty += r.mean_duty * weight;
+    acc.apex = acc.apex.max(r.apex);
+    acc.jumps += r.jumps;
+    acc.broken |= r.broken;
+    acc.impact_g = acc.impact_g.max(r.impact_g);
 }
 
 #[cfg(test)]
@@ -375,6 +644,90 @@ mod tests {
             hi = hi.max(v);
         }
         assert!(hi - lo > (CRUISE_MAX - CRUISE_MIN) * 0.8);
+    }
+
+    #[test]
+    fn suite_schedule_is_balanced_and_deterministic() {
+        let schedule = || {
+            (0..5)
+                .flat_map(|it| (0..4).map(move |k| suite_terrain_index(it, k, 4, 10)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(schedule(), schedule());
+        let visits = schedule();
+        for terrain in 0..10 {
+            assert_eq!(visits.iter().filter(|&&v| v == terrain).count(), 2);
+        }
+    }
+
+    #[test]
+    fn suite_objective_prefers_route_progress_over_parking() {
+        let parked = Rollout {
+            reward: -118.0,
+            ..Rollout::default()
+        };
+        let attempted = Rollout {
+            reward: -300.0,
+            waypoint_fraction: 1.0 / 15.0,
+            ..Rollout::default()
+        };
+        let completed = Rollout {
+            reward: -500.0,
+            waypoint_fraction: 1.0,
+            completion_rate: 1.0,
+            ..Rollout::default()
+        };
+        assert!(training_objective(&attempted) > training_objective(&parked));
+        assert!(training_objective(&completed) > training_objective(&attempted));
+    }
+
+    #[test]
+    fn suite_training_and_evaluation_are_reproducible() {
+        let terrains = [
+            Terrain::new(Course::Flat, 1),
+            Terrain::new(Course::Rubble, 2),
+            Terrain::new(Course::Slalom, 3),
+        ];
+        let run = || {
+            let mut t = trainer(123);
+            t.cfg.n_dirs = 3;
+            t.cfg.n_top = 2;
+            t.cfg.horizon = 0.2;
+            t.deltas.resize(t.cfg.n_dirs * n_theta(t.policy.frame), 0.0);
+            t.record_suite_baseline(&terrains);
+            for _ in 0..2 {
+                t.iterate_suite(&terrains);
+            }
+            (
+                t.curve.clone(),
+                t.last_eval.completion_rate,
+                t.last_eval.waypoint_fraction,
+            )
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn parallel_and_sequential_rollouts_produce_the_same_update() {
+        let terrains = [
+            Terrain::new(Course::Flat, 1),
+            Terrain::new(Course::Rubble, 2),
+            Terrain::new(Course::Slalom, 3),
+            Terrain::new(Course::Jump, 4),
+        ];
+        let run = |workers| {
+            let mut t = trainer(456);
+            t.cfg.n_dirs = 4;
+            t.cfg.n_top = 2;
+            t.cfg.horizon = 0.3;
+            t.cfg.workers = workers;
+            t.deltas.resize(t.cfg.n_dirs * n_theta(t.policy.frame), 0.0);
+            t.record_suite_baseline(&terrains);
+            t.iterate_suite(&terrains);
+            (t.policy.theta, t.policy.norm.mean, t.policy.norm.m2)
+        };
+        assert_eq!(run(1), run(4));
     }
 
     #[test]

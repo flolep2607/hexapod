@@ -318,6 +318,18 @@ impl Default for Normalizer {
 }
 
 impl Normalizer {
+    /// An accumulator with no prior samples or variance pseudocount. Rollout
+    /// workers use this and merge it into the policy's long-lived statistics
+    /// in a fixed order after they finish.
+    pub(crate) fn empty() -> Normalizer {
+        Normalizer {
+            n: 0.0,
+            mean: [0.0; MAX_OBS],
+            m2: [0.0; MAX_OBS],
+            frozen: false,
+        }
+    }
+
     pub fn observe(&mut self, obs: &[f64; MAX_OBS], n_obs: usize) {
         if self.frozen {
             return;
@@ -328,6 +340,22 @@ impl Normalizer {
             self.mean[i] += d / self.n;
             self.m2[i] += d * (obs[i] - self.mean[i]);
         }
+    }
+
+    /// Parallel Welford merge. Calling this in rollout-index order makes the
+    /// native trainer deterministic independently of worker scheduling.
+    pub(crate) fn merge(&mut self, other: &Normalizer, n_obs: usize) {
+        if other.n == 0.0 {
+            return;
+        }
+        let old_n = self.n;
+        let new_n = old_n + other.n;
+        for i in 0..n_obs {
+            let delta = other.mean[i] - self.mean[i];
+            self.mean[i] += delta * other.n / new_n;
+            self.m2[i] += other.m2[i] + delta * delta * old_n * other.n / new_n;
+        }
+        self.n = new_n;
     }
 
     #[inline]
@@ -641,6 +669,36 @@ mod tests {
         let mut out = [0.0; MAX_OBS];
         n.apply(&probe, &mut out, no);
         assert!(out[..no].iter().all(|v| v.abs() < 0.25), "{out:?}");
+    }
+
+    #[test]
+    fn merged_normaliser_matches_sequential_observation() {
+        let no = n_obs(Frame::default());
+        let mut observations = Vec::new();
+        for sample in 0..40 {
+            let mut obs = [0.0; MAX_OBS];
+            for (i, value) in obs.iter_mut().enumerate().take(no) {
+                *value = sample as f64 * 0.25 - i as f64 * 0.1;
+            }
+            observations.push(obs);
+        }
+        let mut sequential = Normalizer::default();
+        for obs in &observations {
+            sequential.observe(obs, no);
+        }
+        let mut merged = Normalizer::default();
+        for chunk in observations.chunks(7) {
+            let mut partial = Normalizer::empty();
+            for obs in chunk {
+                partial.observe(obs, no);
+            }
+            merged.merge(&partial, no);
+        }
+        assert_eq!(merged.n, sequential.n);
+        for i in 0..no {
+            assert!((merged.mean[i] - sequential.mean[i]).abs() < 1e-12);
+            assert!((merged.m2[i] - sequential.m2[i]).abs() < 1e-10);
+        }
     }
 
     /// Converting a world ground point through a sagged `pos[1]` used to fold

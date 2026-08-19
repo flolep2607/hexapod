@@ -144,6 +144,18 @@ const W_PROGRESS: f64 = 1.2;
 /// Each waypoint reached. Small on purpose — arrivals come at whatever rate
 /// the route is spaced at, so a large one would be mileage again.
 const W_WAYPOINT: f64 = 5.0;
+/// Reaching the last waypoint after visiting every waypoint in order. This is
+/// deliberately only a few seconds of clean walking reward: completion must
+/// break ties between otherwise useful controllers without turning the task
+/// back into a race for sparse distance bonuses.
+const W_FINISH: f64 = 24.0;
+/// Episode-level cost for the fraction of ordered waypoints left unreached.
+/// Unlike raw distance, this cannot be harvested by sprinting past the route.
+const INCOMPLETE_ROUTE_PENALTY: f64 = 80.0;
+/// A controller that parks safely at the first trench is not better than one
+/// that attempts the route and falls. Expiring the horizon without entering
+/// the finish therefore costs slightly more than a fall.
+const TIMEOUT_PENALTY: f64 = 45.0;
 /// Per joule of mechanical work, so this is a real energy price.
 const W_WORK: f64 = 0.020;
 /// Per metre of foot skid.
@@ -186,7 +198,7 @@ const PIT_PLANT: f64 = -0.20;
 /// a hop is triggered, it runs once, and it does not start again until the
 /// feet are down and a short cooldown has passed.
 const HOP_CROUCH: f64 = 0.08;
-const HOP_PUSH: f64 = 0.22;
+const HOP_PUSH: f64 = 0.25;
 const HOP_LIFT_END: f64 = 0.48;
 const HOP_COOLDOWN: f64 = 0.14;
 
@@ -218,7 +230,7 @@ fn hop_feedforward(clock: f64) -> (f64, f64) {
         }
     };
     let crouch = bump(0.00, HOP_CROUCH + 0.02);
-    let push = bump(0.05, 0.28);
+    let push = bump(0.03, 0.47);
     let lift = if (HOP_PUSH..HOP_LIFT_END).contains(&clock) {
         1.0
     } else {
@@ -227,12 +239,25 @@ fn hop_feedforward(clock: f64) -> (f64, f64) {
     (-0.85 * crouch + 1.50 * push, lift)
 }
 
-/// Near-field centre scan: a trench 1.4 m ahead. That is far enough to
-/// crouch-and-push before the lip, and close enough that takeoff is not two
-/// metres early.
-fn pit_ahead(obs: &[f64], frame: crate::robot::Frame) -> bool {
-    let base = obs_scan(frame);
-    obs[base + 1] < -0.25
+/// Begin the hop early enough that the front feet are gathered before they
+/// reach the near lip. JUMP trenches span the corridor, so their world-Z
+/// extent is an exact range measurement and avoids the aliasing of a binary
+/// height probe at one fixed distance.
+fn jump_trench_ahead(terrain: &Terrain, z: f64, speed: f64, frame: crate::robot::Frame) -> bool {
+    let Some(pit) = terrain
+        .obstacles
+        .iter()
+        .filter(|ob| ob.top < PIT_PLANT && ob.z1 > z)
+        .min_by(|a, b| a.z0.total_cmp(&b.z0))
+    else {
+        return false;
+    };
+    let to_lip = pit.z0 - z;
+    // Start the crouch one push-window before the lip. The small margin keeps
+    // lift-off on solid ground without spending the finite ballistic arc
+    // before the gap begins.
+    let lead = speed.max(0.0) * HOP_PUSH + frame.body_r() * 0.44;
+    to_lip > 0.0 && to_lip <= lead
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -368,6 +393,9 @@ pub struct Sim {
     /// Index of the waypoint being chased, and how many have been reached.
     pub wp: usize,
     pub reached: usize,
+    /// The final waypoint has been entered. `reached == waypoints.len()` then
+    /// distinguishes a complete route from one that skipped an earlier gate.
+    pub finished: bool,
     /// Range and signed bearing to that waypoint: bearing is positive when it
     /// is to the left of where the machine is pointing.
     pub wp_dist: f64,
@@ -468,6 +496,7 @@ impl Default for Sim {
             advance_frac: 1.0,
             wp: 0,
             reached: 0,
+            finished: false,
             wp_dist: 0.0,
             bearing: 0.0,
             steer: 0.0,
@@ -619,7 +648,7 @@ impl Sim {
         cmd: Cmd,
         integrate: bool,
     ) -> f64 {
-        if self.fallen || self.broken {
+        if self.fallen || self.broken || self.finished {
             return 0.0;
         }
         // Belly already on the floor: do not let the height spring stand it up.
@@ -650,16 +679,27 @@ impl Sim {
             }
         } else if self.jump_cool > 0.0 {
             self.jump_cool -= dt;
-        } else if !was_airborne && self.vy > -0.2 {
-            let mut trigger = act[i_j];
-            if terrain.course.is_jump() && pit_ahead(&self.obs, self.frame) {
-                trigger += 0.90;
+        } else if terrain.course.is_jump()
+            && !was_airborne
+            && self.vy > -0.2
+            && {
+                let fwd = rot_y([0.0, 0.0, 1.0], self.yaw);
+                let along = fwd[0] * self.vel[0] + fwd[2] * self.vel[1];
+                jump_trench_ahead(terrain, self.pos[2], along, self.frame)
             }
+        {
+            // Only the parkour course contains trenches wider than a stride.
+            // The learned jump output is a residual on that detected event,
+            // not permission to hop on ordinary stepable gaps or repeatedly
+            // on clear ground after a landing.
+            let trigger = act[i_j] + 0.90;
             if trigger > JUMP_LIFT {
                 self.jump_clock = dt;
             }
         }
         let hopping = self.jump_clock > 0.0;
+        let recovering = !hopping && self.jump_cool > 0.0;
+        let mut landing = false;
         if hopping {
             let (mut hop_body, mut hop_lift) = hop_feedforward(self.jump_clock);
             let fwd = rot_y([0.0, 0.0, 1.0], self.yaw);
@@ -672,8 +712,9 @@ impl Sim {
             let descending = self.vy <= 0.08;
             if (was_airborne || self.jump_clock >= HOP_PUSH) && descending && !over_void {
                 // Land: gather and crouch so the damper is not asked for eight g.
+                landing = true;
                 hop_lift = 0.0;
-                hop_body = hop_body.min(-1.20);
+                hop_body = hop_body.min(-1.50);
             } else if was_airborne || hop_lift > 0.0 {
                 hop_lift = hop_lift.max(0.9);
             }
@@ -724,7 +765,19 @@ impl Sim {
             cmd.turn
         };
         let w_cmd = TURN_RATE * self.steer;
-        let body_dh = 0.20 * act[act_body_dh(self.frame)];
+        // The jump actuator has gathered the legs to their ordinary action
+        // limit already. Give first contact another five centimetres, then
+        // release that crouch over the cooldown instead of snapping the body
+        // target straight back to standing height on the next tick.
+        let recovery = if landing {
+            0.05
+        } else if !hopping && self.jump_cool > 0.0 {
+            0.35 * (self.jump_cool / (HOP_COOLDOWN + 0.16)).min(1.0)
+        } else {
+            0.0
+        };
+        let body_gain = if hopping { 0.26 } else { 0.20 };
+        let body_dh = body_gain * act[act_body_dh(self.frame)] - recovery;
 
         // --- gait clock and stance/swing transitions ------------------------
         self.phase = frac(self.phase + dt / cycle);
@@ -752,8 +805,12 @@ impl Sim {
         // schedule. A positive lift raises every foot at once; anything else
         // gathers them all — the crouch and the landing. A foot over a trench
         // is not gathered: planting there is how a walker ends the run.
-        if hopping {
-            let now = act[act_jump(self.frame)] < JUMP_LIFT;
+        if hopping || recovering {
+            // Keep every foot gathered on the landing surface during the
+            // short recovery. Resuming the walking phase immediately can send
+            // its first touchdown behind the far lip and fit the support plane
+            // to the bottom of the trench.
+            let now = recovering || act[act_jump(self.frame)] < JUMP_LIFT;
             for i in 0..n {
                 let was = self.feet[i].stance;
                 let d = self.frame.dir(i);
@@ -762,7 +819,18 @@ impl Sim {
                 let wz = self.pos[2];
                 let h = terrain.height(wx, wz);
                 let down = now && h > PIT_PLANT;
-                if was && !down {
+                if recovering && down {
+                    // Settle the gathered feet beneath the moving chassis.
+                    // Otherwise a low-speed landing fixes every plant at the
+                    // far lip, the stride immediately runs out, and the first
+                    // normal touchdown reaches backward into the trench.
+                    let p = [wx, h, wz];
+                    let (gx, gz) = terrain.slope(wx, wz);
+                    self.feet[i].plant = p;
+                    self.feet[i].world = p;
+                    self.feet[i].grip = terrain.grip(wx, wz);
+                    self.feet[i].slope = [gx, gz];
+                } else if was && !down {
                     self.feet[i].lift_from = self.feet[i].world;
                 } else if !was && down {
                     let p = [wx, h, wz];
@@ -1010,7 +1078,15 @@ impl Sim {
                     }
                 }
                 let a_up = A_JUMP_MAX.min((VY_TAKEOFF_MAX - self.vy) / dt);
-                clamp(a_pd, -A_LAND_MAX, a_up.max(0.0))
+                if hopping && !was_airborne && self.jump_clock > HOP_CROUCH {
+                    // Once the crouch is loaded, push to a takeoff velocity.
+                    // A pure position spring eases off as the body rises and
+                    // makes the next jump weaker whenever obstacles are close
+                    // enough that the chassis has not fully stood back up.
+                    a_up.max(0.0)
+                } else {
+                    clamp(a_pd, -A_LAND_MAX, a_up.max(0.0))
+                }
             } else {
                 a_pd
             }
@@ -1257,11 +1333,19 @@ impl Sim {
         // it further away every tick. So the chassis moves by the *change* in
         // the tracking error, which integrates to exactly the current offset.
         let mut shift = [
-            err[0] - self.prev_track_err[0],
+            clamp(err[0] - self.prev_track_err[0], -0.02, 0.02),
             0.0,
-            err[2] - self.prev_track_err[2],
+            clamp(err[2] - self.prev_track_err[2], -0.02, 0.02),
         ];
         self.prev_track_err = err;
+        if hopping || recovering {
+            // Gathering every leg changes the tracking error discontinuously;
+            // it is not a real horizontal impulse. Let commanded velocity
+            // carry the chassis through a hop and its recovery instead of
+            // teleporting it by the kinematic residual.
+            shift[0] = 0.0;
+            shift[2] = 0.0;
+        }
         // Obstruction is a hard constraint, so it has to survive this
         // correction too. A few millimetres a tick is exactly how something
         // seeps through a barrier that is only checked during motion, and a
@@ -1377,8 +1461,12 @@ impl Sim {
         let closed = was - hypot2(w[0] - self.pos[0], w[1] - self.pos[2]);
         let progress = closed.min(cmd.speed().abs() * dt);
         let before = self.reached;
+        let was_finished = self.finished;
         self.update_route(terrain);
         let arrivals = (self.reached - before) as f64;
+        let completed = !was_finished
+            && self.finished
+            && self.reached == terrain.waypoints.len();
 
         // --- reward -------------------------------------------------------------
         let target = cmd.speed();
@@ -1396,6 +1484,7 @@ impl Sim {
                 + ALIVE)
             + W_PROGRESS * progress
             + W_WAYPOINT * arrivals
+            + if completed { W_FINISH } else { 0.0 }
             - W_WORK * work_step
             - W_SLIP * self.slip
             - W_STUB * step_stub
@@ -1548,6 +1637,20 @@ impl Sim {
             return; // keep the previous plane
         }
 
+        // A gathered landing places every foot on one transverse line. That
+        // support can define height (and usually roll), but not a fore-aft
+        // slope; solving the nearly singular normal equations manufactures a
+        // huge slope from floating-point noise and points the height spring at
+        // the sky or the trench floor. Use the mean support height until the
+        // walking stance has two-dimensional spread again.
+        let vx = sxx - sx * sx / n;
+        let vz = szz - sz * sz / n;
+        let vxz = sxz - sx * sz / n;
+        if vx * vz - vxz * vxz < 1e-8 {
+            self.plane = [0.0, 0.0, sy / n];
+            return;
+        }
+
         // Normal equations with a small ridge term for collinear supports.
         let r = 1e-6;
         let m = [[sxx + r, sxz, sx], [sxz, szz + r, sz], [sx, sz, n + r]];
@@ -1651,14 +1754,23 @@ impl Sim {
     /// machine is well past it: arriving beside one and having to turn back
     /// for it is not a task anybody wants a walking robot to learn.
     fn update_route(&mut self, terrain: &Terrain) {
+        if self.finished {
+            return;
+        }
         let last = terrain.waypoints.len().saturating_sub(1);
         loop {
             let w = terrain.waypoint(self.wp);
             let (dx, dz) = (w[0] - self.pos[0], w[1] - self.pos[2]);
             let d = hypot2(dx, dz);
-            if self.wp < last && d < WAYPOINT_R {
-                self.wp += 1;
+            if d < WAYPOINT_R {
                 self.reached += 1;
+                if self.wp == last {
+                    self.finished = true;
+                    self.wp_dist = d;
+                    self.bearing = 0.0;
+                    return;
+                }
+                self.wp += 1;
                 continue;
             }
             // Left behind. Move on to the next one, but do not pretend it was
@@ -1777,6 +1889,11 @@ impl Sim {
 pub struct Rollout {
     pub reward: f64,
     pub distance: f64,
+    /// Simulated seconds actually executed and final lateral position. These
+    /// make early falls, breaks, and wall detours observable in headless
+    /// policy diagnostics.
+    pub elapsed: f64,
+    pub end_x: f64,
     pub steps: usize,
     pub fell: bool,
     pub stub_total: f64,
@@ -1792,6 +1909,17 @@ pub struct Rollout {
     pub peak_servo_load: f64,
     /// Waypoints reached, and ticks spent against a wall or an obstacle.
     pub reached: usize,
+    /// Whether the final waypoint was entered, and whether every ordered
+    /// waypoint was reached on the way there. For an aggregate evaluation,
+    /// these are true only when every constituent episode has that outcome.
+    pub finished: bool,
+    pub completed: bool,
+    /// Fraction of route waypoints reached, averaged across episodes.
+    pub waypoint_fraction: f64,
+    /// Fraction of episodes which completed the full ordered route.
+    pub completion_rate: f64,
+    /// Time to the terminal waypoint, with failures charged the full horizon.
+    pub finish_time: f64,
     pub collisions: f64,
     /// Mean cycle time, stride and duty the policy actually ran, after its
     /// online modulation. These are what a speed-conditioned policy varies.
@@ -1845,14 +1973,33 @@ pub fn rollout(
         s_sum += sim.stride_now;
         d_sum += sim.duty_now;
         steps += 1;
-        if sim.fallen || sim.broken {
+        if sim.fallen || sim.broken || sim.finished {
             break;
+        }
+    }
+
+    let route_len = terrain.waypoints.len();
+    let waypoint_fraction = if route_len == 0 {
+        1.0
+    } else {
+        sim.reached as f64 / route_len as f64
+    };
+    let completed = sim.finished && sim.reached == route_len;
+    let finish = terrain.waypoint(route_len.saturating_sub(1));
+    let direct_finish_distance = hypot2(finish[0], finish[1]);
+    let completion_horizon = cmd.speed().abs() * secs >= 0.95 * direct_finish_distance;
+    if !completed && completion_horizon {
+        total -= INCOMPLETE_ROUTE_PENALTY * (1.0 - waypoint_fraction);
+        if !sim.finished && !sim.fallen && !sim.broken {
+            total -= TIMEOUT_PENALTY;
         }
     }
 
     Rollout {
         reward: total,
         distance: sim.dist,
+        elapsed: sim.t,
+        end_x: sim.pos[0],
         steps,
         fell: sim.fallen,
         stub_total: sim.stub_total,
@@ -1866,6 +2013,11 @@ pub fn rollout(
         },
         peak_servo_load: peak_load,
         reached: sim.reached,
+        finished: sim.finished,
+        completed,
+        waypoint_fraction,
+        completion_rate: f64::from(u8::from(completed)),
+        finish_time: if sim.finished { sim.t } else { secs },
         collisions: sim.collisions,
         mean_cycle: mean(c_sum, steps),
         mean_stride: mean(s_sum, steps),
@@ -1911,11 +2063,15 @@ fn evaluate_at_speeds(
     speeds: &[f64],
 ) -> Rollout {
     let mut acc = Rollout::default();
+    acc.finished = true;
+    acc.completed = true;
     let n = speeds.len() as f64;
     for &s in speeds {
         let r = rollout(terrain, policy, phys, secs, Cmd::at(s), None);
         acc.reward += r.reward / n;
         acc.distance += r.distance / n;
+        acc.elapsed += r.elapsed / n;
+        acc.end_x += r.end_x / n;
         acc.steps += r.steps;
         acc.fell |= r.fell;
         acc.stub_total += r.stub_total / n;
@@ -1925,6 +2081,11 @@ fn evaluate_at_speeds(
         acc.speed_error += r.speed_error / n;
         acc.peak_servo_load = acc.peak_servo_load.max(r.peak_servo_load);
         acc.reached += r.reached;
+        acc.finished &= r.finished;
+        acc.completed &= r.completed;
+        acc.waypoint_fraction += r.waypoint_fraction / n;
+        acc.completion_rate += r.completion_rate / n;
+        acc.finish_time += r.finish_time / n;
         acc.collisions += r.collisions / n;
         acc.mean_cycle += r.mean_cycle / n;
         acc.mean_stride += r.mean_stride / n;
@@ -1994,8 +2155,11 @@ mod tests {
         for &s in &[2.5, 4.0, 5.0] {
             let r = rollout(&t, &p, &Physics::default(), 6.0, Cmd::at(s), None);
             let avg = r.distance / (r.steps as f64 * DT);
+            // The kinematic tracking correction is bounded, so the seeded
+            // open-loop gait may saturate slightly below the fastest command.
+            // Learned feedback is what closes the remaining error.
             assert!(
-                (avg - s).abs() / s < 0.20,
+                (avg - s).abs() / s < 0.25,
                 "commanded {s:.1}, averaged {avg:.2}"
             );
         }
@@ -2647,8 +2811,28 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(s.reached, s.wp, "reached count and index disagree");
-        assert!(s.reached >= 2, "only reached {} waypoints", s.reached);
+        assert_eq!(
+            s.reached,
+            s.wp + usize::from(s.finished),
+            "reached count and index disagree"
+        );
+        assert!(s.finished, "did not reach the final waypoint");
+        assert_eq!(s.reached, t.waypoints.len(), "did not visit the full route");
+    }
+
+    #[test]
+    fn rollout_terminates_after_every_waypoint_and_reports_completion() {
+        let t = Terrain::new(Course::Flat, 1);
+        let p = baseline();
+        let horizon = 30.0;
+        let r = rollout(&t, &p, &Physics::default(), horizon, Cmd::at(4.0), None);
+        assert!(r.finished, "never entered the final waypoint: {r:?}");
+        assert!(r.completed, "finished after skipping a waypoint: {r:?}");
+        assert_eq!(r.reached, t.waypoints.len());
+        assert_eq!(r.completion_rate, 1.0);
+        assert_eq!(r.waypoint_fraction, 1.0);
+        assert!(r.finish_time < horizon, "episode did not terminate early");
+        assert!(r.steps < (horizon / DT) as usize);
     }
 
     #[test]
@@ -2914,6 +3098,83 @@ mod tests {
     }
 
     #[test]
+    fn seeded_jump_clears_and_lands_beyond_the_first_trench() {
+        for &speed in JUMP_EVAL_SPEEDS.iter() {
+            let t = Terrain::new(Course::Jump, 1);
+            let pit = t
+                .obstacles
+                .iter()
+                .find(|ob| ob.top < PIT_PLANT)
+                .expect("JUMP has no trench");
+            let p = baseline();
+            let g = p.gait();
+            let mut s = Sim::default();
+            s.reset(&t, &g, &Physics::default());
+            let mut takeoff_z = None;
+            let mut takeoff_y_vy = None;
+            let mut landing_z = None;
+            let mut landing_y_vy = None;
+            let mut was_airborne = false;
+            for _ in 0..600 {
+                s.step(&t, &p, &g, DT, Cmd::at(speed));
+                if !was_airborne && s.airborne {
+                    takeoff_z.get_or_insert(s.pos[2]);
+                    takeoff_y_vy.get_or_insert((s.pos[1], s.vy));
+                }
+                if was_airborne && !s.airborne {
+                    landing_z.get_or_insert(s.pos[2]);
+                    landing_y_vy.get_or_insert((s.pos[1], s.vy));
+                    break;
+                }
+                was_airborne = s.airborne;
+                if s.fallen || s.broken {
+                    break;
+                }
+            }
+            assert!(
+                !s.fallen && !s.broken && landing_z.is_some_and(|z| z > pit.z1),
+                "{speed:.1} m/s: pit {:.2}..{:.2}, takeoff {:?} y/vy {:?}, landing {:?} y/vy {:?}, end {:.2}, impact {:.1}g, fallen {}, broken {}",
+                pit.z0,
+                pit.z1,
+                takeoff_z,
+                takeoff_y_vy,
+                landing_z,
+                landing_y_vy,
+                s.pos[2],
+                s.impact_g,
+                s.fallen,
+                s.broken
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_jump_controller_can_finish_a_full_parkour_route() {
+        let t = Terrain::new(Course::Jump, 1);
+        for &speed in JUMP_EVAL_SPEEDS.iter() {
+            let r = rollout(
+                &t,
+                &baseline(),
+                &Physics::default(),
+                45.0,
+                Cmd::at(speed),
+                None,
+            );
+            assert!(
+                r.completed,
+                "{speed:.1} m/s stopped at {:.2} m after {}/{} waypoints ({} jumps, impact {:.1}g, fallen {}, broken {})",
+                r.distance,
+                r.reached,
+                t.waypoints.len(),
+                r.jumps,
+                r.impact_g,
+                r.fell,
+                r.broken
+            );
+        }
+    }
+
+    #[test]
     fn walking_does_not_become_a_jump() {
         let t = Terrain::new(Course::Flat, 1);
         let r = rollout(
@@ -2975,7 +3236,7 @@ mod tests {
 
     #[test]
     fn airborne_is_not_a_fall() {
-        let t = Terrain::new(Course::Flat, 1);
+        let t = Terrain::new(Course::Jump, 1);
         let p = jumper();
         let g = p.gait();
         let mut s = Sim::default();
@@ -3000,7 +3261,7 @@ mod tests {
         // with the legs still at standing height is the case the break
         // penalty exists for: the demand strips the gearbox even though the
         // integrator will not apply that acceleration.
-        let t = Terrain::new(Course::Flat, 1);
+        let t = Terrain::new(Course::Jump, 1);
         let p = jumper();
         let g = p.gait();
         let mut s = Sim::default();
@@ -3016,7 +3277,9 @@ mod tests {
         assert!(air, "never took off");
         s.pos[0] = 0.0;
         s.pos[2] = 1.0;
-        s.jump_clock = 0.60; // hop clock: gather to land, not lift
+        // Bypass the hop's landing crouch: this invariant is specifically the
+        // uncontrolled, standing-height impact described above.
+        s.jump_clock = 0.0;
         s.vy = -8.0;
         s.pos[1] = s.plane_y(s.pos[0], s.pos[2]) + g.body_h + 0.04;
         s.airborne = true;
@@ -3026,7 +3289,7 @@ mod tests {
 
     #[test]
     fn a_jumper_can_take_off_while_running() {
-        let t = Terrain::new(Course::Flat, 1);
+        let t = Terrain::new(Course::Jump, 1);
         let r = rollout(
             &t,
             &jumper(),
@@ -3038,5 +3301,19 @@ mod tests {
         assert!(r.jumps >= 1, "jumper never left the ground");
         assert!(r.distance > 4.0, "jumper stalled at {:.2} m", r.distance);
         assert!(!r.broken);
+    }
+
+    #[test]
+    fn jump_action_is_ignored_on_stepable_gap_courses() {
+        let t = Terrain::new(Course::Gaps, 1);
+        let r = rollout(
+            &t,
+            &jumper(),
+            &Physics::default(),
+            4.0,
+            Cmd::at(5.5),
+            None,
+        );
+        assert_eq!(r.jumps, 0, "stepable GAPS course triggered a hop");
     }
 }
