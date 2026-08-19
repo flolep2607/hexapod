@@ -668,8 +668,9 @@ fn dist(a: V3, b: V3) -> f64 {
 }
 
 fn substep(plant: &mut ArticulatedPlant, dt: f64) {
-    // ponytail: contact at the control rate skates the plants. Split the tick.
-    let n = 8;
+    // Contact at the control rate skates the plants, so the tick is split.
+    // How far is [`Physics::substeps`]; the scene runner sweeps it.
+    let n = plant.substeps;
     let h = dt / n as f64;
     for _ in 0..n {
         plant.step(h);

@@ -18,11 +18,13 @@ use crate::robot::{
 };
 use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 
-/// Motor gains, as multiples of the joint's stall torque: an error of a sixth
-/// of a radian asks for stall. Tied to stall so they follow the plant's length
-/// scale instead of having to be retuned alongside it.
-const STIFF_PER_STALL: f32 = 6.1;
-const DAMP_PER_STALL: f32 = 0.82;
+/// God motor. The joint tracks its command and that is all: no stall torque,
+/// no torque-speed line, no backdrive. Gains are in acceleration, not force —
+/// Rapier divides them by the joint's effective inertia, which is what keeps a
+/// spring this stiff conditioned well enough to run at a cheap solver budget.
+/// A force-based spring of equivalent authority needs 8 substeps and 64 solver
+/// passes per tick to stay up; this one holds at 2 and 4.
+
 const FOOT_R: f32 = FOOT_R_M as f32;
 /// Collider `user_data`: the walkable plane. Any chassis contact is fatal.
 const HIT_FLOOR: u128 = 1;
@@ -48,7 +50,7 @@ fn hinge(
     world_anchor: Vector,
     world_axis: Vector,
     limits: [f32; 2],
-    stall: f32,
+    gains: (f32, f32, f32),
 ) -> RevoluteJoint {
     // Negated on purpose. `crate::math::rot_y` turns +x toward +z, which is a
     // left-handed rotation about Y; Rapier is right-handed. Left as it comes,
@@ -75,9 +77,9 @@ fn hinge(
     let mut joint = RevoluteJointBuilder::new(Vector::X)
         .contacts_enabled(false)
         .limits(limits)
-        .motor_model(MotorModel::ForceBased)
-        .motor_position(0.0, STIFF_PER_STALL * stall, DAMP_PER_STALL * stall)
-        .motor_max_force(stall)
+        .motor_model(MotorModel::AccelerationBased)
+        .motor_position(0.0, gains.0, gains.1)
+        .motor_max_force(gains.2)
         .build();
     joint.data.set_local_frame1(parent.inverse() * world);
     joint.data.set_local_frame2(child.inverse() * world);
@@ -129,6 +131,8 @@ pub struct ArticulatedPlant {
     colliders: ColliderSet,
     impulse_joints: ImpulseJointSet,
     multibody_joints: MultibodyJointSet,
+    /// Rapier steps per control tick, from [`Physics::substeps`].
+    pub substeps: usize,
     pipeline: PhysicsPipeline,
     islands: IslandManager,
     broad_phase: BroadPhaseBvh,
@@ -148,7 +152,6 @@ impl ArticulatedPlant {
         // Servo stall is a real N·m for the 28 cm machine, so it is scaled by
         // 1/scale to keep tau/(mgL).
         let s = 1.0f32;
-        let stall_sim = phys.actuator.stall_nm as f32 / phys.scale as f32;
         let n = frame.legs();
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();
@@ -293,8 +296,12 @@ impl ArticulatedPlant {
         let tibia_kg = (phys.leg.tibia_kg as f32).max(0.008);
         let coxa_kg = 0.012f32;
 
+        let gains = (
+            phys.motor_stiff as f32,
+            phys.motor_damp as f32,
+            phys.motor_max as f32,
+        );
         let mut legs: [Option<LegBodies>; MAX_LEGS] = std::array::from_fn(|_| None);
-        let stall = stall_sim;
 
         for i in 0..n {
             let jw = fk_world(frame, i, q0[i], pos, 0.0, 0.0, 0.0);
@@ -414,9 +421,9 @@ impl ArticulatedPlant {
                     (Q_LIMIT[k].1 - q0[i][k]) as f32,
                 ]
             };
-            let coxa_joint = hinge(&chassis_pose, &coxa_pose, hip, Vector::Y, lim(0), stall);
-            let femur_joint = hinge(&coxa_pose, &femur_pose, knee, pitch_axis, lim(1), stall);
-            let tibia_joint = hinge(&femur_pose, &tibia_pose, ankle, pitch_axis, lim(2), stall);
+            let coxa_joint = hinge(&chassis_pose, &coxa_pose, hip, Vector::Y, lim(0), gains);
+            let femur_joint = hinge(&coxa_pose, &femur_pose, knee, pitch_axis, lim(1), gains);
+            let tibia_joint = hinge(&femur_pose, &tibia_pose, ankle, pitch_axis, lim(2), gains);
 
             let h_coxa = impulse_joints.insert(chassis, coxa, coxa_joint, true);
             let h_femur = impulse_joints.insert(coxa, femur, femur_joint, true);
@@ -455,8 +462,8 @@ impl ArticulatedPlant {
 
         let integration = IntegrationParameters {
             dt: crate::sim::DT as f32,
-            num_solver_iterations: 16,
-            num_internal_pgs_iterations: 4,
+            num_solver_iterations: phys.solver_iters,
+            num_internal_pgs_iterations: 1,
             length_unit: 1.0,
             ..Default::default()
         };
@@ -471,6 +478,7 @@ impl ArticulatedPlant {
             colliders,
             impulse_joints,
             multibody_joints,
+            substeps: phys.substeps.max(1),
             pipeline: PhysicsPipeline::new(),
             islands: IslandManager::new(),
             broad_phase: BroadPhaseBvh::new(),
@@ -489,19 +497,19 @@ impl ArticulatedPlant {
     /// past `omega_max`, and the force cap collapses to its floor exactly when
     /// the leg needs to move — the whole machine ends up twitching in place
     /// instead of walking. Rate-limiting first is what a servo actually does.
-    pub fn drive(&mut self, q_cmd: &[[f64; 3]; MAX_LEGS], phys: &Physics, dt: f64) {
-        let stall = phys.actuator.stall_nm as f32 / phys.scale as f32;
-        let omega_max = phys.actuator.omega_max as f32;
-        let max_step = omega_max * dt as f32;
+    pub fn drive(&mut self, q_cmd: &[[f64; 3]; MAX_LEGS], phys: &Physics, _dt: f64) {
+        let (ks, kd, kf) = (
+            phys.motor_stiff as f32,
+            phys.motor_damp as f32,
+            phys.motor_max as f32,
+        );
         for i in 0..self.n {
             for j in 0..3 {
                 let Some(leg) = self.legs[i].as_ref() else {
                     continue;
                 };
                 let h = leg.hinges[j];
-                let at = self.joint_angle(h) - h.q0;
-                let want = wrap(q_cmd[i][j] as f32 - h.q0);
-                let target = h.set + wrap(want - h.set).clamp(-max_step, max_step);
+                let target = wrap(q_cmd[i][j] as f32 - h.q0);
                 if let Some(leg) = self.legs[i].as_mut() {
                     leg.hinges[j].set = target;
                 }
@@ -511,42 +519,20 @@ impl ArticulatedPlant {
                 let Some(rev) = joint.data.as_revolute_mut() else {
                     continue;
                 };
-                // The hinge is joint-local X, so the world axis is the parent's
-                // rotation applied to frame 1's X — not the parent's Y, which
-                // only matched the coxa and read chassis roll as femur speed,
-                // collapsing the torque cap to the 2% floor on every pitch
-                // joint.
-                let hinge_axis = rev.data.local_axis1();
-                let parent = &self.bodies[h.parent];
-                let child = &self.bodies[h.child];
-                let w = child.angvel() - parent.angvel();
-                let axis = *parent.rotation() * hinge_axis;
-                let omega = w.dot(axis);
-                // A motor loses torque only in the direction it is already
-                // spinning; braking or holding against the spin has its full
-                // stall available. Derating both ways left the joint with no
-                // torque to stop an overshoot, so the legs flailed past target
-                // and the body sagged.
-                let along = (target - at) * omega > 0.0;
-                let avail = if along {
-                    stall * (1.0 - (omega.abs() / omega_max).clamp(0.0, 1.0))
-                } else {
-                    stall
-                };
-                rev.set_motor_position(target, STIFF_PER_STALL * stall, DAMP_PER_STALL * stall);
-                rev.set_motor_max_force(avail.max(0.02 * stall));
+                rev.set_motor_position(target, ks, kd);
+                rev.set_motor_max_force(kf);
             }
         }
     }
 
     /// Snap `legs` to their current hinge angles and leave a brake on.
     /// They still yield under load; they are not walked.
-    pub fn lock(
-        &mut self,
-        legs: &[bool; MAX_LEGS],
-        phys: &Physics,
-    ) {
-        let stall = phys.actuator.stall_nm as f32 / phys.scale as f32;
+    pub fn lock(&mut self, legs: &[bool; MAX_LEGS], phys: &Physics) {
+        let (ks, kd, kf) = (
+            phys.motor_stiff as f32,
+            phys.motor_damp as f32,
+            phys.motor_max as f32,
+        );
         for i in 0..self.n {
             if !legs[i] {
                 continue;
@@ -561,12 +547,12 @@ impl ArticulatedPlant {
                     leg.hinges[j].set = at;
                 }
             }
-            self.hold_leg(i, stall);
+            self.hold_leg(i, ks, kd, kf);
         }
     }
 
     /// Re-assert the frozen servo setpoint. The joint can sag; the target cannot.
-    fn hold_leg(&mut self, i: usize, stall: f32) {
+    fn hold_leg(&mut self, i: usize, ks: f32, kd: f32, kf: f32) {
         for j in 0..3 {
             let Some(leg) = self.legs[i].as_ref() else {
                 continue;
@@ -578,8 +564,8 @@ impl ArticulatedPlant {
             let Some(rev) = joint.data.as_revolute_mut() else {
                 continue;
             };
-            rev.set_motor_position(h.set, STIFF_PER_STALL * stall, 8.0 * stall);
-            rev.set_motor_max_force(stall);
+            rev.set_motor_position(h.set, ks, kd);
+            rev.set_motor_max_force(kf);
         }
     }
 

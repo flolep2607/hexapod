@@ -231,7 +231,12 @@ pub fn drive_articulated(
 
     plant.drive(&q_cmd, phys, dt);
     let pre = plant.chassis_vel();
-    plant.step(dt);
+    // Same split as the crawl: contact resolved at the control rate skates
+    // the plants, and this path used to bypass the substepping entirely.
+    let n = plant.substeps.max(1);
+    for _ in 0..n {
+        plant.step(dt / n as f64);
+    }
     let (p, yaw, pitch, roll) = plant.chassis_pose();
     let v = plant.chassis_vel();
     sim.observe_pose(p, yaw, pitch, roll, v);

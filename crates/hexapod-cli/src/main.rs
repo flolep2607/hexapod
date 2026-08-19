@@ -137,6 +137,7 @@ fn main() {
         "courses" => courses_json(),
         "system" => system(frame, course, seed, iters, cfg, phys, &args),
         "oneleg" | "reach" => oneleg(frame, seed, phys, &args),
+        "scene" | "scenes" => scenes(frame, phys, &args),
         "watch" => {
             let course = if flag(&args, "--course").is_some() {
                 course
@@ -1303,4 +1304,236 @@ fn sparkline(v: &[f32]) -> String {
         s.push(BARS[i]);
     }
     format!("{s}   [{lo:.1} .. {hi:.1}]")
+}
+
+// ------------------------------------------------------------------- scenes
+
+/// One headless scenario with pass/fail numbers, so a locomotion change can be
+/// judged from a terminal instead of a canvas. Every scene prints the same
+/// columns; `--json` emits them for scripting.
+///
+///   hexapod scene            run them all
+///   hexapod scene walk       run one
+///   hexapod scene --json     machine readable
+struct Report {
+    name: &'static str,
+    /// Worst joint tracking error over the run, radians. The god motor's own
+    /// score: if this is not near zero the joints are not following the gait
+    /// and every other number is measuring the wrong machine.
+    track: f64,
+    /// Lowest the chassis got, sim units. Ride height is 0.88.
+    min_y: f64,
+    /// Ground covered in the plane, sim units.
+    travel: f64,
+    /// Metres of stance-foot sliding summed over every planted foot.
+    slip: f64,
+    /// Distance to the waypoint at the end, or -1 when the scene has none.
+    to_goal: f64,
+    fell: bool,
+    /// Simulated seconds per wall second.
+    rt: f64,
+}
+
+impl Report {
+    fn row(&self) -> String {
+        format!(
+            "{:<12} track {:6.3}  min_y {:6.3}  travel {:7.3}  slip {:8.2}  goal {:7.3}  {:>5}  {:6.1}x",
+            self.name,
+            self.track,
+            self.min_y,
+            self.travel,
+            self.slip,
+            self.to_goal,
+            if self.fell { "FELL" } else { "ok" },
+            self.rt
+        )
+    }
+    fn json(&self) -> String {
+        format!(
+            "{{\"name\":\"{}\",\"track\":{:.4},\"min_y\":{:.4},\"travel\":{:.4},\"slip\":{:.3},\"to_goal\":{:.4},\"fell\":{},\"rt\":{:.2}}}",
+            self.name, self.track, self.min_y, self.travel, self.slip, self.to_goal, self.fell, self.rt
+        )
+    }
+}
+
+fn scenes(frame: Frame, mut phys: Physics, args: &[String]) {
+    if let Some(v) = flag(args, "--stiff").and_then(|v| v.parse().ok()) {
+        phys.motor_stiff = v;
+    }
+    if let Some(v) = flag(args, "--damp").and_then(|v| v.parse().ok()) {
+        phys.motor_damp = v;
+    }
+    if let Some(v) = flag(args, "--substeps").and_then(|v| v.parse().ok()) {
+        phys.substeps = v;
+    }
+    if let Some(v) = flag(args, "--solver").and_then(|v| v.parse().ok()) {
+        phys.solver_iters = v;
+    }
+    if let Some(v) = flag(args, "--maxf").and_then(|v| v.parse().ok()) {
+        phys.motor_max = v;
+    }
+    // args[0] is the subcommand. A scene name is the next bare word that is
+    // not the value of a flag.
+    let mut want = String::new();
+    let mut k = 1;
+    while k < args.len() {
+        if args[k].starts_with("--") {
+            k += 2;
+            continue;
+        }
+        want = args[k].clone();
+        break;
+    }
+    let json = args.iter().any(|a| a == "--json");
+    let secs: f64 = flag(args, "--seconds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20.0);
+    let mut rows = Vec::new();
+    // The tripod path is a different controller from the crawl and breaks in
+    // different ways, so it gets its own scenes rather than sharing a knob.
+    for (name, course) in [("tripod", Course::Flat), ("tripod-rubble", Course::Rubble)] {
+        if !want.is_empty() && want != name {
+            continue;
+        }
+        rows.push(run_tripod(name, frame, phys, course, secs));
+    }
+    let all: [(&'static str, Course, f64, f64); 6] = [
+        ("stand", Course::Flat, 0.0, 0.0),
+        ("walk", Course::Flat, 1.0, 0.0),
+        ("turn", Course::Flat, 0.0, 1.0),
+        ("rubble", Course::Rubble, 1.0, 0.0),
+        ("steps", Course::Steps, 1.0, 0.0),
+        ("slalom", Course::Slalom, 1.0, 0.0),
+    ];
+    for (name, course, fwd, turn) in all {
+        if !want.is_empty() && want != name {
+            continue;
+        }
+        rows.push(run_scene(name, frame, phys, course, fwd, turn, secs));
+    }
+    if json {
+        println!(
+            "[{}]",
+            rows.iter().map(|r| r.json()).collect::<Vec<_>>().join(",")
+        );
+    } else {
+        println!("scene        joint-tracking  ride    ground     foot-slip   waypoint  state   speed");
+        for r in &rows {
+            println!("{}", r.row());
+        }
+    }
+}
+
+fn run_scene(
+    name: &'static str,
+    frame: Frame,
+    phys: Physics,
+    course: Course,
+    fwd: f64,
+    turn: f64,
+    secs: f64,
+) -> Report {
+    use hexapod_core::sim::DT;
+    let terrain = Terrain::new(course, 1);
+    let mut drill = OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true);
+    drill.set_cmd(Cmd {
+        fwd,
+        turn,
+        cruise: 0.35,
+        nav: false,
+    });
+    let n = (secs / DT) as usize;
+    let mut min_y = f64::INFINITY;
+    let mut track: f64 = 0.0;
+    let mut slip = 0.0f64;
+    let mut fell = false;
+    let mut prev: Option<[[f64; 3]; hexapod_core::robot::MAX_LEGS]> = None;
+    let t0 = Instant::now();
+    for _ in 0..n {
+        drill.step(DT);
+        let s = drill.sample();
+        min_y = min_y.min(s.pos[1]);
+        fell |= s.fallen;
+        // Commanded joints versus where the joints actually are.
+        let cmd = drill.cmd_q();
+        for i in 0..frame.legs() {
+            let at = drill.plant.leg_q(i);
+            for j in 0..3 {
+                track = track.max((at[j] - cmd[i][j]).abs());
+            }
+        }
+        let mut feet = [[0.0; 3]; hexapod_core::robot::MAX_LEGS];
+        for i in 0..frame.legs() {
+            feet[i] = drill.plant.leg_joints_world(i)[3];
+        }
+        if let Some(p) = prev {
+            for i in 0..frame.legs() {
+                if i == s.moving && s.phase.swinging() {
+                    continue;
+                }
+                let d = feet[i][0] - p[i][0];
+                let e = feet[i][2] - p[i][2];
+                slip += (d * d + e * e).sqrt();
+            }
+        }
+        prev = Some(feet);
+    }
+    let rt = (n as f64 * DT) / t0.elapsed().as_secs_f64();
+    let s = drill.sample();
+    // Range to the waypoint the machine is currently aiming at.
+    let w = terrain.waypoint(0);
+    let (dx, dz) = (w[0] - s.pos[0], w[1] - s.pos[2]);
+    let to_goal = (dx * dx + dz * dz).sqrt();
+    Report {
+        name,
+        track,
+        min_y,
+        travel: s.chassis_xz,
+        slip,
+        to_goal,
+        fell,
+        rt,
+    }
+}
+
+fn run_tripod(
+    name: &'static str,
+    frame: Frame,
+    phys: Physics,
+    course: Course,
+    secs: f64,
+) -> Report {
+    use hexapod_core::sim::DT;
+    let (mut walker, terrain, policy, gait) =
+        hexapod_core::walker::open_loop_walk(frame, course, 1, phys);
+    let cmd = Cmd {
+        fwd: 1.0,
+        turn: 0.0,
+        cruise: 1.5,
+        nav: false,
+    };
+    let n = (secs / DT) as usize;
+    let mut min_y = f64::INFINITY;
+    let mut fell = false;
+    let t0 = Instant::now();
+    for _ in 0..n {
+        walker.step(&terrain, &policy, &gait, DT, cmd);
+        let s = walker.sample();
+        min_y = min_y.min(s.pos[1]);
+        fell |= s.fallen;
+    }
+    let rt = (n as f64 * DT) / t0.elapsed().as_secs_f64();
+    let s = walker.sample();
+    let w = terrain.waypoint(0);
+    let (dx, dz) = (w[0] - s.pos[0], w[1] - s.pos[2]);
+    Report {
+        name,
+        track: 0.0,
+        min_y,
+        travel: (s.pos[0] * s.pos[0] + s.pos[2] * s.pos[2]).sqrt(),
+        slip: 0.0,
+        to_goal: (dx * dx + dz * dz).sqrt(),
+        fell,
+        rt,
+    }
 }

@@ -142,11 +142,33 @@ pub struct Physics {
     /// simulator drives a joint with is the torque the catalogue sizes it on.
     pub dynamic: f64,
     pub actuator: Actuator,
+    /// God-motor gains for the articulated plant, in acceleration units.
+    /// `stiff` is the joint's natural frequency squared and `damp` is twice
+    /// that frequency at critical damping, so a joint that should settle in
+    /// `t` seconds wants `stiff = (4/t)^2`. Nothing here is a servo: the plant
+    /// tracks the gait and the machine is judged on whether it walks.
+    pub motor_stiff: f64,
+    pub motor_damp: f64,
+    /// Rapier steps per 100 Hz control tick, and solver passes per step. The
+    /// two knobs that set what the simulation costs; every scene prints the
+    /// realtime multiple they buy.
+    pub substeps: usize,
+    pub solver_iters: usize,
+    /// Ceiling on joint force, simulator units. Not a servo rating — there is
+    /// no torque-speed line, no stall derating and no backdrive any more. It
+    /// exists because an unbounded motor lets the solver inject unbounded
+    /// energy: uncapped, a tripod gait launches the machine kilometres.
+    pub motor_max: f64,
 }
 
 impl Default for Physics {
     fn default() -> Self {
         Physics {
+            motor_stiff: 1.0e6,
+            motor_damp: 2.0e3,
+            substeps: 4,
+            solver_iters: 4,
+            motor_max: 50.0,
             mass_kg: 2.0,
             scale: 0.10,
             // Rubber foot on dry board. Loose ground scales this down.

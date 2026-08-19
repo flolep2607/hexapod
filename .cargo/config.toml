@@ -1,0 +1,11 @@
+# Rapier's contact and joint solvers are written to batch four constraints at a
+# time. Without this the wasm build runs them one lane wide and loses ~14% of
+# the physics rate — measured, on the six-leg crawl. Costs ~190 KB in the
+# inlined module, and needs Chrome 91 / Firefox 89 / Safari 16.4 or newer.
+#
+# Deliberately NOT paired with rapier's own `simd-stable` feature: the `wide`
+# crate it pulls in is slower than plain scalar code here, with or without
+# simd128 underneath it (2.95x and 3.87x respectively, against 3.93x for this
+# flag on its own).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
