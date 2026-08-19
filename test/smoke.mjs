@@ -29,9 +29,13 @@ async function openHarness(name) {
   const page = await context.newPage();
   // A --fast artifact reloads itself when dist changes. Smoke pages must stay
   // pinned to the artifact they opened even if a dev watcher rebuilds it.
-  await page.addInitScript(() => {
+  await page.addInitScript((workerEnabled) => {
     window.setInterval = () => 0;
-  });
+    // Six deterministic scenarios already exercise the main-thread fallback
+    // in parallel. Keep their background workers from competing for the same
+    // CI cores; the playback scenario below is the dedicated worker contract.
+    if (!workerEnabled) Object.defineProperty(window, "Worker", { value: undefined });
+  }, name === "playback scheduler");
   const checks = [];
   const errors = [];
   const hasDevFileReloader = HAS_DEV_FILE_RELOADER;
@@ -219,6 +223,110 @@ async function speedAndPhysics(h) {
     hull.n >= 3 && hull.span < 1.5,
     `${hull.n} pts, ${hull.span.toFixed(2)} m`
   );
+}
+
+async function playbackScheduler(h) {
+  const { page, check, setRange, waitFor } = h;
+  await clickWalk(page);
+  await waitFor(() => window.__hxPlayback?.().worker === true, null, 5000);
+  const workerWalk = await waitFor(() => window.__hxOneleg?.().on === false, null, 2000);
+  check("Walk switches the worker out of the drill", Boolean(workerWalk));
+
+  const sample = async (requested, durationMs = 750) => {
+    await setRange("rRate", requested);
+    // Give the rolling achieved-rate readout and the scheduler one window to
+    // forget the preceding rate before measuring the next one.
+    await page.waitForTimeout(350);
+    return page.evaluate(async (windowMs) => {
+      const readClock = () => {
+        const text = document.getElementById("hClock")?.textContent || "";
+        const match = text.match(/^(\d+):(\d+(?:\.\d+)?)/);
+        return match ? Number(match[1]) * 60 + Number(match[2]) : NaN;
+      };
+
+      let frames = 0;
+      let sampling = true;
+      const countFrame = () => {
+        if (!sampling) return;
+        frames++;
+        requestAnimationFrame(countFrame);
+      };
+      requestAnimationFrame(countFrame);
+
+      const wall0 = performance.now();
+      const sim0 = readClock();
+      await new Promise((resolve) => setTimeout(resolve, windowMs));
+      const wallMs = performance.now() - wall0;
+      const simSeconds = readClock() - sim0;
+      sampling = false;
+
+      const rateControl = document.getElementById("rRate");
+      const actual = document.getElementById("vRateActual");
+      return {
+        wallMs,
+        simSeconds,
+        achieved: simSeconds / (wallMs / 1000),
+        frames,
+        copy: rateControl?.closest("label")?.textContent?.replace(/\s+/g, " ").trim() || "",
+        requestedText: document.getElementById("vRate")?.textContent?.trim() || "",
+        actualText: actual?.textContent?.trim() || "",
+        actualTitle: actual?.getAttribute("title") || "",
+        backend: actual?.dataset.backend || "",
+        playback: window.__hxPlayback?.() || null,
+      };
+    }, durationMs);
+  };
+
+  const normal = await sample(1);
+  const fast = await sample(10);
+  const describe = (result) =>
+    `${result.simSeconds.toFixed(1)} sim-s / ${(result.wallMs / 1000).toFixed(2)} wall-s` +
+    ` = ${result.achieved.toFixed(2)}×, ${result.frames} frames`;
+
+  check(
+    "playback distinguishes requested from achieved speed",
+    fast.requestedText === "10×" &&
+      /\d+(?:\.\d+)?×\s*(?:actual|achieved)/i.test(fast.actualText) &&
+      /request|achiev|actual/i.test(`${fast.copy} ${fast.actualTitle}`),
+    `${fast.copy}${fast.actualTitle ? ` (${fast.actualTitle})` : ""}`
+  );
+  check(
+    "live playback runs off the UI thread",
+    fast.backend === "worker" && fast.playback?.worker === true,
+    `${fast.backend || "no backend"} / ${JSON.stringify(fast.playback)}`
+  );
+  check(
+    "a higher request advances more simulation time",
+    Number.isFinite(normal.achieved) &&
+      Number.isFinite(fast.achieved) &&
+      fast.achieved > normal.achieved * 1.15,
+    `1×: ${describe(normal)}; 10×: ${describe(fast)}`
+  );
+  check(
+    "high-rate playback keeps animation responsive",
+    fast.frames >= 3 && fast.simSeconds > 0,
+    describe(fast)
+  );
+
+  await page.click("#btnPause");
+  await page.waitForTimeout(250);
+  const paused = await page.evaluate(async () => {
+    const readClock = () => {
+      const match = (document.getElementById("hClock")?.textContent || "").match(
+        /^(\d+):(\d+(?:\.\d+)?)/
+      );
+      return match ? Number(match[1]) * 60 + Number(match[2]) : NaN;
+    };
+    const before = readClock();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    return { before, after: readClock() };
+  });
+  check(
+    "pause does not accumulate catch-up work",
+    Number.isFinite(paused.before) && Math.abs(paused.after - paused.before) <= 0.11,
+    `${paused.before.toFixed(1)} -> ${paused.after.toFixed(1)} sim-s`
+  );
+  await page.click("#btnPause");
 }
 
 async function frameState(h, legs) {
@@ -457,6 +565,9 @@ async function onelegDrill(h) {
   await page.click("#btnWalk");
   check("walk restores the gait", (await page.getAttribute("#btnWalk", "data-on")) === "true");
   check("one-leg turns off", (await page.getAttribute("#btnOneleg", "data-on")) !== "true");
+  await page.click("#btnPause");
+  const walkTelemetry = await page.evaluate(() => window.__hxOneleg());
+  check("Walk leaves the drill in engine telemetry", !walkTelemetry.on, walkTelemetry.phaseName);
   check(
     "inactive one-leg button is not the orange primary action",
     !(await page.$eval("#btnOneleg", (button) => button.classList.contains("primary")))
@@ -469,6 +580,7 @@ const scenarios = [
   ["physics", async (harness) => {
     await speedAndPhysics(harness);
   }],
+  ["playback scheduler", playbackScheduler],
   ["frames", async (harness) => {
     await decapod(harness);
     await quadruped(harness);
@@ -476,6 +588,11 @@ const scenarios = [
   ["gait + navigation", gaitAndNavigation],
   ["one leg", onelegDrill],
 ];
+const scenarioNeedle = (process.env.SMOKE_SCENARIO || "").trim().toLowerCase();
+const selectedScenarios = scenarioNeedle
+  ? scenarios.filter(([name]) => name.toLowerCase().includes(scenarioNeedle))
+  : scenarios;
+if (!selectedScenarios.length) throw new Error(`no smoke scenario matches ${scenarioNeedle}`);
 
 const started = performance.now();
 const SCENARIO_TIMEOUT_MS = 20000;
@@ -496,7 +613,7 @@ const withScenarioTimeout = async (promise, name) => {
   }
 };
 const results = await Promise.all(
-  scenarios.map(async ([name, scenario]) => {
+  selectedScenarios.map(async ([name, scenario]) => {
     const scenarioStarted = performance.now();
     let harness;
     try {
@@ -542,7 +659,7 @@ if (!clean) failures++;
 
 const elapsed = (performance.now() - started) / 1000;
 console.log(
-  `\n${failures === 0 ? "PASS" : failures + " FAILURE(S)"}  — ${scenarios.length} parallel scenarios in ${elapsed.toFixed(2)}s` +
+  `\n${failures === 0 ? "PASS" : failures + " FAILURE(S)"}  — ${selectedScenarios.length} parallel scenarios in ${elapsed.toFixed(2)}s` +
     (TAKE_SCREENSHOTS ? " · screenshots in dist/shots/" : "")
 );
 process.exit(failures === 0 ? 0 : 1);

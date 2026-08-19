@@ -61,14 +61,40 @@ const COL = {
 };
 
 let api = null;
+let rawApi = null;
 let stage = null;
 let course = new Float32Array(0);
+let simWorker = null;
+let workerReady = false;
+let workerTelemetry = null;
+let workerActualRate = 0;
+let workerDropped = 0;
+let workerQueue = [];
+let lastWorkerControl = "";
+let deterministicTelemetry = false;
+
+const WORKER_MUTATIONS = [
+  "hx_set_course",
+  "hx_set_legs",
+  "hx_set_preset",
+  "hx_set_mode",
+  "hx_set_oneleg_leg",
+  "hx_reset_live",
+  "hx_set_param",
+  "hx_set_train_cfg",
+  "hx_reset_training",
+  "hx_train",
+  "hx_set_build",
+  "hx_set_servo",
+  "hx_set_cruise",
+  "hx_set_nav",
+];
 
 const state = {
   paused: false,
   timeScale: 1,
   training: false,
-  mode: 0,
+  mode: 2,
   courseKind: 4,
   legs: 6,
   seed: 1,
@@ -119,9 +145,106 @@ function decodeBase64(b64) {
   return out;
 }
 
+function mirrorWorkerCall(name, args) {
+  if (!simWorker) return;
+  const message = { type: "call", name, args };
+  if (workerReady) simWorker.postMessage(message);
+  else workerQueue.push(message);
+}
+
+function mirroredApi(exports) {
+  // WebAssembly export properties are non-writable. Inheriting from the
+  // exports object and assigning a same-named wrapper fails silently, leaving
+  // mutations on the UI instance only. Copy into a plain facade instead.
+  const wrapped = {};
+  const mutations = new Set(WORKER_MUTATIONS);
+  for (const name of Object.getOwnPropertyNames(exports)) {
+    const value = exports[name];
+    wrapped[name] = mutations.has(name)
+      ? (...args) => {
+          const result = value(...args);
+          mirrorWorkerCall(name, args);
+          return result;
+        }
+      : value;
+  }
+  return wrapped;
+}
+
+function stopWorker(reason) {
+  if (simWorker) simWorker.terminate();
+  simWorker = null;
+  workerReady = false;
+  workerTelemetry = null;
+  workerQueue = [];
+  lastWorkerControl = "";
+  if (rawApi) rawApi.hx_reset_live();
+  if (reason) log(`sim.worker.fallback(${JSON.stringify(reason)})`);
+}
+
+function startWorker(wasm, seed) {
+  if (typeof Worker !== "function" || !window.HX_WORKER_SRC) return;
+  let url;
+  try {
+    url = URL.createObjectURL(new Blob([window.HX_WORKER_SRC], { type: "text/javascript" }));
+    simWorker = new Worker(url);
+  } catch (error) {
+    if (url) URL.revokeObjectURL(url);
+    simWorker = null;
+    return;
+  }
+  simWorker.onmessage = (event) => {
+    const msg = event.data;
+    if (msg.type === "ready") {
+      workerReady = true;
+      URL.revokeObjectURL(url);
+      for (const queued of workerQueue) simWorker.postMessage(queued);
+      workerQueue = [];
+      simWorker.postMessage({ type: "sync" });
+      return;
+    }
+    if (msg.type === "telemetry") {
+      workerTelemetry = new Float32Array(msg.data);
+      workerActualRate = msg.actualRate;
+      workerDropped = msg.dropped;
+      state.stepUs = msg.stepUs;
+      return;
+    }
+    if (msg.type === "error") stopWorker(msg.error);
+  };
+  simWorker.onerror = (event) => stopWorker(event.message || "worker error");
+  const copy = wasm.slice().buffer;
+  simWorker.postMessage(
+    { type: "init", wasm: copy, telemetryLen: L.T_LEN, timeIndex: L.T_TIME, seed },
+    [copy]
+  );
+}
+
+function syncWorkerControl() {
+  if (!workerReady || !simWorker) return;
+  const control = {
+    paused: state.paused,
+    rate: state.timeScale,
+    fwd: state.cmd.fwd,
+    turn: state.cmd.turn,
+  };
+  const encoded = JSON.stringify(control);
+  if (encoded === lastWorkerControl) return;
+  lastWorkerControl = encoded;
+  simWorker.postMessage({ type: "control", control });
+}
+
 /** Fresh view — wasm memory can be reallocated by any call that grows it. */
+function mainTelemetry() {
+  return new Float32Array(rawApi.memory.buffer, rawApi.hx_telemetry_ptr(), rawApi.hx_telemetry_len());
+}
+
 function telemetry() {
-  return new Float32Array(api.memory.buffer, api.hx_telemetry_ptr(), api.hx_telemetry_len());
+  // Deterministic smoke helpers explicitly switch to the main instance before
+  // stepping it. An ordinary Pause keeps displaying the worker's last coherent
+  // pose instead of jumping back to the idle mirror.
+  if (!deterministicTelemetry && workerTelemetry) return workerTelemetry;
+  return mainTelemetry();
 }
 
 function readCourse() {
@@ -886,7 +1009,7 @@ function setTab(name) {
 }
 
 function refreshGaitTable() {
-  const trained = telemetry()[L.T_TRAINED] > 0.5;
+  const trained = mainTelemetry()[L.T_TRAINED] > 0.5;
   const rows = PARAMS.map((p, i) => {
     const a = api.hx_gait(0, i);
     const b = trained ? api.hx_gait(1, i) : NaN;
@@ -1183,67 +1306,75 @@ const traceFoot = new Trace($("cFoot"), [
   { color: COL.ink, fill: "rgba(20,20,22,0.07)" },
 ]);
 
-/* Nothing above 60 Hz reaches a screen, and a display that offers 120 would
- * otherwise buy the sim nothing while costing it two draws. 30 is the floor:
- * when the dial asks for more physics than a 60 Hz frame holds, half the frame
- * rate is worth twice the sim budget — 30 still reads as motion, and dropping
- * the sim instead is what made the speed dial a lie. */
-const RENDER_HZ = 30;
-const RENDER_HZ_MIN = 30;
-const FRAME_MS = 1000 / RENDER_HZ;
-const FRAME_MS_MAX = 1000 / RENDER_HZ_MIN;
-/* Playback speed is a request, not a promise. The physics runs at 800 Hz, so a
- * 10x dial asks for more of it than a frame will fit, and handing the whole
- * arrears to one hx_step call blocks for as long as it takes — the dial used to
- * buy sim time by spending frame rate, and ended up short of both. Step in
- * one-tick slices against a wall clock instead: the frame lands on time with
- * whatever the machine reached, and the surplus is dropped the way it always
- * was. Leave the rest of the frame for the draw and the panels. */
-const SIM_SLICE = 1 / 100;
+/* Rendering is deliberately independent from stepping. At high playback rates
+ * fewer pictures buy the worker more GPU/CPU headroom, while its fixed 100 Hz
+ * control ticks keep exactly the same physics. */
+const renderHz = () => (state.timeScale >= 6 ? 10 : state.timeScale >= 3 ? 15 : 30);
+const SIM_DT = 1 / 100;
+const SIM_SLICE = 2 * SIM_DT;
+const MAX_SIM_DEBT = 0.5;
 
-let lastDraw = performance.now();
+let lastFrame = performance.now();
+let lastDraw = lastFrame;
 let drawMs = 2;
-let behind = false;
+let mainDebt = 0;
+let mainDropped = 0;
+let mainActualRate = 0;
+let lastRateWall = lastFrame;
+let lastRateSim = 0;
+let lastTrain = 0;
 let slowAcc = 0;
 
 function frame(now) {
   requestAnimationFrame(frame);
-  const slot = behind ? FRAME_MS_MAX : FRAME_MS;
-  const wall = (now - lastDraw) / 1000;
-  if (wall * 1000 < slot - 1) return;
-  const dt = Math.min(0.05, wall) * state.timeScale;
-  lastDraw = now;
+  const wall = Math.min(0.05, Math.max(0, (now - lastFrame) / 1000));
+  lastFrame = now;
 
   readKeys();
+  syncWorkerControl();
 
-  if (!state.paused) {
-    const t0 = performance.now();
-    // Whatever the draw is not going to need. Measured, not assumed: on a GPU
-    // the draw is a couple of ms and the sim gets nearly the whole frame; on a
-    // software canvas it is most of the frame and the sim gets the floor.
-    const budget = Math.max(slot - drawMs - 1, 3);
-    let owed = dt;
-    while (owed > 1e-9 && performance.now() - t0 < budget) {
-      const slice = Math.min(owed, SIM_SLICE);
-      api.hx_step_quiet(slice, state.cmd.fwd, state.cmd.turn);
-      owed -= slice;
+  // Local fallback still steps on animation callbacks that are not draw
+  // frames. The old loop returned here and left half the 60 Hz callbacks idle,
+  // then discarded whatever did not fit beside the next draw.
+  if (!state.paused && !workerTelemetry) {
+    mainDebt += wall * state.timeScale;
+    if (mainDebt > MAX_SIM_DEBT) {
+      mainDropped += mainDebt - MAX_SIM_DEBT;
+      mainDebt = MAX_SIM_DEBT;
     }
-    api.hx_publish();
-    behind = owed > 1e-9;
-    state.stepUs += ((performance.now() - t0) * 1000 - state.stepUs) * 0.1;
+    const t0 = performance.now();
+    const drawDue = now - lastDraw >= 1000 / renderHz() - 1;
+    const budget = drawDue ? Math.max(3, 14 - drawMs) : 12;
+    let ticks = 0;
+    while (mainDebt >= SIM_DT - 1e-9 && performance.now() - t0 < budget) {
+      const slice = Math.min(mainDebt, SIM_SLICE);
+      api.hx_step_quiet(slice, state.cmd.fwd, state.cmd.turn);
+      mainDebt -= slice;
+      ticks += Math.round(slice / SIM_DT);
+    }
+    if (ticks) {
+      const sampleUs = ((performance.now() - t0) * 1000) / ticks;
+      state.stepUs += (sampleUs - state.stepUs) * 0.1;
+    }
   } else {
-    behind = false;
+    if (state.paused) mainDebt = 0;
   }
 
-  if (state.training) {
+  if (state.training && now - lastTrain >= 1000 / 30 - 1) {
+    lastTrain = now;
     const t0 = performance.now();
     api.hx_train(1);
     state.iterMs = performance.now() - t0;
     drawCurve();
     updateTrainingPanel();
-    const trained = telemetry();
+    const trained = mainTelemetry();
     if (trained[L.T_TRAINED] > 0.5 && state.mode !== 1) setMode(1);
   }
+
+  const drawSlot = 1000 / renderHz();
+  if (now - lastDraw < drawSlot - 1) return;
+  lastDraw = now;
+  if (!workerTelemetry) api.hx_publish();
 
   const t = telemetry();
   const d0 = performance.now();
@@ -1253,6 +1384,17 @@ function frame(now) {
   }
   drawGaitDiagram(t);
   drawMs += (performance.now() - d0 - drawMs) * 0.1;
+
+  if (!workerTelemetry) {
+    const elapsed = (now - lastRateWall) / 1000;
+    const simTime = t[L.T_TIME];
+    if (elapsed >= 0.2) {
+      const sample = simTime >= lastRateSim ? (simTime - lastRateSim) / elapsed : 0;
+      mainActualRate += (sample - mainActualRate) * 0.25;
+      lastRateWall = now;
+      lastRateSim = simTime;
+    }
+  }
 
   slowAcc += wall;
   if (slowAcc > 0.06) {
@@ -1272,6 +1414,16 @@ function updateReadouts(t) {
   $("hClock").textContent =
     `${String(Math.floor(secs / 60)).padStart(2, "0")}:${fmt(secs % 60, 1).padStart(4, "0")}` +
     (state.timeScale === 1 ? "" : ` · ${state.timeScale}×`);
+  const actual = state.paused ? 0 : workerTelemetry ? workerActualRate : mainActualRate;
+  const dropped = workerTelemetry ? workerDropped : mainDropped;
+  const actualEl = $("vRateActual");
+  if (actualEl) {
+    actualEl.textContent = `${actual.toFixed(1)}× actual`;
+    actualEl.dataset.backend = workerTelemetry ? "worker" : "local";
+    actualEl.title =
+      `${state.timeScale}× requested · ${actual.toFixed(2)}× measured` +
+      (dropped > 0.01 ? ` · ${dropped.toFixed(2)} simulated seconds dropped` : "");
+  }
   $("hCourse").textContent = courseName(state.courseKind);
   const hinges = Math.round(t[L.T_N_HINGES] || state.legs * 3);
   $("hSolver").textContent =
@@ -1435,7 +1587,9 @@ function updateReadouts(t) {
 }
 
 function updateTrainingPanel() {
-  const t = telemetry();
+  // Training runs synchronously in the UI's deterministic mirror; the worker
+  // receives the same command but may still be completing it on another core.
+  const t = mainTelemetry();
   const base = t[L.T_BASE_R];
   const best = t[L.T_BEST_R];
   $("sBase").textContent = fmt(base, 1);
@@ -1494,6 +1648,7 @@ function wire() {
 
   $("btnPause").addEventListener("click", () => {
     state.paused = !state.paused;
+    if (!state.paused) deterministicTelemetry = false;
     $("btnPause").dataset.on = String(state.paused);
     $("btnPause").textContent = state.paused ? "Resume" : "Pause";
     log(state.paused ? "sim.pause()" : "sim.resume()");
@@ -1728,9 +1883,12 @@ function syncCruiseLabels() {
 /* ------------------------------------------------------------------ boot */
 
 async function boot() {
-  const { instance } = await WebAssembly.instantiate(decodeBase64(window.HX_WASM_B64), {});
-  api = instance.exports;
-  api.hx_init(1);
+  const wasm = decodeBase64(window.HX_WASM_B64);
+  const { instance } = await WebAssembly.instantiate(wasm, {});
+  rawApi = instance.exports;
+  api = mirroredApi(rawApi);
+  rawApi.hx_init(1);
+  startWorker(wasm, 1);
 
   stage = new window.Stage($("view"));
   buildStaticUI();
@@ -1774,6 +1932,7 @@ async function boot() {
   // time. The smoke suite still verifies the animation loop separately; long
   // physics assertions use this to avoid sleeping through simulated seconds.
   window.__hxStepSamples = (count) => {
+    deterministicTelemetry = true;
     const n = Math.min(1200, Math.max(0, Math.floor(count)));
     let t = telemetry();
     let hull = { n: 0, span: Infinity };
@@ -1841,6 +2000,12 @@ async function boot() {
     for (let i = 0; i < n; i++) m = Math.max(m, Math.abs(r[i * 2]));
     return m;
   };
+  window.__hxPlayback = () => ({
+    requested: state.timeScale,
+    actual: workerTelemetry ? workerActualRate : mainActualRate,
+    worker: Boolean(workerTelemetry),
+    dropped: workerTelemetry ? workerDropped : mainDropped,
+  });
   window.__ready = true;
 
   log(`boot: wasm ready, ${state.legs * 3} DOF, analytic IK`);

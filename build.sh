@@ -3,6 +3,7 @@
 #
 #   ./build.sh            release build -> dist/hexapod-simulator.html
 #   ./build.sh --fast     dev build: no tests, no LTO, live-reload snippet
+#   ./build.sh --skip-tests  release build without the workspace test gate
 #
 # The wasm module is inlined as base64 and the telemetry offsets are generated
 # from the Rust source, so the output is self-contained and the two sides of
@@ -10,6 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+SKIP_TESTS=0
 if [ "${1:-}" = "--fast" ]; then
     PROFILE=dev-fast
     CARGO_FLAGS="--profile dev-fast --offline"
@@ -17,10 +19,11 @@ if [ "${1:-}" = "--fast" ]; then
 else
     PROFILE=release
     CARGO_FLAGS="--release --offline"
+    [ "${1:-}" = "--skip-tests" ] && SKIP_TESTS=1
 fi
 WASM=target/wasm32-unknown-unknown/$PROFILE/hexapod_wasm.wasm
 
-if [ -z "${HX_LIVE:-}" ]; then
+if [ -z "${HX_LIVE:-}" ] && [ "$SKIP_TESTS" -eq 0 ]; then
     # Rapier aborts the process when two of its worlds are stepped at once, so
     # anything that links it is excluded here and run single-threaded below.
     # hexapod-wasm is what drags the feature in: excluding it also keeps the
@@ -90,6 +93,7 @@ parts = [
     f"window.HX_SERVOS={json.dumps(servos, separators=(',', ':'))};\n"
     f"window.HX_PARTS={json.dumps(parts['parts'], separators=(',', ':'))};\n"
     f"window.HX_COURSES={json.dumps(courses, separators=(',', ':'))};\n"
+    f"window.HX_WORKER_SRC={json.dumps((web / 'sim-worker.js').read_text(encoding='utf-8'))};\n"
     f'window.HX_WASM_B64="{base64.b64encode(wasm).decode()}";\n'
     "</script>",
     # Each module is wrapped so the two inlined scripts cannot collide in the

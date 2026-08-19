@@ -46,6 +46,49 @@ const COL = {
 
 const LIGHT = norm([-0.35, -1.0, -0.28]);
 const NEAR = 0.35;
+const VERTEX_FLOATS = 7;
+
+/** Reusable, geometrically growing vertex storage. The stage emits many small
+ * faces, so retaining this memory avoids rebuilding large JS arrays and then
+ * copying them into fresh Float32Arrays every frame. */
+class VertexStream {
+  constructor(capacity = 16384) {
+    this.data = new Float32Array(capacity);
+    this.length = 0;
+  }
+
+  reset() {
+    this.length = 0;
+  }
+
+  _reserve(extra) {
+    const needed = this.length + extra;
+    if (needed <= this.data.length) return;
+    let capacity = this.data.length;
+    while (capacity < needed) capacity *= 2;
+    const grown = new Float32Array(capacity);
+    grown.set(this.data);
+    this.data = grown;
+  }
+
+  vertex(x, y, z, r, g, b, a) {
+    this._reserve(VERTEX_FLOATS);
+    const d = this.data;
+    let i = this.length;
+    d[i++] = x;
+    d[i++] = y;
+    d[i++] = z;
+    d[i++] = r;
+    d[i++] = g;
+    d[i++] = b;
+    d[i++] = a;
+    this.length = i;
+  }
+
+  view() {
+    return this.data.subarray(0, this.length);
+  }
+}
 
 function norm(v) {
   const l = Math.hypot(v[0], v[1], v[2]) || 1;
@@ -76,6 +119,13 @@ class Stage {
     this.faces = [];
     this.obstacles = new Float32Array(0);
     this.route = new Float32Array(0);
+    this._terrainCache = [];
+    this._hitOb = new Uint8Array(0);
+    this._hitLegs = new Uint8Array(0);
+    this._hitResult = { hitOb: this._hitOb, hitLegs: this._hitLegs, chassis: false };
+    this._triangles = new VertexStream(131072);
+    this._shadows = new VertexStream(8192);
+    this._edges = new VertexStream(131072);
     this.dpr = 1;
     this.showSupport = true;
     this.showTargets = true;
@@ -84,6 +134,18 @@ class Stage {
     this.orbit = { az: -0.62, el: 0.38, dist: 8.0 };
     this.onView = null;
     this.contact = { blocked: false, chassis: false, legs: 0, obstacles: 0 };
+    this._resizeDirty = true;
+    this._cssWidth = 0;
+    this._cssHeight = 0;
+    if (typeof ResizeObserver !== "undefined") {
+      this._resizeObserver = new ResizeObserver((entries) => {
+        const rect = entries[entries.length - 1].contentRect;
+        this._cssWidth = rect.width;
+        this._cssHeight = rect.height;
+        this._resizeDirty = true;
+      });
+      this._resizeObserver.observe(canvas);
+    }
     this._bindInput();
   }
 
@@ -122,10 +184,15 @@ class Stage {
   }
 
   resize() {
-    const r = this.cv.getBoundingClientRect();
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const w = Math.max(1, Math.round(r.width * dpr));
-    const h = Math.max(1, Math.round(r.height * dpr));
+    if (!this._resizeDirty && dpr === this.dpr) return;
+    if (!this._cssWidth || !this._cssHeight) {
+      const r = this.cv.getBoundingClientRect();
+      this._cssWidth = r.width;
+      this._cssHeight = r.height;
+    }
+    const w = Math.max(1, Math.round(this._cssWidth * dpr));
+    const h = Math.max(1, Math.round(this._cssHeight * dpr));
     if (this.cv.width !== w || this.cv.height !== h) {
       this.cv.width = w;
       this.cv.height = h;
@@ -133,11 +200,41 @@ class Stage {
     this.dpr = dpr;
     this.w = w;
     this.h = h;
+    this._resizeDirty = false;
   }
 
   setCourse(buf, route) {
     this.obstacles = buf;
     this.route = route || new Float32Array(0);
+    this._cacheTerrain();
+  }
+
+  /** Obstacles do not move between course changes. Build their tiled faces
+   * once instead of recreating every vertex and face on every rendered frame.
+   * A second face list preserves the collision highlight without mutation. */
+  _cacheTerrain() {
+    const savedFaces = this.faces;
+    const ob = this.obstacles;
+    this._terrainCache = [];
+    for (let i = 0; i + 4 < ob.length; i += 5) {
+      const x0 = ob[i];
+      const x1 = ob[i + 1];
+      const z0 = ob[i + 2];
+      const z1 = ob[i + 3];
+      const top = ob[i + 4];
+      const kind = this._kind(x0, x1, z0, z1, top);
+      const build = (hit) => {
+        this.faces = [];
+        const [side, cap] = this._palette(kind, hit);
+        if (top >= 0) this._box(x0, x1, 0, top, z0, z1, side, cap, false);
+        else this._box(x0, x1, top, 0, z0, z1, COL.pit, COL.pitFloor, true);
+        return this.faces;
+      };
+      const normal = build(false);
+      const hit = kind === "pit" || kind === "ice" ? normal : build(true);
+      this._terrainCache.push({ z0, z1, normal, hit });
+    }
+    this.faces = savedFaces;
   }
 
   /** `orbit` is free; `top` and `side` lock the camera until drag or a button. */
@@ -674,8 +771,12 @@ class Stage {
   _hits(pos, bodyR, joints, legs) {
     const ob = this.obstacles;
     const n = Math.floor(ob.length / 5);
-    const hitOb = new Uint8Array(n);
-    const hitLegs = new Uint8Array(legs);
+    if (this._hitOb.length !== n) this._hitOb = new Uint8Array(n);
+    else this._hitOb.fill(0);
+    if (this._hitLegs.length !== legs) this._hitLegs = new Uint8Array(legs);
+    else this._hitLegs.fill(0);
+    const hitOb = this._hitOb;
+    const hitLegs = this._hitLegs;
     const r = bodyR || 0.95;
     let chassis = false;
     for (let i = 0; i < n; i++) {
@@ -706,26 +807,18 @@ class Stage {
         }
       }
     }
-    return { hitOb, hitLegs, chassis };
+    this._hitResult.hitOb = hitOb;
+    this._hitResult.hitLegs = hitLegs;
+    this._hitResult.chassis = chassis;
+    return this._hitResult;
   }
 
   _terrain(zc, hitOb) {
-    const ob = this.obstacles;
-    for (let i = 0; i + 4 < ob.length; i += 5) {
-      const z0 = ob[i + 2];
-      const z1 = ob[i + 3];
-      if (z1 < zc - 14 || z0 > zc + 30) continue;
-      const x0 = ob[i];
-      const x1 = ob[i + 1];
-      const top = ob[i + 4];
-      const kind = this._kind(x0, x1, z0, z1, top);
-      const hit = hitOb && hitOb[i / 5];
-      const [side, cap] = this._palette(kind, hit);
-      if (top >= 0) {
-        this._box(x0, x1, 0, top, z0, z1, side, cap, false);
-      } else {
-        this._box(x0, x1, top, 0, z0, z1, COL.pit, COL.pitFloor, true);
-      }
+    for (let i = 0; i < this._terrainCache.length; i++) {
+      const entry = this._terrainCache[i];
+      if (entry.z1 < zc - 14 || entry.z0 > zc + 30) continue;
+      const faces = hitOb && hitOb[i] ? entry.hit : entry.normal;
+      for (let j = 0; j < faces.length; j++) this.faces.push(faces[j]);
     }
   }
 
@@ -881,11 +974,10 @@ class Stage {
     const lam = Math.max(0, -dot(n, LIGHT));
     const i = 0.56 + 0.44 * lam;
     const c = face.c;
-    return [
-      Math.round(Math.min(255, c[0] * i * 255)),
-      Math.round(Math.min(255, c[1] * i * 255)),
-      Math.round(Math.min(255, c[2] * i * 255)),
-    ];
+    const r = Math.round(Math.min(255, c[0] * i * 255));
+    const g = Math.round(Math.min(255, c[1] * i * 255));
+    const b = Math.round(Math.min(255, c[2] * i * 255));
+    return (r << 16) | (g << 8) | b;
   }
 
   _geometryContext() {
@@ -934,8 +1026,8 @@ class Stage {
       program,
       p: gl.getAttribLocation(program, "p"),
       c: gl.getAttribLocation(program, "c"),
-      pb: gl.createBuffer(),
-      cb: gl.createBuffer(),
+      vb: gl.createBuffer(),
+      vertexCapacity: 0,
     };
     return this.geo;
   }
@@ -958,7 +1050,7 @@ class Stage {
       if (!visible) continue;
       const poly = this._clipNear(vs);
       if (poly.length < 3) continue;
-      if (f.a) shadows.push({ poly, color: [20, 20, 24], a: f.a });
+      if (f.a) shadows.push({ poly, color: 0x141418, a: f.a });
       else items.push({ poly, color: this._shade(f) });
     }
 
@@ -977,6 +1069,9 @@ class Stage {
       tris.sort((a, b) => b.z - a.z);
       for (const it of tris) {
         const pts = it.poly.map((v) => this._project(v));
+        const r = (it.color >> 16) & 255;
+        const g = (it.color >> 8) & 255;
+        const b = it.color & 255;
         ctx.beginPath();
         ctx.moveTo(pts[0][0], pts[0][1]);
         ctx.lineTo(pts[1][0], pts[1][1]);
@@ -984,48 +1079,49 @@ class Stage {
         ctx.closePath();
         ctx.fillStyle =
           it.a < 1
-            ? `rgba(${it.color[0]},${it.color[1]},${it.color[2]},${it.a})`
-            : `rgb(${it.color[0]},${it.color[1]},${it.color[2]})`;
+            ? `rgba(${r},${g},${b},${it.a})`
+            : `rgb(${r},${g},${b})`;
         ctx.fill();
       }
       return;
     }
 
-    const triP = [];
-    const triC = [];
-    const shP = [];
-    const shC = [];
-    const lineP = [];
-    const lineC = [];
-    const vertex = (v, out, edge = false) => {
-      const p = this._project(v);
-      out.push(
-        (p[0] / this.w) * 2 - 1,
-        1 - (p[1] / this.h) * 2,
-        1 - (2 * NEAR) / v[2] - (edge ? 0.00035 : 0)
+    const triangles = this._triangles;
+    const shadowsBuf = this._shadows;
+    const edges = this._edges;
+    triangles.reset();
+    shadowsBuf.reset();
+    edges.reset();
+    const vertex = (v, out, rgb, alpha = 1, edge = false) => {
+      const scale = this.focal / v[2];
+      const px = this.cx + v[0] * scale;
+      const py = this.cy - v[1] * scale;
+      out.vertex(
+        (px / this.w) * 2 - 1,
+        1 - (py / this.h) * 2,
+        1 - (2 * NEAR) / v[2] - (edge ? 0.00035 : 0),
+        (((rgb >> 16) & 255) / 255) * alpha,
+        (((rgb >> 8) & 255) / 255) * alpha,
+        ((rgb & 255) / 255) * alpha,
+        alpha
       );
     };
-    const color = (c, out, alpha = 1) =>
-      out.push((c[0] / 255) * alpha, (c[1] / 255) * alpha, (c[2] / 255) * alpha, alpha);
-    const fan = (it, pos, col, alpha) => {
+    const fan = (it, out, alpha) => {
       for (let i = 1; i + 1 < it.poly.length; i++) {
-        for (const v of [it.poly[0], it.poly[i], it.poly[i + 1]]) {
-          vertex(v, pos);
-          color(it.color, col, alpha);
-        }
+        vertex(it.poly[0], out, it.color, alpha);
+        vertex(it.poly[i], out, it.color, alpha);
+        vertex(it.poly[i + 1], out, it.color, alpha);
       }
     };
     for (const it of items) {
-      fan(it, triP, triC, 1);
+      fan(it, triangles, 1);
       for (let i = 0; i < it.poly.length; i++) {
         const j = (i + 1) % it.poly.length;
-        vertex(it.poly[i], lineP, true);
-        vertex(it.poly[j], lineP, true);
-        color([24, 24, 26], lineC, 0.34);
-        color([24, 24, 26], lineC, 0.34);
+        vertex(it.poly[i], edges, 0x18181a, 0.34, true);
+        vertex(it.poly[j], edges, 0x18181a, 0.34, true);
       }
     }
-    for (const it of shadows) fan(it, shP, shC, it.a);
+    for (const it of shadows) fan(it, shadowsBuf, it.a);
 
     const { canvas, gl, program } = geo;
     if (canvas.width !== this.w || canvas.height !== this.h) {
@@ -1041,30 +1137,41 @@ class Stage {
     gl.depthFunc(gl.LEQUAL);
     gl.disable(gl.BLEND);
 
-    const upload = (buffer, attr, values, size) => {
-      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(values), gl.DYNAMIC_DRAW);
-      gl.enableVertexAttribArray(attr);
-      gl.vertexAttribPointer(attr, size, gl.FLOAT, false, 0, 0);
-    };
-    upload(geo.pb, geo.p, triP, 3);
-    upload(geo.cb, geo.c, triC, 4);
+    const triangleCount = triangles.length / VERTEX_FLOATS;
+    const shadowStart = triangleCount;
+    const shadowCount = shadowsBuf.length / VERTEX_FLOATS;
+    const edgeStart = shadowStart + shadowCount;
+    const edgeCount = edges.length / VERTEX_FLOATS;
+    const totalFloats = triangles.length + shadowsBuf.length + edges.length;
+    gl.bindBuffer(gl.ARRAY_BUFFER, geo.vb);
+    if (totalFloats > geo.vertexCapacity) {
+      geo.vertexCapacity = Math.max(totalFloats, geo.vertexCapacity ? geo.vertexCapacity * 2 : 16384);
+      gl.bufferData(gl.ARRAY_BUFFER, geo.vertexCapacity * Float32Array.BYTES_PER_ELEMENT, gl.DYNAMIC_DRAW);
+    }
+    let floatOffset = 0;
+    if (triangles.length) {
+      gl.bufferSubData(gl.ARRAY_BUFFER, floatOffset * Float32Array.BYTES_PER_ELEMENT, triangles.view());
+      floatOffset += triangles.length;
+    }
+    if (shadowsBuf.length) {
+      gl.bufferSubData(gl.ARRAY_BUFFER, floatOffset * Float32Array.BYTES_PER_ELEMENT, shadowsBuf.view());
+      floatOffset += shadowsBuf.length;
+    }
+    if (edges.length) gl.bufferSubData(gl.ARRAY_BUFFER, floatOffset * Float32Array.BYTES_PER_ELEMENT, edges.view());
+    const stride = VERTEX_FLOATS * Float32Array.BYTES_PER_ELEMENT;
+    gl.enableVertexAttribArray(geo.p);
+    gl.vertexAttribPointer(geo.p, 3, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(geo.c);
+    gl.vertexAttribPointer(geo.c, 4, gl.FLOAT, false, stride, 3 * Float32Array.BYTES_PER_ELEMENT);
     gl.depthMask(true);
-    gl.drawArrays(gl.TRIANGLES, 0, triP.length / 3);
+    gl.drawArrays(gl.TRIANGLES, 0, triangleCount);
 
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
-    if (shP.length) {
-      upload(geo.pb, geo.p, shP, 3);
-      upload(geo.cb, geo.c, shC, 4);
-      gl.drawArrays(gl.TRIANGLES, 0, shP.length / 3);
-    }
-    upload(geo.pb, geo.p, lineP, 3);
-    upload(geo.cb, geo.c, lineC, 4);
-    gl.drawArrays(gl.LINES, 0, lineP.length / 3);
+    if (shadowCount) gl.drawArrays(gl.TRIANGLES, shadowStart, shadowCount);
+    if (edgeCount) gl.drawArrays(gl.LINES, edgeStart, edgeCount);
     gl.depthMask(true);
-    gl.flush();
   }
 
   /** Light-ray hit on the highest obstacle top at that xz, else the floor. */
@@ -1150,12 +1257,10 @@ class Stage {
     for (let i = 0; i < hits.hitLegs.length; i++) if (hits.hitLegs[i]) nLegsHit++;
     let nOb = 0;
     for (let i = 0; i < hits.hitOb.length; i++) if (hits.hitOb[i]) nOb++;
-    this.contact = {
-      blocked,
-      chassis: hits.chassis,
-      legs: nLegsHit,
-      obstacles: nOb,
-    };
+    this.contact.blocked = blocked;
+    this.contact.chassis = hits.chassis;
+    this.contact.legs = nLegsHit;
+    this.contact.obstacles = nOb;
     this._terrain(pos[2], hits.hitOb);
     this._chassis(pos, t[L.T_YAW], t[L.T_PITCH], t[L.T_ROLL], bodyR, blocked || hits.chassis);
     const swinging = L.T_MOVE_PHASE != null && t[L.T_MOVE_PHASE] >= 1 && t[L.T_MOVE_PHASE] <= 3;

@@ -136,7 +136,9 @@ fn make(seed: u64) -> App {
         oneleg: None,
         oneleg_leg: 0,
         locks: hexapod_core::walker::StanceLocks::new(),
-        mode: MODE_BASELINE,
+        // The dashboard is a leg-placement lab first: boot into the empty-field
+        // drill and require an explicit Walk action before running the course.
+        mode: MODE_ONELEG,
         since_fall: 0.0,
         acc: 0.0,
         build,
@@ -164,6 +166,7 @@ fn make(seed: u64) -> App {
 pub extern "C" fn hx_init(seed: u32) {
     unsafe { APP = Some(make(seed as u64)) };
     app().reset_live();
+    app().publish();
 }
 
 #[unsafe(no_mangle)]
@@ -1260,6 +1263,13 @@ mod tests {
             dest_wander < 0.01,
             "landing mark crawled during the swing: {dest_wander}"
         );
+    }
+
+    #[test]
+    fn initialization_defaults_to_the_oneleg_drill() {
+        hx_init(1);
+        assert!(tel()[T_ONELEG] > 0.5, "T_ONELEG={}", tel()[T_ONELEG]);
+        assert_eq!(tel()[T_MODE], MODE_ONELEG as f32);
     }
 
     #[test]
