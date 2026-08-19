@@ -21,11 +21,19 @@ fi
 WASM=target/wasm32-unknown-unknown/$PROFILE/hexapod_wasm.wasm
 
 if [ -z "${HX_LIVE:-}" ]; then
+    # Rapier aborts the process when two of its worlds are stepped at once, so
+    # anything that links it is excluded here and run single-threaded below.
+    # hexapod-wasm is what drags the feature in: excluding it also keeps the
+    # workspace pass from unifying `rapier` onto hexapod-core.
     echo "==> cargo test"
-    cargo test $CARGO_FLAGS -q 2>&1 | tail -5 || cargo test --offline -q
+    cargo test $CARGO_FLAGS -q --workspace --exclude hexapod-wasm 2>&1 | tail -5 \
+      || cargo test --offline -q --workspace --exclude hexapod-wasm
     echo "==> cargo test (rapier plant)"
     cargo test $CARGO_FLAGS -q -p hexapod-core --features rapier -- --test-threads=1 2>&1 | tail -8 \
       || cargo test --offline -q -p hexapod-core --features rapier -- --test-threads=1
+    echo "==> cargo test (wasm bridge, rapier)"
+    cargo test $CARGO_FLAGS -q -p hexapod-wasm -- --test-threads=1 2>&1 | tail -8 \
+      || cargo test --offline -q -p hexapod-wasm -- --test-threads=1
 fi
 
 echo "==> building wasm"
