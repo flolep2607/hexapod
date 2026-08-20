@@ -128,6 +128,9 @@ pub struct SacConfig {
     /// is too broad in an 18-joint controller; a safe local Gaussian starts
     /// near -2.5 nats per joint.
     pub target_entropy_per_action: f64,
+    /// Quadratic actor prior in normalized action space. This prevents the
+    /// policy from exploiting critic estimates far outside replay support.
+    pub action_prior_cost: f64,
 }
 
 impl Default for SacConfig {
@@ -139,9 +142,10 @@ impl Default for SacConfig {
             actor_lr: 3.0e-5,
             critic_lr: 3.0e-4,
             alpha_lr: 3.0e-4,
-            reward_scale: 25.0,
+            reward_scale: 5.0,
             initial_alpha: 0.001,
             target_entropy_per_action: -2.5,
+            action_prior_cost: 1.0,
         }
     }
 }
@@ -337,7 +341,13 @@ impl SacAgent {
             let actor_loss = log_probability
                 .broadcast_mul(&alpha.detach())?
                 .sub(&policy_q)?
-                .mean_all()?;
+                .mean_all()?
+                .add(
+                    &policy_actions
+                        .sqr()?
+                        .mean_all()?
+                        .affine(self.config.action_prior_cost, 0.0)?,
+                )?;
             let actor_loss_value = actor_loss.to_vec0::<f32>()?;
             self.actor_optim.backward_step(&actor_loss)?;
 
@@ -602,6 +612,7 @@ mod tests {
                 actor_lr: 3.0e-4,
                 initial_alpha: 0.01,
                 target_entropy_per_action: -1.0,
+                action_prior_cost: 0.0,
                 ..SacConfig::default()
             },
             7,

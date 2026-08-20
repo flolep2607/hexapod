@@ -29,6 +29,11 @@ struct TrainConfig {
     eval_episodes: usize,
     seed: u64,
     hidden: usize,
+    actor_lr: f64,
+    reward_scale: f64,
+    initial_alpha: f64,
+    target_entropy_per_action: f64,
+    action_prior_cost: f64,
     device: String,
     out: PathBuf,
     eval: Option<PathBuf>,
@@ -55,6 +60,11 @@ impl TrainConfig {
             eval_episodes: parse(&args, "--eval-episodes", 8)?,
             seed: parse(&args, "--seed", 1)?,
             hidden: parse(&args, "--hidden", 256)?,
+            actor_lr: parse(&args, "--actor-lr", 3.0e-5)?,
+            reward_scale: parse(&args, "--reward-scale", 5.0)?,
+            initial_alpha: parse(&args, "--initial-alpha", 0.001)?,
+            target_entropy_per_action: parse(&args, "--target-entropy-per-action", -2.5)?,
+            action_prior_cost: parse(&args, "--action-prior-cost", 1.0)?,
             device: value(&args, "--device").unwrap_or_else(|| "cpu".into()),
             out: PathBuf::from(
                 value(&args, "--out")
@@ -88,6 +98,21 @@ impl TrainConfig {
             || !(0.0..=1.0).contains(&self.warmup_hold_fraction)
         {
             return Err("--warmup-hold-fraction must be between zero and one".into());
+        }
+        if !self.actor_lr.is_finite() || self.actor_lr <= 0.0 {
+            return Err("--actor-lr must be finite and positive".into());
+        }
+        if !self.reward_scale.is_finite() || self.reward_scale <= 0.0 {
+            return Err("--reward-scale must be finite and positive".into());
+        }
+        if !self.initial_alpha.is_finite() || self.initial_alpha <= 0.0 {
+            return Err("--initial-alpha must be finite and positive".into());
+        }
+        if !self.target_entropy_per_action.is_finite() {
+            return Err("--target-entropy-per-action must be finite".into());
+        }
+        if !self.action_prior_cost.is_finite() || self.action_prior_cost < 0.0 {
+            return Err("--action-prior-cost must be finite and non-negative".into());
         }
         Ok(())
     }
@@ -133,6 +158,11 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         &device,
         SacConfig {
             hidden: config.hidden,
+            actor_lr: config.actor_lr,
+            reward_scale: config.reward_scale,
+            initial_alpha: config.initial_alpha,
+            target_entropy_per_action: config.target_entropy_per_action,
+            action_prior_cost: config.action_prior_cost,
             ..SacConfig::default()
         },
         config.seed,
@@ -406,13 +436,18 @@ fn save_checkpoint(
     }
     agent.save_actor(&config.out)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
         evaluation.score,
         evaluation.distance,
         config.seed,
         normalizer.mean.len(),
         n_act(Frame::new(6)),
         config.hidden,
+        config.actor_lr,
+        config.reward_scale,
+        config.initial_alpha,
+        config.target_entropy_per_action,
+        config.action_prior_cost,
         config.warmup_action_std,
         config.warmup_hold_fraction,
         config.policy_warmup_updates,
@@ -507,6 +542,11 @@ fn print_help() {
          --eval-interval N    held-out evaluation cadence (default 10000)\n\
          --eval-episodes N    held-out episodes (default 8)\n\
          --hidden N           units in each actor/critic layer (default 256)\n\
+         --actor-lr X         actor learning rate (default 3e-5)\n\
+         --reward-scale X     Bellman reward scale (default 5)\n\
+         --initial-alpha X    initial entropy coefficient (default 0.001)\n\
+         --target-entropy-per-action X entropy target per joint (default -2.5)\n\
+         --action-prior-cost X normalized quadratic actor prior (default 1)\n\
          --device cpu|cuda:N  tensor device (CUDA requires --features cuda)\n\
          --seed N             deterministic run seed\n\
          --out PATH           best actor safetensors checkpoint\n\
