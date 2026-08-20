@@ -165,6 +165,7 @@ pub struct SacAgent {
     device: Device,
     config: SacConfig,
     actor: Actor,
+    actor_prior: Option<Actor>,
     critic: TwinCritic,
     target: TwinCritic,
     actor_vars: VarMap,
@@ -209,6 +210,7 @@ impl SacAgent {
         deterministic_init(&actor_vars, seed, device)?;
         initialize_actor_output(&actor_vars, actions, device)?;
         deterministic_init(&critic_vars, seed ^ 0xA5A5_A5A5_A5A5_A5A5, device)?;
+        initialize_critic_outputs(&critic_vars, device)?;
         copy_parameters(&critic_vars, &target_vars, 1.0)?;
 
         let log_alpha = Var::from_tensor(&Tensor::new(config.initial_alpha.ln() as f32, device)?)?;
@@ -222,6 +224,7 @@ impl SacAgent {
             device: device.clone(),
             config,
             actor,
+            actor_prior: None,
             critic,
             target,
             actor_vars,
@@ -338,16 +341,18 @@ impl SacAgent {
                 self.actor.sample(&observations, &actor_epsilon)?;
             let (policy_q1, policy_q2) = self.critic.forward(&observations, &policy_actions)?;
             let policy_q = policy_q1.minimum(&policy_q2)?;
+            let prior_loss = if let Some(prior) = &self.actor_prior {
+                let policy_mean = self.actor.deterministic(&observations)?;
+                let prior_mean = prior.deterministic(&observations)?.detach();
+                policy_mean.sub(&prior_mean)?.sqr()?.mean_all()?
+            } else {
+                policy_actions.sqr()?.mean_all()?
+            };
             let actor_loss = log_probability
                 .broadcast_mul(&alpha.detach())?
                 .sub(&policy_q)?
                 .mean_all()?
-                .add(
-                    &policy_actions
-                        .sqr()?
-                        .mean_all()?
-                        .affine(self.config.action_prior_cost, 0.0)?,
-                )?;
+                .add(&prior_loss.affine(self.config.action_prior_cost, 0.0)?)?;
             let actor_loss_value = actor_loss.to_vec0::<f32>()?;
             self.actor_optim.backward_step(&actor_loss)?;
 
@@ -388,6 +393,22 @@ impl SacAgent {
 
     pub fn load_actor<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
         self.actor_vars.load(path)
+    }
+
+    /// Freeze the current deterministic policy as the quadratic fine-tuning
+    /// prior. This keeps a useful initialized gait in-distribution while fresh
+    /// critics learn its value; the live actor remains independently trainable.
+    pub fn freeze_actor_prior(&mut self) -> Result<()> {
+        let vars = VarMap::new();
+        let actor = Actor::new(
+            self.observations,
+            self.actions,
+            self.config.hidden,
+            VarBuilder::from_varmap(&vars, DType::F32, &self.device),
+        )?;
+        copy_parameters(&self.actor_vars, &vars, 1.0)?;
+        self.actor_prior = Some(actor);
+        Ok(())
     }
 }
 
@@ -471,6 +492,22 @@ fn initialize_actor_output(vars: &VarMap, actions: usize, device: &Device) -> Re
     Ok(())
 }
 
+fn initialize_critic_outputs(vars: &VarMap, device: &Device) -> Result<()> {
+    let data = vars.data().lock().expect("critic variable map poisoned");
+    for name in [
+        "q1.out.weight",
+        "q1.out.bias",
+        "q2.out.weight",
+        "q2.out.bias",
+    ] {
+        let variable = data
+            .get(name)
+            .ok_or_else(|| candle_core::Error::Msg(format!("critic is missing {name}")))?;
+        variable.set(&Tensor::zeros(variable.shape(), DType::F32, device)?)?;
+    }
+    Ok(())
+}
+
 fn copy_parameters(source: &VarMap, target: &VarMap, tau: f64) -> Result<()> {
     let source = source
         .data()
@@ -527,6 +564,19 @@ mod tests {
             .action(&[4.0, -2.0, 0.7], &norm, false, &mut rng)
             .expect("action");
         assert_eq!(action, vec![0.0; 2]);
+    }
+
+    #[test]
+    fn critics_start_at_a_neutral_zero_value() {
+        let agent = SacAgent::new(3, 2, &Device::Cpu, SacConfig::default(), 46).expect("agent");
+        let observations = Tensor::zeros((4, 3), DType::F32, &Device::Cpu).expect("observations");
+        let actions = Tensor::zeros((4, 2), DType::F32, &Device::Cpu).expect("actions");
+        let (q1, q2) = agent
+            .critic
+            .forward(&observations, &actions)
+            .expect("critic forward");
+        assert_eq!(q1.to_vec1::<f32>().expect("q1 values"), vec![0.0; 4]);
+        assert_eq!(q2.to_vec1::<f32>().expect("q2 values"), vec![0.0; 4]);
     }
 
     #[test]
@@ -596,6 +646,67 @@ mod tests {
             .expect("action after");
         assert_eq!(after, before);
         assert_eq!(agent.alpha().expect("alpha after"), alpha_before);
+    }
+
+    #[test]
+    fn fine_tuning_prior_is_an_independent_frozen_actor() {
+        let norm = ObsNorm::new(3);
+        let mut rng = Rng::new(16);
+        let mut agent = SacAgent::new(
+            3,
+            2,
+            &Device::Cpu,
+            SacConfig {
+                hidden: 16,
+                action_prior_cost: 0.5,
+                ..SacConfig::default()
+            },
+            19,
+        )
+        .expect("agent");
+        agent.freeze_actor_prior().expect("freeze prior");
+        let observations = Tensor::new(&[[0.3f32, -0.2, 0.8]], &Device::Cpu).expect("observations");
+        let prior_before = agent
+            .actor_prior
+            .as_ref()
+            .expect("prior")
+            .deterministic(&observations)
+            .expect("prior action")
+            .flatten_all()
+            .expect("flat prior")
+            .to_vec1::<f32>()
+            .expect("prior values");
+
+        let mut replay = JointReplay::new(32, 3, 2).expect("replay");
+        for i in 0..32 {
+            let value = i as f64 / 31.0;
+            replay
+                .push(
+                    &[value, -value, 0.5],
+                    &[0.2, -0.1],
+                    value,
+                    &[value + 0.01, -value, 0.5],
+                    true,
+                    false,
+                )
+                .expect("transition");
+        }
+        let batch = replay.sample(16, &mut rng).expect("batch");
+        agent
+            .update(&batch, &norm, &mut rng, true)
+            .expect("policy update");
+
+        let prior_after = agent
+            .actor_prior
+            .as_ref()
+            .expect("prior")
+            .deterministic(&observations)
+            .expect("prior action")
+            .flatten_all()
+            .expect("flat prior")
+            .to_vec1::<f32>()
+            .expect("prior values");
+        assert_eq!(prior_after, prior_before);
     }
 
     #[test]

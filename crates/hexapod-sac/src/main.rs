@@ -183,6 +183,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     )?;
     if let Some(path) = &config.init {
         agent.load_actor(path)?;
+        agent.freeze_actor_prior()?;
     }
 
     let started = Instant::now();
@@ -285,7 +286,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                     .iter()
                     .map(|value| *value as f64)
                     .collect::<Vec<_>>(),
-                step.reward,
+                step.learning_reward,
                 &step.observation,
                 step.terminated,
                 step.truncated,

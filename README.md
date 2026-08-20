@@ -105,7 +105,9 @@ The learner uses twin critics and target networks, tanh-corrected stochastic
 actions, automatic entropy tuning, normalized observations, scaled rewards,
 large minibatches, and held-out deterministic evaluation. True episode endings
 are stored separately from time-limit truncation so Bellman targets bootstrap
-only when they should.
+only when they should. Critics learn from the local posture/support/speed
+signal; checkpoint selection and curriculum promotion still use the stricter
+net-progress episode score.
 
 The tensor implementation is Candle 0.11. CPU is the dependency-light default;
 the `cuda` feature moves batched actor and critic work to NVIDIA GPUs. Nexus and
@@ -123,8 +125,9 @@ observation normalizer and run configuration.
 
 `--init` starts a new off-policy fine-tuning run from a saved actor. It freezes
 the checkpoint's observation normalizer, gathers the initial replay with that
-actor, bootstraps fresh critics before policy updates, and saves the loaded
-baseline before training. Optimizer and replay state are not resumed.
+actor, uses a frozen copy of the actor as the fine-tuning prior, bootstraps
+fresh critics before policy updates, and saves the loaded baseline before
+training. Optimizer and replay state are not resumed.
 
 Joint checkpoints use `hexapod-joint-v1` and cannot be loaded as the browser's
 gait-level `hexapod-policy-v1`. Continue one with `--resume`; because training

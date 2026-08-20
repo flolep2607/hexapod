@@ -550,14 +550,15 @@ struct TickState {
 ///
 /// A decision advances [`DECIMATION`] physics ticks unless the episode ends
 /// first. `reward` is the change in the episode score, so summing transition
-/// rewards reproduces [`JointRollout::score`] exactly. That keeps replay
-/// targets on a small, stable scale and preserves the ordered-waypoint and
-/// finish bonuses instead of teaching from a different objective than the one
-/// used for evaluation.
+/// rewards reproduces [`JointRollout::score`] exactly. `learning_reward` is the
+/// local control signal intended for a value learner; strict episode scoring
+/// remains authoritative for evaluation and curriculum promotion.
 #[derive(Clone, Debug)]
 pub struct JointStep {
     pub observation: Vec<f64>,
     pub reward: f64,
+    /// Dense control reward without history-dependent episode gates.
+    pub learning_reward: f64,
     pub terminated: bool,
     pub truncated: bool,
 }
@@ -998,6 +999,7 @@ impl JointEnv {
 
         let score_before = self.summary().score;
         let n = self.frame.legs();
+        let mut learning_reward = 0.0;
         for _ in 0..DECIMATION {
             let tick = self.refresh_observation();
             if self.is_done() {
@@ -1046,7 +1048,9 @@ impl JointEnv {
                 self.route.bearing,
             );
             let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
-            self.total += (shaped - SMOOTH_COST * churn).max(0.0);
+            let learning_tick = (shaped - SMOOTH_COST * churn).max(0.0);
+            self.total += learning_tick;
+            learning_reward += learning_tick * DT / self.stage.horizon().max(1e-6);
             self.steps += 1;
             self.clock += DT / 0.5;
             if self.steps >= self.max_ticks {
@@ -1058,6 +1062,7 @@ impl JointEnv {
         Ok(JointStep {
             observation: self.observation.clone(),
             reward: score_after - score_before,
+            learning_reward,
             terminated: self.terminated(),
             truncated: self.truncated(),
         })
@@ -1076,7 +1081,11 @@ impl JointEnv {
         let completed = self.route.finished && self.route.reached == route_len;
         let base_score = self.total * DT / self.stage.horizon().max(1e-6);
         let mean_support = if self.steps == 0 {
-            0.0
+            // The environment is constructed from a warmed standing plant.
+            // Treating its pre-step support as zero made locomotion episodes
+            // start at -SUPPORT_DEFICIT_COST, so transition rewards no longer
+            // telescoped to the reported episode score.
+            self.frame.legs() as f64
         } else {
             self.support_sum / self.steps as f64
         };
@@ -2719,6 +2728,7 @@ mod tests {
         let initial = env.state().to_vec();
         let mut action = vec![0.0; n_act(frame)];
         let mut reward_sum = 0.0;
+        let mut learning_reward_sum = 0.0;
         let mut final_step = None;
 
         while !env.is_done() {
@@ -2728,6 +2738,8 @@ mod tests {
             let step = env.step(&action).expect("valid joint action");
             assert_eq!(step.observation.len(), n_obs(frame));
             reward_sum += step.reward;
+            assert!(step.learning_reward >= 0.0);
+            learning_reward_sum += step.learning_reward;
             final_step = Some(step);
         }
 
@@ -2736,6 +2748,7 @@ mod tests {
         assert!(final_step.truncated);
         assert!(!final_step.terminated);
         assert!((reward_sum - actual.score).abs() < 1e-12);
+        assert!((learning_reward_sum - actual.score).abs() < 1e-12);
         assert_eq!(actual.score.to_bits(), expected.score.to_bits());
         assert_eq!(actual.distance.to_bits(), expected.distance.to_bits());
         assert_eq!(actual.secs.to_bits(), expected.secs.to_bits());
@@ -2747,6 +2760,34 @@ mod tests {
         for (a, b) in reset.iter().zip(initial) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    #[test]
+    fn value_learning_gets_a_dense_signal_before_net_progress_is_earned() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 17);
+        let mut env = JointEnv::new(frame, &phys, terrain, Stage::WalkFlat);
+        let action = vec![0.0; n_act(frame)];
+        let mut exact_reward = 0.0;
+        let mut learning_reward = 0.0;
+
+        while !env.is_done() {
+            let step = env.step(&action).expect("valid standing action");
+            exact_reward += step.reward;
+            learning_reward += step.learning_reward;
+        }
+
+        let rollout = env.summary();
+        assert!((exact_reward - rollout.score).abs() < 1e-12);
+        assert!(
+            learning_reward > exact_reward + 0.05,
+            "dense reward {learning_reward:.3} did not guide beyond exact score {exact_reward:.3}"
+        );
+        assert!(
+            rollout.distance < 0.25 * Stage::WalkFlat.speed() * Stage::WalkFlat.horizon(),
+            "standing unexpectedly earned the full net-progress gate"
+        );
     }
 
     #[test]
