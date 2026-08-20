@@ -559,7 +559,8 @@ struct TickState {
 pub struct JointStep {
     pub observation: Vec<f64>,
     pub reward: f64,
-    /// Dense control reward without history-dependent episode gates.
+    /// Dense control reward without history-dependent episode gates. It can be
+    /// negative when the local support estimate falls below a usable gait.
     pub learning_reward: f64,
     pub terminated: bool,
     pub truncated: bool,
@@ -874,6 +875,18 @@ impl JointEnv {
         &self.observation
     }
 
+    /// Change the commanded forward speed without resetting physical state.
+    /// This is an exogenous observation update used by speed curricula.
+    pub fn set_command(&mut self, speed: f64) -> Result<&[f64], String> {
+        if !speed.is_finite() || speed < 0.0 {
+            return Err("joint command speed must be finite and non-negative".into());
+        }
+        self.cmd = speed;
+        let tick = self.sample();
+        self.fill_observation(&tick);
+        Ok(&self.observation)
+    }
+
     pub fn is_done(&self) -> bool {
         self.terminated() || self.truncated()
     }
@@ -1060,9 +1073,11 @@ impl JointEnv {
                 self.route.bearing,
             );
             let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
-            let learning_tick = (shaped - SMOOTH_COST * churn).max(0.0);
-            self.total += learning_tick;
-            learning_reward += learning_tick * DT / self.stage.horizon().max(1e-6);
+            let scored_tick = (shaped - SMOOTH_COST * churn).max(0.0);
+            self.total += scored_tick;
+            let local_support_cost = SUPPORT_DEFICIT_COST * (1.0 - support_gate(self.duty, n));
+            learning_reward +=
+                (scored_tick - local_support_cost) * DT / self.stage.horizon().max(1e-6);
             self.steps += 1;
             self.clock += DT / 0.5;
             if self.steps >= self.max_ticks {
@@ -1469,12 +1484,16 @@ fn episode_score(
     // but it is not a usable hexapod gait. Penalise the whole episode by mean
     // contact, reaching full credit at roughly two feet on a hexapod. Squaring
     // keeps a brief flight phase affordable and makes sustained hopping steep.
-    let support_target = (0.35 * legs as f64).max(1.0);
-    let support_gate = clamp(support / support_target, 0.0, 1.0).powi(2);
+    let support_gate = support_gate(support, legs);
     base_score * progress_gate * support_gate
         + 0.35 * waypoint_fraction
         + f64::from(u8::from(completed))
         - SUPPORT_DEFICIT_COST * (1.0 - support_gate)
+}
+
+fn support_gate(support: f64, legs: usize) -> f64 {
+    let target = (0.35 * legs as f64).max(1.0);
+    clamp(support / target, 0.0, 1.0).powi(2)
 }
 
 /// Per-tick reward. Bounded above by roughly 1.0 so a stage's score is
@@ -2667,6 +2686,25 @@ mod tests {
         assert!(reset[setpoint_start..].iter().all(|value| *value == 0.0));
     }
 
+    #[test]
+    fn speed_curriculum_updates_the_command_observation_without_stepping() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut env = JointEnv::new(frame, &phys, terrain, Stage::RunFlat);
+        let command_index = 7 * frame.legs() + 11;
+        let before = env.summary();
+        assert_eq!(env.state()[command_index], Stage::RunFlat.speed());
+
+        let state = env.set_command(0.8).expect("valid curriculum speed");
+        assert_eq!(state[command_index], 0.8);
+        let after = env.summary();
+        assert_eq!(after.secs.to_bits(), before.secs.to_bits());
+        assert_eq!(after.distance.to_bits(), before.distance.to_bits());
+        assert!(env.set_command(f64::NAN).is_err());
+        assert!(env.set_command(-0.1).is_err());
+    }
+
     /// The seeded policy holds the machine up on flat ground. This is the
     /// baseline every later stage builds on, and it is also the check that the
     /// plant's motors can carry the chassis at all.
@@ -2840,6 +2878,15 @@ mod tests {
             rollout.distance < 0.25 * Stage::WalkFlat.speed() * Stage::WalkFlat.horizon(),
             "standing unexpectedly earned the full net-progress gate"
         );
+    }
+
+    #[test]
+    fn dense_support_cost_separates_a_tripod_gait_from_a_projectile() {
+        assert_eq!(support_gate(3.0, 6), 1.0);
+        assert!(support_gate(2.0, 6) > 0.8);
+        assert!(support_gate(0.5, 6) < 0.1);
+        let projectile_cost = SUPPORT_DEFICIT_COST * (1.0 - support_gate(0.5, 6));
+        assert!(projectile_cost > 0.9 * SUPPORT_DEFICIT_COST);
     }
 
     #[test]

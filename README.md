@@ -36,7 +36,7 @@ cargo run --release -p hexapod-sac -- --eval checkpoints/joint-sac-walk-v1.safet
 # Fine-tune a useful actor without restarting its gait or observation scale.
 cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --init checkpoints/joint-sac-walk-v1.safetensors --out checkpoints/joint-sac-walk-finetuned-v1.safetensors
 # Train the next flat-ground curriculum objective explicitly.
-cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --stage run-flat --steps 500000 --out checkpoints/joint-sac-run-v1.safetensors
+cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --stage run-flat --start-speed 0.8 --speed-ramp-steps 300000 --steps 500000 --out checkpoints/joint-sac-run-v1.safetensors
 
 # Experimental Nexus 0.5 native-GPU batch path.
 cargo run --release -p hexapod-cli -- joint-train --backend nexus-gpu --batch-envs 128 --iters 20 --out joint-gpu.txt
@@ -108,9 +108,10 @@ actions, automatic entropy tuning, normalized observations, scaled rewards,
 large minibatches, and held-out deterministic evaluation. True episode endings
 are stored separately from time-limit truncation so Bellman targets bootstrap
 only when they should. Critics learn from the local posture/support/speed
-signal; checkpoint selection and curriculum promotion still use the stricter
-net-progress episode score. Observations include the executed joint setpoints,
-so actuator slew does not hide controller state from the actor or critics.
+signal, including an immediate support-deficit cost; checkpoint selection and
+curriculum promotion still use the stricter net-progress episode score.
+Observations include the executed joint setpoints, so actuator slew does not
+hide controller state from the actor or critics.
 
 The tensor implementation is Candle 0.11. CPU is the dependency-light default;
 the `cuda` feature moves batched actor and critic work to NVIDIA GPUs. Nexus and
@@ -125,6 +126,11 @@ after held-out walking evaluation crosses its score gate; harder terrain is
 never trained merely because a fixed iteration budget expired. The best actor
 is saved as safetensors with a `.meta` file containing its stage, exact
 observation normalizer, and run configuration.
+
+For `RUN-FLAT`, `--start-speed 0.8 --speed-ramp-steps N` raises the training
+command linearly to 2.0 m/s while evaluation always uses the full stage target.
+Replay, and observation statistics for fresh runs, therefore cover the command
+range instead of starting from an out-of-distribution constant-speed input.
 
 `--init` starts a new off-policy fine-tuning run from a saved actor. It freezes
 the checkpoint's observation normalizer, gathers the initial replay with that

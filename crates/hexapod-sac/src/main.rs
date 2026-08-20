@@ -18,6 +18,8 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 struct TrainConfig {
     stage: Stage,
     steps: usize,
+    start_speed: f64,
+    speed_ramp_steps: usize,
     environments: usize,
     replay_capacity: usize,
     warmup_steps: usize,
@@ -48,9 +50,12 @@ impl TrainConfig {
             print_help();
             std::process::exit(0);
         }
+        let stage = parse_stage(value(&args, "--stage").as_deref().unwrap_or("walk-flat"))?;
         Ok(Self {
-            stage: parse_stage(value(&args, "--stage").as_deref().unwrap_or("walk-flat"))?,
+            stage,
             steps: parse(&args, "--steps", 500_000)?,
+            start_speed: parse(&args, "--start-speed", stage.speed())?,
+            speed_ramp_steps: parse(&args, "--speed-ramp-steps", 0)?,
             environments: parse(&args, "--envs", 16)?,
             replay_capacity: parse(&args, "--replay", 1_000_000)?,
             warmup_steps: parse(&args, "--warmup", 10_000)?,
@@ -91,6 +96,17 @@ impl TrainConfig {
         }
         if self.replay_capacity < self.batch_size {
             return Err("--replay must be at least --batch".into());
+        }
+        if !self.start_speed.is_finite()
+            || self.start_speed < 0.0
+            || self.start_speed > self.stage.speed()
+        {
+            return Err(format!(
+                "--start-speed must be between zero and the {} target {:.2}",
+                self.stage.name(),
+                self.stage.speed()
+            )
+            .into());
         }
         if !self.updates_per_step.is_finite() || self.updates_per_step < 0.0 {
             return Err("--utd must be finite and non-negative".into());
@@ -204,8 +220,11 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     let mut best_score = f64::NEG_INFINITY;
 
     println!(
-        "# native SAC · {} · {} envs · replay {} · batch {} · UTD {:.2} · {:?}",
+        "# native SAC · {} · speed {:.2}->{:.2} over {} steps · {} envs · replay {} · batch {} · UTD {:.2} · {:?}",
         stage.name(),
+        config.start_speed,
+        stage.speed(),
+        config.speed_ramp_steps,
         config.environments,
         config.replay_capacity,
         config.batch_size,
@@ -213,7 +232,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         device
     );
     println!(
-        " steps   replay updates   score   dist  feet    alpha entropy   q      losses (critic/actor)  wall"
+        " steps   replay updates   cmd  score   dist  feet    alpha entropy   q      losses (critic/actor)  wall"
     );
 
     if config.init.is_some() {
@@ -230,10 +249,11 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         best_score = evaluation.score;
         save_checkpoint(&agent, &normalizer, &config, &evaluation)?;
         println!(
-            "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+            "{transitions:>7} {replay_len:>8} {updates:>7} {command:>5.2} {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
             transitions = 0,
             replay_len = 0,
             updates = 0,
+            command = stage.speed(),
             score = evaluation.score,
             distance = evaluation.distance,
             support = evaluation.support,
@@ -247,6 +267,16 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     }
 
     while transitions < config.steps {
+        let training_command = curriculum_speed(
+            stage,
+            config.start_speed,
+            config.speed_ramp_steps,
+            transitions,
+        );
+        for (environment, state) in environments.iter_mut().zip(&mut states) {
+            let observation = environment.set_command(training_command)?;
+            state.copy_from_slice(observation);
+        }
         for state in &states {
             normalizer.observe(state);
         }
@@ -346,8 +376,9 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 mean_entropy_per_action: 0.0,
             });
             println!(
-                "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+                "{transitions:>7} {replay_len:>8} {updates:>7} {command:>5.2} {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
                 replay_len = replay.len(),
+                command = training_command,
                 score = evaluation.score,
                 distance = evaluation.distance,
                 support = evaluation.support,
@@ -491,7 +522,7 @@ fn save_checkpoint(
     }
     agent.save_actor(&config.out)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage={}\nscore={:.17}\ndistance={:.17}\nseed={}\ninit={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage={}\nscore={:.17}\ndistance={:.17}\nseed={}\ninit={}\nstart_speed={:.17}\nspeed_ramp_steps={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
         config.stage.name(),
         evaluation.score,
         evaluation.distance,
@@ -500,6 +531,8 @@ fn save_checkpoint(
             .init
             .as_deref()
             .map_or_else(|| "none".into(), |path| path.display().to_string()),
+        config.start_speed,
+        config.speed_ramp_steps,
         normalizer.mean.len(),
         n_act(Frame::new(6)),
         config.hidden,
@@ -627,11 +660,21 @@ fn parse_stage(value: &str) -> AppResult<Stage> {
     }
 }
 
+fn curriculum_speed(stage: Stage, start: f64, ramp_steps: usize, transitions: usize) -> f64 {
+    if ramp_steps == 0 {
+        return stage.speed();
+    }
+    let progress = (transitions as f64 / ramp_steps as f64).clamp(0.0, 1.0);
+    start + progress * (stage.speed() - start)
+}
+
 fn print_help() {
     println!(
         "hexapod-sac — native off-policy motor learner\n\n\
          --stage NAME         walk-flat or run-flat (default walk-flat)\n\
          --steps N            collected transitions (default 500000)\n\
+         --start-speed X      initial command for a speed curriculum\n\
+         --speed-ramp-steps N transitions used to reach the stage speed\n\
          --envs N             parallel reusable Rapier worlds (default 16)\n\
          --replay N           replay capacity (default 1000000)\n\
          --warmup N           random transitions before gradients (default 10000)\n\
@@ -665,5 +708,14 @@ mod tests {
         assert_eq!(parse_stage("walk-flat").expect("walk"), Stage::WalkFlat);
         assert_eq!(parse_stage("RUN_FLAT").expect("run"), Stage::RunFlat);
         assert!(parse_stage("mixed").is_err());
+    }
+
+    #[test]
+    fn speed_curriculum_reaches_and_holds_the_stage_target() {
+        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 0, 0), 2.0);
+        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 0), 0.8);
+        assert!((curriculum_speed(Stage::RunFlat, 0.8, 100, 50) - 1.4).abs() < 1e-12);
+        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 100), 2.0);
+        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 200), 2.0);
     }
 }
