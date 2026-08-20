@@ -44,7 +44,7 @@ impl TrainConfig {
             environments: parse(&args, "--envs", 16)?,
             replay_capacity: parse(&args, "--replay", 1_000_000)?,
             warmup_steps: parse(&args, "--warmup", 10_000)?,
-            warmup_action_std: parse(&args, "--warmup-action-std", 0.20)?,
+            warmup_action_std: parse(&args, "--warmup-action-std", 0.05)?,
             batch_size: parse(&args, "--batch", 256)?,
             updates_per_step: parse(&args, "--utd", 1.0)?,
             eval_interval: parse(&args, "--eval-interval", 10_000)?,
@@ -472,7 +472,7 @@ fn print_help() {
          --envs N             parallel reusable Rapier worlds (default 16)\n\
          --replay N           replay capacity (default 1000000)\n\
          --warmup N           random transitions before gradients (default 10000)\n\
-         --warmup-action-std X Gaussian warm-up scale in unit actions (default 0.20)\n\
+         --warmup-action-std X Gaussian warm-up scale in unit actions (default 0.05)\n\
          --batch N            replay minibatch (default 256)\n\
          --utd X              gradient updates per transition (default 1.0)\n\
          --eval-interval N    held-out evaluation cadence (default 10000)\n\

@@ -12,6 +12,7 @@ use hexapod_core::math::Rng;
 
 const LOG_STD_MIN: f64 = -5.0;
 const LOG_STD_MAX: f64 = 2.0;
+const INITIAL_LOG_STD: f32 = -3.0;
 const LOG_2PI: f64 = 1.837_877_066_409_345_3;
 
 #[derive(Clone, Debug)]
@@ -439,7 +440,7 @@ fn initialize_actor_output(vars: &VarMap, actions: usize, device: &Device) -> Re
         .ok_or_else(|| candle_core::Error::Msg("actor is missing out.bias".into()))?;
     weight.set(&Tensor::zeros(weight.shape(), DType::F32, device)?)?;
     let mut values = vec![0.0f32; actions * 2];
-    values[actions..].fill(-1.5);
+    values[actions..].fill(INITIAL_LOG_STD);
     bias.set(&Tensor::from_vec(values, actions * 2, device)?)?;
     Ok(())
 }
