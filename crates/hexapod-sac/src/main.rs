@@ -20,6 +20,7 @@ struct TrainConfig {
     environments: usize,
     replay_capacity: usize,
     warmup_steps: usize,
+    warmup_action_std: f64,
     batch_size: usize,
     updates_per_step: f64,
     eval_interval: usize,
@@ -43,6 +44,7 @@ impl TrainConfig {
             environments: parse(&args, "--envs", 16)?,
             replay_capacity: parse(&args, "--replay", 1_000_000)?,
             warmup_steps: parse(&args, "--warmup", 10_000)?,
+            warmup_action_std: parse(&args, "--warmup-action-std", 0.20)?,
             batch_size: parse(&args, "--batch", 256)?,
             updates_per_step: parse(&args, "--utd", 1.0)?,
             eval_interval: parse(&args, "--eval-interval", 10_000)?,
@@ -74,6 +76,9 @@ impl TrainConfig {
         }
         if !self.updates_per_step.is_finite() || self.updates_per_step < 0.0 {
             return Err("--utd must be finite and non-negative".into());
+        }
+        if !self.warmup_action_std.is_finite() || self.warmup_action_std <= 0.0 {
+            return Err("--warmup-action-std must be finite and positive".into());
         }
         Ok(())
     }
@@ -151,7 +156,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         let take = (config.steps - transitions).min(environments.len());
         let unit_actions = if transitions < config.warmup_steps {
             (0..take * actions)
-                .map(|_| rng.range(-1.0, 1.0) as f32)
+                .map(|_| (rng.normal() * config.warmup_action_std).clamp(-1.0, 1.0) as f32)
                 .collect::<Vec<_>>()
         } else {
             let flat = states[..take]
@@ -376,13 +381,14 @@ fn save_checkpoint(
     }
     agent.save_actor(&config.out)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nwarmup_action_std={:.17}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
         evaluation.score,
         evaluation.distance,
         config.seed,
         normalizer.mean.len(),
         n_act(Frame::new(6)),
         config.hidden,
+        config.warmup_action_std,
         normalizer.n,
         join_f64(&normalizer.mean),
         join_f64(&normalizer.m2),
@@ -466,6 +472,7 @@ fn print_help() {
          --envs N             parallel reusable Rapier worlds (default 16)\n\
          --replay N           replay capacity (default 1000000)\n\
          --warmup N           random transitions before gradients (default 10000)\n\
+         --warmup-action-std X Gaussian warm-up scale in unit actions (default 0.20)\n\
          --batch N            replay minibatch (default 256)\n\
          --utd X              gradient updates per transition (default 1.0)\n\
          --eval-interval N    held-out evaluation cadence (default 10000)\n\

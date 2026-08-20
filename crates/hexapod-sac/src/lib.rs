@@ -135,7 +135,7 @@ impl Default for SacConfig {
             critic_lr: 3.0e-4,
             alpha_lr: 3.0e-4,
             reward_scale: 25.0,
-            initial_alpha: 0.1,
+            initial_alpha: 0.01,
         }
     }
 }
