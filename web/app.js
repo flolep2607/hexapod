@@ -8,6 +8,8 @@
 
 const L = window.HX_LAYOUT;
 const CATALOGUE = window.HX_SERVOS;
+/* Natively trained checkpoints, inlined by build.sh. */
+const CHECKPOINTS = window.HX_POLICIES || [];
 const PARTS = window.HX_PARTS;
 
 const PARAMS = [
@@ -47,8 +49,6 @@ const COURSE_NOTES = {
     "Rubble, ramps, a slalom, trenches, then ice. Everything the generator can build, in one run.",
   JUMP:
     "Parkour. Trenches wider than a stride, and platforms you can only reach by jumping the gap in front of them. The command is still a speed: run, jump, land without stripping the servos.",
-};
-const courseName = (i) => (COURSES[i] || "Flat").toUpperCase();
   BEAM:
     "A plank about three metres wide over a void that spans the corridor, wandering from one side to the other. Every other course lets a foot land anywhere within a stride; here the machine has to track a line, because a metre off it there is nothing.",
   PILLARS:
@@ -59,6 +59,8 @@ const courseName = (i) => (COURSES[i] || "Flat").toUpperCase();
     "The long version of the parkour course. Trenches 1.9-2.35 m across, each with a raised apron on the far side and a run-up in front of it. JUMP asks whether the machine can jump; this asks how far.",
   GLACIER:
     "Slalom gates on one unbroken sheet of ice. SLICK asks whether the machine stays upright on a fifth of the grip; this asks it to change direction on one, which is where a low-friction foot actually gets you into trouble.",
+};
+const courseName = (i) => (COURSES[i] || "Flat").toUpperCase();
 const isJump = () => courseName(state.courseKind) === "JUMP";
 
 const COL = {
@@ -98,6 +100,8 @@ const WORKER_MUTATIONS = [
   "hx_set_servo",
   "hx_set_cruise",
   "hx_set_nav",
+  "hx_clear_policy",
+  "hx_set_plant",
 ];
 
 const state = {
@@ -116,6 +120,8 @@ const state = {
   build: { mass: 2.0, femurMm: 80, safety: 1.35 },
   cruise: 4.0,
   onelegLeg: 0,
+  /* Name of the loaded checkpoint, or null while the seed gait is in force. */
+  policy: null,
   /* Index into the servo catalogue whose torque-speed line drives the joints,
    * or -1 for the generic 20 kg-cm default. */
   servo: -1,
@@ -879,6 +885,18 @@ function buildStaticUI() {
     (c, i) => `<button class="btn" data-course="${i}" data-on="${i === state.courseKind}">${c}</button>`
   ).join("");
 
+  const ckSel = $("ckSel");
+  if (ckSel) {
+    // Newest last, and preselected: the latest curriculum stage is the one
+    // worth watching first.
+    ckSel.innerHTML = CHECKPOINTS.map(
+      (c, i) => `<option value="${i}">${c.name}</option>`
+    ).join("");
+    ckSel.value = String(Math.max(0, CHECKPOINTS.length - 1));
+    ckSel.disabled = CHECKPOINTS.length === 0;
+  }
+  refreshPolicyPanel();
+
   const rl = $("rLegs");
   rl.min = api.hx_legs_min();
   rl.max = api.hx_legs_max();
@@ -905,7 +923,16 @@ function afterMachineChange() {
   state.training = false;
   $("btnTrain").dataset.on = "false";
   $("btnTrain").textContent = "Train";
-  setMode(0);
+  // A checkpoint's parameter matrix is shaped by the leg count, so the module
+  // drops it when the frame changes and keeps it when only the hardware does.
+  if (!api.hx_policy_loaded()) {
+    state.policy = null;
+    blankScore();
+  }
+  setMode(state.policy ? 1 : 0);
+  refreshPolicyPanel();
+  // No rescore here: this runs on every notch of the leg, mass and servo
+  // sliders, and an evaluation is a rollout, not a readout.
   updateTrainingPanel();
 }
 
@@ -1462,7 +1489,9 @@ function updateReadouts(t) {
       : "WALKING"
     : "STANDING";
   const oneleg = L.T_ONELEG != null && t[L.T_ONELEG] > 0.5;
-  const crawl = !oneleg && (state.mode === 0 || state.mode === 1);
+  // The learned policy drives a gait, not the one-foot-at-a-time crawl, so it
+  // reads the walking HUD.
+  const crawl = !oneleg && state.mode === 0;
   const plantHud = oneleg || crawl;
   const hudWalk = $("hudWalk");
   const hudDrill = $("hudDrill");
@@ -1628,6 +1657,108 @@ function updateTrainingPanel() {
   refreshGaitTable();
 }
 
+/* ------------------------------------------------------- trained policies */
+
+/* Why the module refused the last checkpoint, in its own words. */
+function policyMessage() {
+  const len = rawApi.hx_policy_msg_len();
+  if (!len) return "";
+  return new TextDecoder().decode(
+    new Uint8Array(rawApi.memory.buffer, rawApi.hx_policy_msg_ptr(), len)
+  );
+}
+
+/* Score whatever policy is driving the machine on the course in front of it.
+ * This is the centroidal evaluation the trainer uses — the same number
+ * `eval-all` prints, for one course and one seed — so it costs a rollout and
+ * is called on load and on course changes, not per frame. */
+function scorePolicy() {
+  if (!$("ckScore")) return;
+  const reward = rawApi.hx_eval_policy();
+  $("ckScore").textContent = fmt(reward, 1);
+  $("ckDone").textContent = `${(rawApi.hx_eval_completion() * 100).toFixed(0)}%`;
+  $("ckDist").textContent = `${fmt(rawApi.hx_eval_distance(), 1)} m`;
+  // The page evaluates over the training horizon, which is far shorter than a
+  // course, so say so rather than letting 0% read as a failure.
+  const horizon = $("rHorizon") ? +$("rHorizon").value : 0;
+  $("ckDoneNote").textContent = `in ${horizon.toFixed(0)} s episodes`;
+}
+
+/* The score belongs to one policy on one course. When either goes, so does it,
+ * rather than reading as the new machine's. */
+function blankScore() {
+  if (!$("ckScore")) return;
+  $("ckScore").textContent = "—";
+  $("ckDone").textContent = "—";
+  $("ckDist").textContent = "—";
+}
+
+function refreshPolicyPanel() {
+  const name = state.policy;
+  const status = $("ckStatus");
+  if (status) status.textContent = name || "hand-tuned seed";
+  const rail = $("ckRailNote");
+  if (rail) rail.textContent = name ? "loaded" : "seed gait";
+  const clear = $("btnCkClear");
+  if (clear) clear.disabled = !name;
+}
+
+/* Hand a checkpoint to both wasm instances and start walking it. Returns null
+ * on success, or the reason it was refused: the module owns the parser, so the
+ * page never decides a file is acceptable when the simulator disagrees. */
+function loadPolicyText(name, text) {
+  const bytes = new TextEncoder().encode(text);
+  const cap = rawApi.hx_policy_cap();
+  if (bytes.length > cap) {
+    return `checkpoint is ${Math.round(bytes.length / 1024)} kB, over the ${Math.round(
+      cap / 1024
+    )} kB the page reserves for one`;
+  }
+  new Uint8Array(rawApi.memory.buffer, rawApi.hx_policy_ptr(), cap).set(bytes);
+  if (!rawApi.hx_load_policy(bytes.length)) {
+    return policyMessage() || "checkpoint refused";
+  }
+  // The worker owns the live plant, so it needs the same checkpoint. It parses
+  // the text itself rather than being told the outcome.
+  if (simWorker) {
+    const message = { type: "policy", text };
+    if (workerReady) simWorker.postMessage(message);
+    else workerQueue.push(message);
+  }
+  state.policy = name;
+  log(`policy.load("${name}")`);
+  // The module has already adopted it and switched itself to the learned
+  // policy. Re-applying the course brings the page's own bookkeeping along and
+  // puts the machine back on the terrain the Terrain tab is showing — the
+  // empty-field drill parks it on FLAT, and a checkpoint is not there to walk
+  // an empty plane.
+  applyCourse();
+  refreshPolicyPanel();
+  return null;
+}
+
+function loadSelectedPolicy() {
+  const pick = CHECKPOINTS[+$("ckSel").value];
+  if (!pick) return;
+  const error = loadPolicyText(pick.name, pick.text);
+  $("ckNote").textContent = error ? `could not load ${pick.name}: ${error}` : "";
+}
+
+function clearPolicy() {
+  api.hx_clear_policy();
+  state.policy = null;
+  state.training = false;
+  $("btnTrain").dataset.on = "false";
+  $("btnTrain").textContent = "Train";
+  setMode(0);
+  refreshPolicyPanel();
+  $("ckNote").textContent = "";
+  scorePolicy();
+  drawCurve();
+  updateTrainingPanel();
+  log("policy.use(\"hand-tuned\")");
+}
+
 /* ------------------------------------------------------------------ input */
 
 function readKeys() {
@@ -1674,7 +1805,16 @@ function wire() {
   if (btnBase) btnBase.addEventListener("click", () => setMode(0));
   if (btnLearnWire) btnLearnWire.addEventListener("click", () => setMode(1));
   $("btnOneleg").addEventListener("click", () => setMode(2));
-  $("btnWalk").addEventListener("click", () => setMode(0));
+  // With a checkpoint loaded, walking means walking it.
+  $("btnWalk").addEventListener("click", () => setMode(state.policy ? 1 : 0));
+  const setPlant = (kind) => {
+    api.hx_set_plant(kind);
+    $("btnPlantTrained").dataset.on = String(kind === 0);
+    $("btnPlantRobot").dataset.on = String(kind === 1);
+    log(`plant.use("${kind === 1 ? "articulated" : "centroidal"}")`);
+  };
+  $("btnPlantTrained").addEventListener("click", () => setPlant(0));
+  $("btnPlantRobot").addEventListener("click", () => setPlant(1));
 
   $("btnTrain").addEventListener("click", () => {
     state.training = !state.training;
@@ -1683,12 +1823,26 @@ function wire() {
     log(state.training ? "ars.start()" : "ars.stop()");
     updateTrainingPanel();
   });
+  $("btnCkLoad").addEventListener("click", loadSelectedPolicy);
+  $("btnCkClear").addEventListener("click", clearPolicy);
+  $("ckFile").addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const text = await file.text();
+    const error = loadPolicyText(file.name.replace(/\.txt$/i, ""), text);
+    $("ckNote").textContent = error ? `could not load ${file.name}: ${error}` : "";
+    // Let the same file be picked again after a failure.
+    e.target.value = "";
+  });
+
   $("btnResetTrain").addEventListener("click", () => {
     state.training = false;
     $("btnTrain").dataset.on = "false";
     $("btnTrain").textContent = "Train";
     api.hx_reset_training();
-    setMode(0);
+    // A loaded checkpoint is not training state: resetting the search returns
+    // to it, not to the hand-tuned seed.
+    setMode(state.policy ? 1 : 0);
     drawCurve();
     updateTrainingPanel();
     log("ars.reset()");
@@ -1848,7 +2002,9 @@ function applyCourse() {
   state.training = false;
   $("btnTrain").dataset.on = "false";
   $("btnTrain").textContent = "Train";
-  setMode(0);
+  // Walking the same controller over one course after another is the point of
+  // loading one, so a course change does not send it back to the seed gait.
+  setMode(state.policy ? 1 : 0);
   const name = courseName(state.courseKind);
   $("trCourse").textContent = name;
   $("tSummary").textContent =
@@ -1873,6 +2029,7 @@ function applyCourse() {
   }
   drawProfile();
   drawCurve();
+  scorePolicy();
   updateTrainingPanel();
   log(`course.set("${name.toLowerCase()}", seed=${state.seed})`);
 }
@@ -1910,6 +2067,7 @@ async function boot() {
     `MIXED · seed 1 · ${api.hx_course_len()} obstacles · ${api.hx_route_len()} waypoints`;
   $("tNote").textContent = COURSE_NOTES.MIXED;
   refreshGaitTable();
+  scorePolicy();
   updateTrainingPanel();
   describeMachine();
   setMode(2);

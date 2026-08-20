@@ -23,6 +23,7 @@
 //! ```
 
 pub mod ars;
+pub mod checkpoint;
 pub mod dynamics;
 pub mod hardware;
 pub mod math;

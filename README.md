@@ -12,8 +12,9 @@ server, no network, no dependencies.
 
 ```
 ./build.sh          # test, compile wasm, emit dist/hexapod-simulator.html
-node test/smoke.mjs # run five browser scenarios in parallel
-SMOKE_SCREENSHOTS=1 node test/smoke.mjs # optionally save the 15 visual snapshots
+node test/smoke.mjs # run the browser scenarios in parallel
+SMOKE_SCENARIO=trained node test/smoke.mjs # or just one of them
+SMOKE_SCREENSHOTS=1 node test/smoke.mjs # optionally save the visual snapshots
 
 # Native all-terrain training, checkpointing, and held-out evaluation.
 cargo run --release -p hexapod-cli -- train-all --iters 200 --train-seeds 2 --output policy.txt
@@ -21,16 +22,47 @@ cargo run --release -p hexapod-cli -- eval-all --policy policy.txt --eval-seeds 
 ```
 
 A pre-trained all-terrain controller and its held-out evaluation are in
-[`checkpoints/README.md`](checkpoints/README.md).
+[`checkpoints/README.md`](checkpoints/README.md). Every file in `checkpoints/`
+is inlined into the built page, so the trained controllers can be watched
+walking without a trainer, a server or a network: pick one under **Trained
+policy** in the right-hand rail, press **Load**, and choose courses in the
+**Terrain** tab.
 
 ## What it does
 
 The dashboard runs a hand-tuned tripod gait over a generated obstacle course at
 a speed you command, following a route the course lays out for it. Press
 **Train** and an ARS learner starts from an exact copy of that gait and searches
-for something better — live, in the page. The **Servos** and **System** tabs
+for something better — live, in the page. **Load** a checkpoint instead and a
+natively-trained policy drives the machine directly: hours of ARS over the whole
+course suite, walking whichever course is selected, at a speed you command. The **Servos** and **System** tabs
 turn whatever gait is running into a list of parts you can actually buy, and the
 servo you pick there is the servo the simulator drives the joints with.
+
+## Watching a trained policy
+
+Training in the page is minutes of search; the checkpoints are hours of it. The
+rail's **Trained policy** panel loads one into the running simulator, and from
+there it is the thing on screen:
+
+- The course comes from the **Terrain** tab. Switching courses keeps the policy
+  loaded and restarts it on the new terrain, which is how one controller is
+  watched over steps, rubble, trenches and a slalom in turn.
+- **Commanded speed** is an input to the policy, not a setting. Move it and the
+  learned gait changes its cycle time, stride and duty factor to hold it.
+- **Trained plant** runs it on the centroidal model ARS optimised against, so
+  what is on screen is what the checkpoint's reward was earned on. **Live robot**
+  hands the same policy to the Rapier machine, which it was never trained on and
+  does not always survive — the gap between the two is the sim-to-sim gap, in
+  the page, for free.
+- The **Training** tab scores the loaded policy on the course in front of it —
+  the same centroidal evaluation `eval-all` reports — and **Train** continues
+  from the checkpoint rather than from the hand-tuned seed, exactly as
+  `train-all --resume` does.
+- **Load a checkpoint file…** takes any `train-all` output, so a policy trained
+  five minutes ago in a terminal can be watched without rebuilding the page. The
+  module parses it and refuses anything shaped for another machine, with the
+  reason.
 
 ## The simulator
 
@@ -243,11 +275,32 @@ Thirteen courses plus two parkour jumps, all generated from a seed:
 | `SLICK` | Ice at a fifth of the grip of the ground around it |
 | `GAUNTLET` | All of the above in one run |
 | `JUMP` | Trenches wider than a stride (1.55–1.95 m), and platforms behind a gap. A running jump |
+| `BEAM` | A ~3 m plank over a void that spans the corridor, wandering side to side |
+| `PILLARS` | A field of pillars with no gate and no pattern, and a ~2.7 m lane through it |
+| `WASHBOARD` | A train of 10–22 cm ridges at a fixed 55 cm–1 m pitch |
+| `CHASM` | Trenches 1.9–2.35 m across with a raised apron behind each. A longer running jump |
+| `GLACIER` | Slalom gates on one unbroken sheet of ice |
 
 `RAMPS` is a different problem from `STEPS`: a staircase is a sequence of
 shocks, a ramp is a sustained tilt, and a banked one rolls the support plane and
 slides the machine sideways the whole way up. `SLICK` is the course the traction
 meter was built for. `SLALOM` is the one that needs the route.
+
+The last five exist because the first ten left whole skills untested. `BEAM` is
+the only course where a foot cannot land anywhere within a stride of where it
+was aimed — a metre off the plank there is nothing, so the machine has to track
+a line rather than a heading. `PILLARS` is navigation without a gate to aim at:
+several openings, no pattern, and a lane narrower than a slalom gate to hold for
+the length of the field. `WASHBOARD` is the course that pays for the online
+cycle-time action, because a fixed stride either matches the ridge pitch or
+fights it and no single cycle time wins both. `CHASM` asks how far the machine
+can jump rather than whether it can. `GLACIER` is the turn `SLICK` never asks
+for: changing direction on a fifth of the grip is a different problem from
+walking straight on it.
+
+A course is only worth training on if it has headroom. `PILLARS` first shipped
+with a 3.4 m lane, and the baseline gait and the learned policy both completed
+it every single time — no gradient, nothing to learn. It is 2.7 m now.
 
 ### Steering is worth more than gait tuning, where the way forward is not forward
 
@@ -275,33 +328,12 @@ and a half minutes of in-page training on `SLALOM` is about 1300 iterations.
 
 And it transfers. Trained on `MIXED` seed 1 for 300 iterations, then scored on
 all nine courses (`hexapod sweep`):
-| `BEAM` | A ~3 m plank over a void that spans the corridor, wandering side to side |
-| `PILLARS` | A field of pillars with no gate and no pattern, and a ~2.7 m lane through it |
-| `WASHBOARD` | A train of 10–22 cm ridges at a fixed 55 cm–1 m pitch |
-| `CHASM` | Trenches 1.9–2.35 m across with a raised apron behind each. A longer running jump |
-| `GLACIER` | Slalom gates on one unbroken sheet of ice |
 
 | course | hand-tuned | learned | waypoints reached |
 | --- | ---: | ---: | ---: |
 | `FLAT` | 86.5 | **138.3** | 11 → 11 |
 | `STEPS`\* | 61.9 | **63.5** | 11 → 6 |
 | `RUBBLE`\* | 59.8 | **113.3** | 11 → 11 |
-The last five exist because the first ten left whole skills untested. `BEAM` is
-the only course where a foot cannot land anywhere within a stride of where it
-was aimed — a metre off the plank there is nothing, so the machine has to track
-a line rather than a heading. `PILLARS` is navigation without a gate to aim at:
-several openings, no pattern, and a lane narrower than a slalom gate to hold for
-the length of the field. `WASHBOARD` is the course that pays for the online
-cycle-time action, because a fixed stride either matches the ridge pitch or
-fights it and no single cycle time wins both. `CHASM` asks how far the machine
-can jump rather than whether it can. `GLACIER` is the turn `SLICK` never asks
-for: changing direction on a fifth of the grip is a different problem from
-walking straight on it.
-
-A course is only worth training on if it has headroom. `PILLARS` first shipped
-with a 3.4 m lane, and the baseline gait and the learned policy both completed
-it every single time — no gradient, nothing to learn. It is 2.7 m now.
-
 | `GAPS`\* | −43.6 | **−26.2** | 9 → 9 |
 | `MIXED` | 58.2 | **121.6** | 10 → 10 |
 | `MIXED`\* | 52.5 | **104.7** | 11 → 10 |

@@ -116,6 +116,10 @@ class Stage {
     this.el = 0.38;
     this.dist = 8.0;
     this.target = [0, 0.7, 0];
+    /* Wall-clock of the last draw, so the camera's follow is a time constant
+     * rather than a per-frame fraction: a policy at 6 m/s outruns a fixed
+     * fraction whenever the frame rate dips. */
+    this.lastFollow = 0;
     this.faces = [];
     this.obstacles = new Float32Array(0);
     this.route = new Float32Array(0);
@@ -1233,8 +1237,15 @@ class Stage {
     const ctx = this.ctx;
     const pos = [t[L.T_POS], t[L.T_POS + 1], t[L.T_POS + 2]];
 
-    // Follow the robot without snapping.
-    const k = 0.09;
+    // Follow the robot without snapping — except when it is not where it was
+    // at all. A respawn at the start line, or a course change, teleports the
+    // body tens of metres, and easing over that leaves the machine off screen
+    // for as long as it takes to catch up.
+    const now = performance.now();
+    const dt = this.lastFollow ? Math.min(0.5, (now - this.lastFollow) / 1000) : 1 / 60;
+    this.lastFollow = now;
+    const jumped = Math.hypot(pos[0] - this.target[0], pos[2] - this.target[2]) > 4;
+    const k = jumped ? 1 : 1 - Math.exp(-dt / 0.12);
     this.target[0] += (pos[0] - this.target[0]) * k;
     this.target[1] += (pos[1] * 0.75 - this.target[1]) * k;
     this.target[2] += (pos[2] - this.target[2]) * k;

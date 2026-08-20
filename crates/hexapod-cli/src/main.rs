@@ -44,7 +44,7 @@ use hexapod_core::ars::ArsConfig;
 use hexapod_core::hardware::{shortlist, Build, Provenance, TorqueMeter, PRICES_CHECKED, SERVOS};
 use hexapod_core::sim::Sim;
 use hexapod_core::power::{parts_of, solve, Kind, Sizing, TorqueTrace};
-use hexapod_core::policy::{Normalizer, Preset, MAX_OBS};
+use hexapod_core::policy::Preset;
 use hexapod_core::sim::{
     evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
     JUMP_EVAL_SPEEDS,
@@ -1051,115 +1051,13 @@ fn difficulty_weighted_suite(
     weighted
 }
 
-const POLICY_MAGIC: &str = "hexapod-policy-v1";
-
 fn save_policy(path: &str, policy: &Policy) -> std::io::Result<()> {
-    let values = |xs: &[f64]| {
-        xs.iter()
-            .map(|v| format!("{v:.17e}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let text = format!(
-        "{POLICY_MAGIC}\nframe={}\nfeedback={:.17e}\nbase_offsets={}\nnorm_n={:.17e}\nnorm_mean={}\nnorm_m2={}\ntheta={}\n",
-        policy.frame.legs(),
-        policy.feedback,
-        values(&policy.base_offsets),
-        policy.norm.n,
-        values(&policy.norm.mean),
-        values(&policy.norm.m2),
-        values(&policy.theta),
-    );
-    std::fs::write(path, text)
+    std::fs::write(path, hexapod_core::checkpoint::to_text(policy))
 }
 
 fn load_policy(path: &str) -> Result<Policy, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut lines = text.lines();
-    if lines.next() != Some(POLICY_MAGIC) {
-        return Err(format!("not a {POLICY_MAGIC} checkpoint"));
-    }
-    let mut fields = std::collections::HashMap::new();
-    for line in lines {
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("invalid checkpoint line {line:?}"));
-        };
-        fields.insert(key, value);
-    }
-    let field = |name: &str| {
-        fields
-            .get(name)
-            .copied()
-            .ok_or_else(|| format!("checkpoint is missing {name}"))
-    };
-    let numbers = |name: &str| -> Result<Vec<f64>, String> {
-        field(name)?
-            .split_whitespace()
-            .map(|v| {
-                v.parse::<f64>()
-                    .map_err(|_| format!("invalid number {v:?} in {name}"))
-            })
-            .collect()
-    };
-    let legs = field("frame")?
-        .parse::<usize>()
-        .map_err(|_| "invalid frame".to_string())?;
-    let frame = Frame::new(legs);
-    if frame.legs() != legs {
-        return Err(format!("unsupported frame with {legs} legs"));
-    }
-    let feedback = field("feedback")?
-        .parse::<f64>()
-        .map_err(|_| "invalid feedback".to_string())?;
-    let norm_n = field("norm_n")?
-        .parse::<f64>()
-        .map_err(|_| "invalid norm_n".to_string())?;
-    let offsets = numbers("base_offsets")?;
-    let means = numbers("norm_mean")?;
-    let m2 = numbers("norm_m2")?;
-    let theta = numbers("theta")?;
-    if offsets.len() != hexapod_core::MAX_LEGS {
-        return Err(format!("expected {} base offsets", hexapod_core::MAX_LEGS));
-    }
-    if means.len() != MAX_OBS || m2.len() != MAX_OBS {
-        return Err(format!("expected {MAX_OBS} normalizer entries"));
-    }
-    if theta.len() != hexapod_core::n_theta(frame) {
-        return Err(format!(
-            "expected {} parameters for {} legs, found {}",
-            hexapod_core::n_theta(frame),
-            legs,
-            theta.len()
-        ));
-    }
-    if !offsets
-        .iter()
-        .chain(&means)
-        .chain(&m2)
-        .chain(&theta)
-        .chain([feedback, norm_n].iter())
-        .all(|v| v.is_finite())
-    {
-        return Err("checkpoint contains NaN or infinity".to_string());
-    }
-    let mut base_offsets = [0.0; hexapod_core::MAX_LEGS];
-    base_offsets.copy_from_slice(&offsets);
-    let mut mean = [0.0; MAX_OBS];
-    mean.copy_from_slice(&means);
-    let mut norm_m2 = [0.0; MAX_OBS];
-    norm_m2.copy_from_slice(&m2);
-    Ok(Policy {
-        frame,
-        theta,
-        base_offsets,
-        norm: Normalizer {
-            n: norm_n,
-            mean,
-            m2: norm_m2,
-            frozen: true,
-        },
-        feedback,
-    })
+    hexapod_core::checkpoint::from_text(&text)
 }
 
 fn eval_all(seed: u64, mut cfg: ArsConfig, phys: Physics, args: &[String]) {

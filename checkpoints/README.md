@@ -12,6 +12,13 @@ The earlier files are retained as reproducible curriculum stages rather than
 as recommended policies. `all-terrain-seed1.txt` predates the finish and jump
 controller fixes; `v2` through `v5` are successive hard-course passes.
 
+Every `.txt` file here is inlined into `dist/hexapod-simulator.html` by
+`build.sh`, and the dashboard's **Trained policy** panel loads one into the live
+simulator — see *Watching a trained policy* in the top-level README. Adding a
+checkpoint here is all it takes to make it selectable in the page; the page also
+loads a file from disk directly, so a policy that finished training a minute ago
+does not need a rebuild.
+
 Re-evaluate it:
 
 ```bash

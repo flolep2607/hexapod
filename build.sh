@@ -70,6 +70,19 @@ servos = json.loads((web / "servos.gen.json").read_text(encoding="utf-8"))
 parts = json.loads((web / "parts.gen.json").read_text(encoding="utf-8"))
 courses = json.loads((web / "courses.gen.json").read_text(encoding="utf-8"))["courses"]
 
+# Trained policies, inlined so the page can drive a real checkpoint offline.
+# Natural sort so all-terrain-v10 would follow v9 rather than v1.
+def natural(path):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", path.stem)]
+
+
+policies = [
+    {"name": f.stem, "text": f.read_text(encoding="utf-8")}
+    for f in sorted((root / "checkpoints").glob("*.txt"), key=natural)
+]
+if not policies:
+    raise SystemExit("checkpoints/: no policy files to inline")
+
 html = (web / "index.html").read_text(encoding="utf-8")
 title, body = html.split("\n", 1)
 if not title.startswith("<title>"):
@@ -93,6 +106,7 @@ parts = [
     f"window.HX_SERVOS={json.dumps(servos, separators=(',', ':'))};\n"
     f"window.HX_PARTS={json.dumps(parts['parts'], separators=(',', ':'))};\n"
     f"window.HX_COURSES={json.dumps(courses, separators=(',', ':'))};\n"
+    f"window.HX_POLICIES={json.dumps(policies, separators=(',', ':'))};\n"
     f"window.HX_WORKER_SRC={json.dumps((web / 'sim-worker.js').read_text(encoding='utf-8'))};\n"
     f'window.HX_WASM_B64="{base64.b64encode(wasm).decode()}";\n'
     "</script>",
@@ -123,5 +137,7 @@ kb = out.stat().st_size / 1024
 print(f"    wasm    {len(wasm)/1024:8.1f} KB")
 print(f"    layout  {len(layout)} offsets, T_LEN={layout['T_LEN']}, S_LEN={layout['S_LEN']}")
 print(f"    servos  {len(servos['servos'])} parts, checked {servos['checked']}")
+kb_policies = sum(len(p["text"]) for p in policies) / 1024
+print(f"    policy  {len(policies)} checkpoints, {kb_policies:.1f} KB")
 print(f"    output  {kb:8.1f} KB  ->  {out}")
 PY

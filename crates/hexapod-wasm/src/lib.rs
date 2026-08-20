@@ -32,6 +32,16 @@ const MODE_BASELINE: u32 = 0;
 const MODE_LEARNED: u32 = 1;
 const MODE_ONELEG: u32 = 2;
 
+/// Which plant carries the learned policy on screen. The centroidal one is
+/// what ARS trained against, so it reproduces the checkpoint's behaviour
+/// exactly; the articulated one is the real robot and a harder test of it.
+const PLANT_CENTROIDAL: u32 = 0;
+const PLANT_ARTICULATED: u32 = 1;
+
+/// Room for a checkpoint's text. A ten-legged policy's parameter matrix and
+/// two normaliser vectors print to about 40 kB at full `f64` precision.
+const POLICY_CAP: usize = 256 * 1024;
+
 struct App {
     frame: Frame,
     terrain: Terrain,
@@ -46,6 +56,10 @@ struct App {
     /// Cached copy of the trainer's best, so stepping does not clone per frame.
     learned: Policy,
     trained: bool,
+    /// A checkpoint loaded from a file, if any. Held apart from `learned`
+    /// because it has to survive everything that resets the trainer: the whole
+    /// point of loading one is to drive it over course after course.
+    loaded: Option<Policy>,
 
     live: Sim,
     live_gait: Gait,
@@ -63,6 +77,9 @@ struct App {
     /// stride through the floor every cycle and the machine skates.
     locks: hexapod_core::walker::StanceLocks,
     mode: u32,
+    /// Plant the learned policy drives in the walk view. The crawl drill and
+    /// the empty-field drill own their own plant and ignore this.
+    plant_kind: u32,
     since_fall: f64,
     /// Leftover sim time from the last frame. Playback speed buys more ticks,
     /// never longer ones, so 10x is ten times the physics and not a coarser
@@ -83,6 +100,11 @@ struct App {
     sizing: Sizing,
 
     telemetry: Vec<f32>,
+    /// Scratch the page writes checkpoint text into before asking for a parse.
+    /// The module exports no allocator, so the buffer is preallocated here.
+    policy_buf: Vec<u8>,
+    /// Why the last load failed, UTF-8, for the page to show verbatim.
+    policy_msg: String,
     course_buf: Vec<f32>,
     route_buf: Vec<f32>,
     torque_buf: Vec<f32>,
@@ -127,6 +149,7 @@ fn make(seed: u64) -> App {
         trainer,
         learned,
         trained: false,
+        loaded: None,
         live: Sim::default(),
         live_gait,
         plant: None,
@@ -136,6 +159,7 @@ fn make(seed: u64) -> App {
         // The dashboard is a leg-placement lab first: boot into the empty-field
         // drill and require an explicit Walk action before running the course.
         mode: MODE_ONELEG,
+        plant_kind: PLANT_CENTROIDAL,
         since_fall: 0.0,
         acc: 0.0,
         build,
@@ -146,6 +170,8 @@ fn make(seed: u64) -> App {
         meter: TorqueMeter::default(),
         sizing: Sizing::default(),
         telemetry: vec![0.0; T_LEN],
+        policy_buf: vec![0; POLICY_CAP],
+        policy_msg: String::new(),
         course_buf: Vec::new(),
         route_buf: Vec::new(),
         torque_buf: vec![0.0; 8],
@@ -199,6 +225,9 @@ pub extern "C" fn hx_set_legs(legs: u32) -> u32 {
         a.preset = Preset::default_for(next);
     }
     a.baseline = Policy::seeded(a.preset, a.frame);
+    // A checkpoint's parameter matrix is shaped by the frame it was trained
+    // for, so a loaded one does not survive this.
+    a.loaded = None;
     a.reset_training();
     a.reset_live();
     a.meter = TorqueMeter::default();
@@ -302,6 +331,31 @@ pub extern "C" fn hx_reset_live() {
     app().reset_live();
 }
 
+/// Choose the plant the learned policy walks on: 0 the centroidal model it was
+/// trained against, 1 the articulated Rapier robot. Respawns the walk view.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_set_plant(kind: u32) {
+    let a = app();
+    let kind = if kind == PLANT_ARTICULATED {
+        PLANT_ARTICULATED
+    } else {
+        PLANT_CENTROIDAL
+    };
+    if a.plant_kind == kind {
+        return;
+    }
+    a.plant_kind = kind;
+    if a.mode == MODE_LEARNED {
+        a.reset_live();
+    }
+    a.publish();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_plant() -> u32 {
+    app().plant_kind
+}
+
 // ------------------------------------------------------------- manual gait
 
 /// Set gait scalar `idx` (0..6) on the hand-tuned policy.
@@ -363,6 +417,9 @@ pub extern "C" fn hx_train(iters: u32) -> f64 {
     a.apply_live_gait_limits();
     if a.mode != MODE_LEARNED {
         a.mode = MODE_LEARNED;
+        // The crawl drill owns the live plant in the other modes; the policy
+        // cannot drive it, so the walk view has to be respawned here.
+        a.reset_live();
     }
     // Publish here: the live view only calls `hx_step` while unpaused, and
     // the dashboard reads these fields after `hx_train`.
@@ -374,6 +431,116 @@ pub extern "C" fn hx_train(iters: u32) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn hx_iterations() -> u32 {
     app().trainer.iter as u32
+}
+
+// -------------------------------------------------------------- checkpoints
+
+/// Capacity of the checkpoint scratch buffer, bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_policy_cap() -> u32 {
+    POLICY_CAP as u32
+}
+
+/// Where to write checkpoint text before calling [`hx_load_policy`].
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_policy_ptr() -> *mut u8 {
+    app().policy_buf.as_mut_ptr()
+}
+
+/// Parse the first `len` bytes of the scratch buffer as a checkpoint and, if
+/// it is one for this machine, walk it. Returns 1 on success, 0 on failure —
+/// read [`hx_policy_msg_ptr`] for why.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_load_policy(len: u32) -> u32 {
+    let a = app();
+    let len = (len as usize).min(a.policy_buf.len());
+    let text = match core::str::from_utf8(&a.policy_buf[..len]) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            a.policy_msg = "checkpoint is not valid UTF-8".to_string();
+            return 0;
+        }
+    };
+    match hexapod_core::checkpoint::from_text(&text) {
+        Ok(policy) if policy.frame != a.frame => {
+            a.policy_msg = format!(
+                "checkpoint is for {} legs, machine has {}",
+                policy.frame.legs(),
+                a.frame.legs()
+            );
+            0
+        }
+        Ok(policy) => {
+            a.policy_msg.clear();
+            a.adopt_policy(policy);
+            1
+        }
+        Err(error) => {
+            a.policy_msg = error;
+            0
+        }
+    }
+}
+
+/// Forget the loaded checkpoint and go back to searching from the hand-tuned
+/// seed.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_clear_policy() {
+    let a = app();
+    a.loaded = None;
+    a.policy_msg.clear();
+    a.reset_training();
+    a.reset_live();
+    a.publish();
+}
+
+/// 1 while a checkpoint from a file is driving the machine.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_policy_loaded() -> u32 {
+    app().loaded.is_some() as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_policy_msg_ptr() -> *const u8 {
+    app().policy_msg.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_policy_msg_len() -> u32 {
+    app().policy_msg.len() as u32
+}
+
+/// Score the policy currently driving the machine over the current course and
+/// the full spread of commanded speeds, on the centroidal plant the trainer
+/// uses. This is the same number `eval-all` reports, for one course and one
+/// seed, so a checkpoint's page score is comparable with its audit.
+///
+/// Costs one evaluation — a few milliseconds — so the page calls it when the
+/// course or the policy changes, not per frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_eval_policy() -> f64 {
+    let a = app();
+    let policy = if a.trained {
+        a.learned.clone()
+    } else {
+        a.baseline.clone()
+    };
+    let saved = core::mem::replace(&mut a.trainer.policy, policy);
+    let r = a.trainer.evaluate(&a.terrain);
+    a.trainer.policy = saved;
+    a.publish();
+    r.reward
+}
+
+/// Fraction of the last evaluation's episodes that walked the whole route.
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_eval_completion() -> f64 {
+    app().trainer.last_eval.completion_rate
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn hx_eval_distance() -> f64 {
+    app().trainer.last_eval.distance
 }
 
 // ------------------------------------------------------------------- build
@@ -604,11 +771,36 @@ impl App {
     }
 
     fn reset_live(&mut self) {
-        if self.mode == MODE_ONELEG {
-            self.start_oneleg();
-        } else {
-            self.start_crawl();
+        match self.mode {
+            MODE_ONELEG => self.start_oneleg(),
+            // The learned policy is a gait controller, not a crawl: it gets
+            // the plant it was trained to drive, so what is on screen is the
+            // checkpoint walking rather than the hand-written crawl.
+            MODE_LEARNED => self.start_walk(),
+            _ => self.start_crawl(),
         }
+    }
+
+    /// Stand the machine on the course and hand it to the policy.
+    fn start_walk(&mut self) {
+        self.oneleg = None;
+        self.locks.reset();
+        self.live.reset(&self.terrain, &self.live_gait, &self.phys);
+        if self.plant_kind == PLANT_ARTICULATED {
+            let plant =
+                ArticulatedPlant::standing(self.frame, &self.live_gait, &self.phys, &self.terrain);
+            let (p, yaw, pitch, roll) = plant.chassis_pose();
+            self.live
+                .observe_pose(p, yaw, pitch, roll, plant.chassis_vel());
+            for i in 0..self.frame.legs() {
+                self.live.feet[i].world = plant.leg_joints_world(i)[3];
+            }
+            self.locks.capture(&self.live, &plant);
+            self.plant = Some(plant);
+        } else {
+            self.plant = None;
+        }
+        self.since_fall = 0.0;
     }
 
     /// Crawl: five legs hold, one plants along the command, chassis shifts.
@@ -669,15 +861,38 @@ impl App {
         self.reset_live();
     }
 
+    /// Rebuild the trainer for the current machine and course.
+    ///
+    /// A loaded checkpoint is the starting point again rather than being
+    /// discarded: a new course is exactly what the user loaded it to walk, and
+    /// pressing Train after that continues from it, as `--resume` does.
     fn reset_training(&mut self) {
+        let start = self
+            .loaded
+            .clone()
+            .unwrap_or_else(|| Policy::seeded(self.preset, self.frame));
+        self.trained = self.loaded.is_some();
+        self.learned = self.loaded.clone().unwrap_or_else(|| self.baseline.clone());
         self.trainer = Trainer::new(
-            Policy::seeded(self.preset, self.frame),
+            start,
             self.trainer.cfg,
             self.phys,
             self.course_seed ^ 0xA5A5,
         );
-        self.trained = false;
-        self.learned = self.baseline.clone();
+        if self.trained {
+            self.live_gait = self.learned.gait();
+            self.apply_live_gait_limits();
+        }
+        self.publish();
+    }
+
+    /// Adopt a parsed checkpoint: it becomes the learned policy, the trainer's
+    /// starting point, and the gait the machine on screen walks.
+    fn adopt_policy(&mut self, policy: Policy) {
+        self.loaded = Some(policy);
+        self.reset_training();
+        self.mode = MODE_LEARNED;
+        self.reset_live();
         self.publish();
     }
 
@@ -1191,6 +1406,92 @@ mod tests {
 
     fn tel() -> &'static [f32] {
         unsafe { std::slice::from_raw_parts(hx_telemetry_ptr(), hx_telemetry_len() as usize) }
+    }
+
+    /// Write text into the module's checkpoint scratch and ask it to load it.
+    fn load(text: &str) -> u32 {
+        let bytes = text.as_bytes();
+        assert!(bytes.len() <= hx_policy_cap() as usize);
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), hx_policy_ptr(), bytes.len()) };
+        hx_load_policy(bytes.len() as u32)
+    }
+
+    fn message() -> String {
+        let len = hx_policy_msg_len() as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(hx_policy_msg_ptr(), len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[test]
+    fn a_loaded_checkpoint_walks_the_course_and_survives_a_course_change() {
+        hx_init(7);
+        hx_set_course(2, 3); // RUBBLE
+        let policy = Policy::seeded(Preset::default_for(Frame::new(6)), Frame::new(6));
+        assert_eq!(
+            load(&hexapod_core::checkpoint::to_text(&policy)),
+            1,
+            "{}",
+            message()
+        );
+        assert_eq!(hx_policy_loaded(), 1);
+        hx_publish();
+        assert!(
+            tel()[T_TRAINED] > 0.5,
+            "a loaded checkpoint is a trained policy"
+        );
+        assert_eq!(tel()[T_MODE] as u32, MODE_LEARNED);
+        // The crawl drill cannot be driven by a policy, so the walk view has to
+        // have taken over. Its plant flag is off on the centroidal model.
+        assert!(tel()[T_PLANT] < 0.5, "the policy drives the plant it was trained on");
+
+        let start = [tel()[T_POS], tel()[T_POS + 2]];
+        for _ in 0..300 {
+            hx_step(1.0 / 60.0, 1.0, 0.0);
+        }
+        hx_publish();
+        let moved = ((tel()[T_POS] - start[0]).powi(2) + (tel()[T_POS + 2] - start[1]).powi(2)).sqrt();
+        assert!(moved > 0.5, "the loaded policy did not walk: {moved:.3} m");
+
+        // Watching one controller over several courses is the whole point, so
+        // a course change keeps it rather than dropping back to the seed.
+        hx_set_course(5, 3); // RAMPS
+        assert_eq!(hx_policy_loaded(), 1);
+        hx_publish();
+        assert!(tel()[T_TRAINED] > 0.5);
+
+        hx_clear_policy();
+        assert_eq!(hx_policy_loaded(), 0);
+        hx_publish();
+        assert!(tel()[T_TRAINED] < 0.5);
+    }
+
+    #[test]
+    fn a_checkpoint_for_another_machine_is_refused_with_a_reason() {
+        hx_init(1);
+        assert_eq!(load("not a checkpoint at all"), 0);
+        assert!(message().contains("hexapod-policy-v1"), "{}", message());
+        let eight = Frame::new(8);
+        let other = Policy::seeded(Preset::default_for(eight), eight);
+        assert_eq!(load(&hexapod_core::checkpoint::to_text(&other)), 0);
+        assert!(message().contains("8 legs"), "{}", message());
+        assert_eq!(hx_policy_loaded(), 0, "a refused checkpoint changes nothing");
+    }
+
+    #[test]
+    fn the_articulated_plant_can_carry_the_policy_too() {
+        hx_init(11);
+        hx_set_course(1, 2); // STEPS
+        let policy = Policy::seeded(Preset::default_for(Frame::new(6)), Frame::new(6));
+        assert_eq!(load(&hexapod_core::checkpoint::to_text(&policy)), 1);
+        hx_set_plant(PLANT_ARTICULATED);
+        assert_eq!(hx_plant(), PLANT_ARTICULATED);
+        hx_publish();
+        assert!(tel()[T_PLANT] > 0.5, "the live robot is standing");
+        for _ in 0..120 {
+            hx_step(1.0 / 60.0, 1.0, 0.0);
+        }
+        hx_set_plant(PLANT_CENTROIDAL);
+        assert_eq!(hx_plant(), PLANT_CENTROIDAL);
     }
 
     #[test]

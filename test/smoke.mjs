@@ -182,6 +182,11 @@ const clickWalk = async (page) => {
 
 async function speedAndPhysics(h) {
   const { page, check, setRange, stepSamples } = h;
+  // Speed tracking is a gait property, and the hand-tuned walk view is the
+  // one-foot-at-a-time crawl, which holds about 0.2 m/s whatever it is asked
+  // for. Load a trained policy: it is the thing in the page that answers a
+  // speed command at all.
+  await page.click("#btnCkLoad");
   await clickWalk(page);
   await page.click("#btnPause");
   const speedAt = async (target) => {
@@ -574,6 +579,151 @@ async function onelegDrill(h) {
   );
 }
 
+async function trainedPolicy(h) {
+  const { page, check, waitFor, screenshot, setRange, stepSamples, nextFrame } = h;
+  const inlined = await page.evaluate(() => (window.HX_POLICIES || []).map((p) => p.name));
+  check("checkpoints are inlined in the page", inlined.length > 0, inlined.join(" "));
+
+  await page.click('[data-tab="training"]');
+  // Every load and course change scores the policy with a real rollout. The
+  // shortest horizon the panel offers keeps this scenario inside its budget;
+  // the checks are on the numbers existing, not on their size.
+  await setRange("rHorizon", 4);
+  await page.click("#btnCkLoad");
+  const loaded = await page.evaluate(() => ({
+    status: document.getElementById("ckStatus").textContent,
+    rail: document.getElementById("ckRailNote").textContent,
+    mode: document.getElementById("hPolicy").textContent,
+    score: document.getElementById("ckScore").textContent,
+    done: document.getElementById("ckDone").textContent,
+    note: document.getElementById("ckNote").textContent,
+  }));
+  check("the checkpoint loads", loaded.note === "", loaded.note);
+  check(
+    "and it names the one it is running",
+    inlined.includes(loaded.status) && /loaded/.test(loaded.rail),
+    JSON.stringify(loaded)
+  );
+  check("the mode chip says the policy is driving", /LEARNED/.test(loaded.mode), loaded.mode);
+  check(
+    "the page scores it on the course in front of it",
+    loaded.score !== "—" && Number.isFinite(Number(loaded.score)) && /%/.test(loaded.done),
+    `${loaded.score} · ${loaded.done}`
+  );
+  check(
+    "the learned gait replaces the hand-tuned column",
+    !/—/.test(await page.$eval("#tblGait tbody tr", (row) => row.textContent))
+  );
+
+  // The drill owns the plant in the other modes and no policy can drive it.
+  await page.click('[data-tab="kinematics"]');
+  const walking = await page.evaluate(() => window.__hxOneleg());
+  check("the crawl drill has handed the machine over", !walking.on, JSON.stringify(walking.on));
+  // Let the real-time loop draw it: the camera follows the body one frame at a
+  // time, so a screenshot straight after a headless burst is of empty corridor.
+  await waitFor(() => window.__hxFalls.t.length > 8, null, 6000);
+  // A tab switch resizes the stage canvas, which clears it, so read across a
+  // few frames rather than whichever one the switch happened to land on.
+  const sample = () =>
+    page.evaluate(() => {
+      const cv = document.getElementById("view");
+      const data = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
+      const seen = new Set();
+      for (let i = 0; i < data.length; i += 4000) seen.add(`${data[i]},${data[i + 1]},${data[i + 2]}`);
+      return seen.size;
+    });
+  let painted = await sample();
+  for (let attempt = 0; attempt < 10 && painted <= 6; attempt++) {
+    await nextFrame();
+    painted = Math.max(painted, await sample());
+  }
+  check("the policy's machine is drawn on the stage", painted > 6, `${painted} distinct sampled colours`);
+  await screenshot("17-policy.png");
+  await page.click("#btnPause");
+  const rollout = await stepSamples(240);
+  check(
+    "the loaded policy walks the course",
+    rollout.time > 2 && rollout.speed.closest > 0.5,
+    `${rollout.time.toFixed(1)} s, closest speed ${rollout.speed.closest.toFixed(2)} m/s`
+  );
+
+  // The same checkpoint on the Rapier machine it was never trained on.
+  await page.click("#btnPlantRobot");
+  const onRobot = await stepSamples(60);
+  check(
+    "the same policy can be handed to the live robot",
+    (await page.getAttribute("#btnPlantRobot", "data-on")) === "true" && onRobot.time > 1,
+    `${onRobot.time.toFixed(1)} s on the articulated plant`
+  );
+  await screenshot("18-policy-robot.png");
+  await page.click("#btnPlantTrained");
+
+  // Watching one controller over course after course is the point of loading it.
+  const names = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-course]")].map((button) => button.textContent)
+  );
+  await page.click('[data-tab="terrain"]');
+  for (const wanted of ["Rubble"]) {
+    const index = names.findIndex((name) => name.toLowerCase() === wanted.toLowerCase());
+    if (index < 0) continue;
+    await page.click(`[data-course="${index}"]`);
+    const kept = await page.evaluate(() => ({
+      status: document.getElementById("ckStatus").textContent,
+      mode: document.getElementById("hPolicy").textContent,
+      score: document.getElementById("ckScore").textContent,
+    }));
+    await page.click('[data-tab="kinematics"]');
+    await waitFor((mark) => window.__hxFalls.t.length > mark, 4, 6000);
+    await screenshot(`19-policy-${wanted.toLowerCase()}.png`);
+    await page.click('[data-tab="terrain"]');
+    check(
+      `the checkpoint keeps walking on ${wanted.toUpperCase()}`,
+      /LEARNED/.test(kept.mode) && inlined.includes(kept.status) && kept.score !== "—",
+      JSON.stringify(kept)
+    );
+  }
+
+  // A file that is not a checkpoint has to be refused, in words, and change
+  // nothing that is already running.
+  await page.click('[data-tab="training"]');
+  await page.setInputFiles("#ckFile", {
+    name: "junk.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("this is not a policy"),
+  });
+  // Reading the file is asynchronous, so the verdict arrives a tick later.
+  await waitFor(() => document.getElementById("ckNote").textContent !== "", null, 4000);
+  const refused = await page.evaluate(() => ({
+    note: document.getElementById("ckNote").textContent,
+    status: document.getElementById("ckStatus").textContent,
+  }));
+  check(
+    "junk is refused with a reason",
+    /could not load junk.txt/.test(refused.note) && /hexapod-policy-v1/.test(refused.note),
+    refused.note
+  );
+  check("and the running checkpoint is untouched", inlined.includes(refused.status), refused.status);
+
+  await page.click("#btnCkClear");
+  const cleared = await page.evaluate(() => ({
+    status: document.getElementById("ckStatus").textContent,
+    mode: document.getElementById("hPolicy").textContent,
+  }));
+  check(
+    "Hand-tuned puts the crawl back",
+    /hand-tuned/i.test(cleared.status) && /CRAWL/.test(cleared.mode),
+    JSON.stringify(cleared)
+  );
+  // The crawl is the drill's plant walking one foot at a time, so its readout
+  // comes back on the stage.
+  const backToCrawl = await waitFor(
+    () => !document.getElementById("hudDrill").hidden && !window.__hxOneleg().on,
+    null,
+    4000
+  );
+  check("and the crawl drill owns the machine again", backToCrawl !== null);
+}
+
 const scenarios = [
   ["dashboard", bootAndStatic],
   ["courses", courses],
@@ -587,6 +737,7 @@ const scenarios = [
   }],
   ["gait + navigation", gaitAndNavigation],
   ["one leg", onelegDrill],
+  ["trained policy", trainedPolicy],
 ];
 const scenarioNeedle = (process.env.SMOKE_SCENARIO || "").trim().toLowerCase();
 const selectedScenarios = scenarioNeedle

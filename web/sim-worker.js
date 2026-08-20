@@ -145,6 +145,18 @@ onmessage = async (event) => {
     schedule(0);
     return;
   }
+  if (msg.type === "policy") {
+    // Checkpoint text, mirrored from the UI thread. The module owns the
+    // parser, so this instance validates it again rather than trusting a
+    // verdict reached against the other one.
+    const bytes = new TextEncoder().encode(msg.text);
+    const cap = api.hx_policy_cap();
+    if (bytes.length <= cap) {
+      new Uint8Array(api.memory.buffer, api.hx_policy_ptr(), cap).set(bytes);
+      api.hx_load_policy(bytes.length);
+    }
+    return;
+  }
   if (msg.type === "call") {
     const fn = api[msg.name];
     if (typeof fn === "function") fn(...msg.args);

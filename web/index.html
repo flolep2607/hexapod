@@ -128,6 +128,21 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         </div>
 
         <div class="sec">
+          <div class="sec-bar"><h2>Trained policy</h2><span class="k" id="ckStatus">hand-tuned seed</span></div>
+          <p class="note">The checkpoints in the rail come from native training — hours of ARS over the
+          whole course suite, not the minutes the page can afford. One drives the machine on screen and
+          walks whichever course is picked in <b>Terrain</b>: switch courses and it keeps walking, so the
+          same controller can be watched over steps, rubble, trenches and slalom in turn. <b>Train</b>
+          then continues from it rather than from the hand-tuned seed.</p>
+          <div class="statrow">
+            <div class="stat"><span class="k">Centroidal score here</span><b id="ckScore">—</b><span class="k">this course and seed</span></div>
+            <div class="stat mute"><span class="k">Route completed</span><b id="ckDone">—</b><span class="k" id="ckDoneNote">of the evaluation episodes</span></div>
+            <div class="stat mute"><span class="k">Distance</span><b id="ckDist">—</b><span class="k">evaluation rollout</span></div>
+          </div>
+          <p class="note" id="ckNote"></p>
+        </div>
+
+        <div class="sec">
           <div class="hd"><h2>Learning curve</h2><span class="k">Reward per iteration · <span class="hot">best so far</span></span></div>
           <div class="br"><i></i><canvas id="cCurve" height="300"></canvas></div>
         </div>
@@ -324,7 +339,34 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
           <button class="btn" id="btnWalk">Walk</button>
         </div>
         <div class="row3" id="onelegBtns"></div>
-        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost. Walk is the same plant, one foot at a time, along the command.</p>
+        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost. Walk is the same plant, one foot at a time, along the command — unless a trained policy is loaded below, in which case Walk hands the machine to it.</p>
+      </div>
+
+      <div class="sec" id="secCruise">
+        <div class="sec-bar"><h2 id="cruiseTitle">Commanded speed</h2><span class="k" id="cruiseNote"></span></div>
+        <label class="slider"><span class="hd"><span class="k" id="cruiseHold">Hold this cruise</span><b id="vCruise">4.0 m/s</b></span>
+          <input type="range" id="rCruise" min="1.5" max="6" step="0.1" value="4"></label>
+        <p class="note" id="cruiseHelp"></p>
+      </div>
+
+      <div class="sec">
+        <div class="sec-bar"><h2>Trained policy</h2><span class="k" id="ckRailNote"></span></div>
+        <select class="sel" id="ckSel"></select>
+        <div class="row2" style="margin-top:6px">
+          <button class="btn primary" id="btnCkLoad">Load</button>
+          <button class="btn" id="btnCkClear">Hand-tuned</button>
+        </div>
+        <label class="btn" for="ckFile" style="display:block;text-align:center;margin-top:6px">Load a checkpoint file…</label>
+        <input type="file" id="ckFile" accept=".txt,text/plain" hidden>
+        <div class="row2" style="margin-top:6px">
+          <button class="btn" id="btnPlantTrained" data-on="true">Trained plant</button>
+          <button class="btn" id="btnPlantRobot">Live robot</button>
+        </div>
+        <p class="note">Checkpoints trained natively over the whole course suite. Loading one puts it on
+        the course picked in Terrain and starts walking; the Training tab scores it and can carry on
+        training from it. <b>Trained plant</b> is the centroidal model ARS optimised against, so it
+        reproduces the checkpoint; <b>Live robot</b> hands the same policy to the Rapier machine, which
+        it was never trained on and does not always survive.</p>
       </div>
 
       <div class="sec">
