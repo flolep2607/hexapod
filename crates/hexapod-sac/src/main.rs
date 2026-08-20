@@ -21,6 +21,7 @@ struct TrainConfig {
     replay_capacity: usize,
     warmup_steps: usize,
     warmup_action_std: f64,
+    warmup_hold_fraction: f64,
     batch_size: usize,
     updates_per_step: f64,
     policy_warmup_updates: usize,
@@ -46,6 +47,7 @@ impl TrainConfig {
             replay_capacity: parse(&args, "--replay", 1_000_000)?,
             warmup_steps: parse(&args, "--warmup", 10_000)?,
             warmup_action_std: parse(&args, "--warmup-action-std", 0.05)?,
+            warmup_hold_fraction: parse(&args, "--warmup-hold-fraction", 0.50)?,
             batch_size: parse(&args, "--batch", 256)?,
             updates_per_step: parse(&args, "--utd", 1.0)?,
             policy_warmup_updates: parse(&args, "--policy-warmup-updates", 1_000)?,
@@ -81,6 +83,11 @@ impl TrainConfig {
         }
         if !self.warmup_action_std.is_finite() || self.warmup_action_std <= 0.0 {
             return Err("--warmup-action-std must be finite and positive".into());
+        }
+        if !self.warmup_hold_fraction.is_finite()
+            || !(0.0..=1.0).contains(&self.warmup_hold_fraction)
+        {
+            return Err("--warmup-hold-fraction must be between zero and one".into());
         }
         Ok(())
     }
@@ -157,8 +164,19 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         }
         let take = (config.steps - transitions).min(environments.len());
         let unit_actions = if transitions < config.warmup_steps {
-            (0..take * actions)
-                .map(|_| (rng.normal() * config.warmup_action_std).clamp(-1.0, 1.0) as f32)
+            let hold = (take as f64 * config.warmup_hold_fraction).round() as usize;
+            (0..take)
+                .flat_map(|environment| {
+                    (0..actions)
+                        .map(|_| {
+                            if environment < hold {
+                                0.0
+                            } else {
+                                (rng.normal() * config.warmup_action_std).clamp(-1.0, 1.0) as f32
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         } else {
             let flat = states[..take]
@@ -388,7 +406,7 @@ fn save_checkpoint(
     }
     agent.save_actor(&config.out)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nwarmup_action_std={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
         evaluation.score,
         evaluation.distance,
         config.seed,
@@ -396,6 +414,7 @@ fn save_checkpoint(
         n_act(Frame::new(6)),
         config.hidden,
         config.warmup_action_std,
+        config.warmup_hold_fraction,
         config.policy_warmup_updates,
         normalizer.n,
         join_f64(&normalizer.mean),
@@ -481,6 +500,7 @@ fn print_help() {
          --replay N           replay capacity (default 1000000)\n\
          --warmup N           random transitions before gradients (default 10000)\n\
          --warmup-action-std X Gaussian warm-up scale in unit actions (default 0.05)\n\
+         --warmup-hold-fraction X exact standing share of warm-up envs (default 0.50)\n\
          --batch N            replay minibatch (default 256)\n\
          --utd X              gradient updates per transition (default 1.0)\n\
          --policy-warmup-updates N critic-only updates before actor training (default 1000)\n\

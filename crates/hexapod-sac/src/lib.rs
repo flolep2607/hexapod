@@ -12,7 +12,7 @@ use hexapod_core::math::Rng;
 
 const LOG_STD_MIN: f64 = -5.0;
 const LOG_STD_MAX: f64 = 2.0;
-const INITIAL_LOG_STD: f32 = -3.0;
+const INITIAL_LOG_STD: f32 = -4.0;
 const LOG_2PI: f64 = 1.837_877_066_409_345_3;
 
 #[derive(Clone, Debug)]
