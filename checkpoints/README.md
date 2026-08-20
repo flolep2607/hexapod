@@ -1,5 +1,19 @@
 # Policy checkpoints
 
+`joint-sac-walk-dense-prior005-100k-seed2-v1.safetensors` is the first native
+motor-level SAC controller to clear the `WALK-FLAT` curriculum gate. The best
+actor was retained at 60,000 transitions from a 100,000-transition run (seed
+20260831): score 0.549, distance 1.64 m in 4.0 s, 2.71 mean supporting feet,
+and no fall. Its `.meta` companion freezes the 85-element observation
+normalizer and complete training configuration. Re-evaluate it with:
+
+```bash
+cargo run --release -p hexapod-sac --features cuda -- \
+  --device cuda:0 \
+  --eval checkpoints/joint-sac-walk-dense-prior005-100k-seed2-v1.safetensors \
+  --eval-episodes 20 --seed 30360831
+```
+
 `all-terrain-v6.txt` is the recommended controller. It was trained in staged
 all-terrain passes, always keeping every course in the training suite while
 temporarily weighting `GAPS`, `JUMP`, and `SLALOM`. On a disjoint audit of 600
