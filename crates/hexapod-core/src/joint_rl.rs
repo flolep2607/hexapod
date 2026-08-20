@@ -60,6 +60,13 @@ pub const MAX_JOINT_RATE: f64 = 6.0;
 /// look like it is tracking a speed while being useless on a real machine.
 pub const SMOOTH_COST: f64 = 0.08;
 
+/// Episode cost for abandoning supported locomotion. A progress-only learner
+/// otherwise finds that throwing the chassis forward on one foot is easier
+/// than coordinating six legs: the first SAC pilot travelled 1.59 m while
+/// averaging only 0.72 feet down. Proper support pays no cost; sustained
+/// flight or belly-sliding pays the full amount.
+pub const SUPPORT_DEFICIT_COST: f64 = 0.25;
+
 /// Physics ticks per policy decision. The plant still runs at its own rate;
 /// the policy is asked once every this many ticks and its command is held in
 /// between.
@@ -1446,6 +1453,7 @@ fn episode_score(
     base_score * progress_gate * support_gate
         + 0.35 * waypoint_fraction
         + f64::from(u8::from(completed))
+        - SUPPORT_DEFICIT_COST * (1.0 - support_gate)
 }
 
 /// Per-tick reward. Bounded above by roughly 1.0 so a stage's score is
@@ -2924,6 +2932,12 @@ mod tests {
         );
         let stable = episode_score(Stage::WalkFlat, 0.9, 1.0, 0.8, 2.1, 6, 0.0, false);
         let hopping = episode_score(Stage::WalkFlat, 0.9, 1.0, 0.8, 0.7, 6, 0.0, false);
+        let parked = episode_score(Stage::WalkFlat, 0.9, 0.0, 0.8, 6.0, 6, 0.0, false);
+        assert_eq!(parked, 0.0, "safe standing should be a neutral fallback");
+        assert!(
+            hopping < 0.0,
+            "unsupported locomotion must be worse than standing: {hopping:.3}"
+        );
         assert!(
             stable > hopping * 5.0,
             "sustained hopping was not penalised: stable {stable:.3}, hopping {hopping:.3}"
