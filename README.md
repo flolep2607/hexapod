@@ -4,8 +4,10 @@ A legged-locomotion simulator with a policy-search trainer and a hardware
 sizer. Four legs to ten; six is the default and the one everything is tuned
 at. The simulator, the learner and the kinematics are Rust; the browser only
 draws. The live robot is Rapier — a chassis plus three revolute joints per
-leg and ground friction. Gait, IK and the servo cap are written here. ARS
-still trains on the fast centroidal step so it can run in the page.
+leg and ground friction. Gait, IK and the servo cap are written here. The
+browser's gait learner still trains on the fast centroidal step; the native
+joint-level learner trains against Rapier-compatible worlds batched on the GPU
+by Nexus.
 
 Start it from `dist/hexapod-simulator.html` — one self-contained file, no
 server, no network, no dependencies.
@@ -19,6 +21,14 @@ SMOKE_SCREENSHOTS=1 node test/smoke.mjs # optionally save the visual snapshots
 # Native all-terrain training, checkpointing, and held-out evaluation.
 cargo run --release -p hexapod-cli -- train-all --iters 200 --train-seeds 2 --output policy.txt
 cargo run --release -p hexapod-cli -- eval-all --policy policy.txt --eval-seeds 3
+
+# Motor-level RL: 18 policy outputs, no gait or inverse kinematics.
+cargo run --release -p hexapod-cli -- joint-train --iters 400 --out joint.txt
+cargo run --release -p hexapod-cli -- joint-eval --policy joint.txt --eval-seeds 3
+cargo run --release -p hexapod-cli -- joint-train --resume joint.txt --stage mixed --iters 200 --out joint.txt
+
+# Experimental Nexus 0.5 native-GPU batch path.
+cargo run --release -p hexapod-cli -- joint-train --backend nexus-gpu --batch-envs 128 --iters 20 --out joint-gpu.txt
 ```
 
 A pre-trained all-terrain controller and its held-out evaluation are in
@@ -27,6 +37,60 @@ is inlined into the built page, so the trained controllers can be watched
 walking without a trainer, a server or a network: pick one under **Trained
 policy** in the right-hand rail, press **Load**, and choose courses in the
 **Terrain** tab.
+
+## Motor-level reinforcement learning
+
+`joint-train` is the path with no hand-written locomotion controller. Its
+policy observes joint angles and rates, body motion, foot contacts, the active
+ordered waypoint, commanded speed, a parkour-required task bit, distances to
+the next trench's near and far lips, a three-lane forward terrain scan and a
+free-running clock. Its eighteen outputs are joint-position offsets sent
+straight to the selected plant's motors. There is no gait phase driving a leg,
+inverse kinematics target, scripted jump, or terrain-specific action gate.
+
+Training works through standing, slow and fast flat locomotion, rough ground,
+gaps and parkour before the final `MIXED` stage samples all fifteen courses.
+That final stage runs long enough to reach the course end. An episode only
+completes after entering every ordered waypoint and the finish; moving in the
+body's forward direction while getting farther from the route earns no
+locomotion score. `joint-eval` reports waypoint coverage, finish rate and
+finish time on held-out seeds with the same backend and rollout contract.
+
+The stable default is `--backend rapier`. The explicit experimental
+`--backend nexus-gpu` path uses `nexus3d = "0.5.0"` through native
+WebGPU/Vulkan; this is a headless compute path and is unrelated to the browser
+renderer. On Rapier, perturbation pairs reuse one warmed initial world and
+`--batch-envs 128` caps concurrent CPU rollout workers; on Nexus it bounds the
+independent worlds resident in one GPU batch. `--device 0` selects the current
+Nexus adapter. Nexus 0.5
+can currently step and actuate the batched robot, but its multibody motors do
+not yet preserve the neutral-standing behavior of the Rapier reference plant;
+do not use its scores as training evidence until the strict ignored GPU parity
+test passes. A Nexus failure is reported and never silently falls
+back to different physics.
+
+Build a release binary before judging throughput:
+
+```text
+cargo build --release -p hexapod-cli
+```
+
+Nexus builds its Rust-GPU shaders locally. Install the toolchain it documents
+before the first build:
+
+```text
+cargo install cargo-gpu --version 0.10.0-alpha.1
+cargo gpu install
+```
+
+Each successful training run writes the checkpoint plus a `.meta` companion
+recording the backend, Nexus version, seed, batch size, curriculum entry stage,
+and physics settings needed to reproduce the run.
+
+Joint checkpoints use `hexapod-joint-v1` and cannot be loaded as the browser's
+gait-level `hexapod-policy-v1`. Continue one with `--resume`; because training
+history is not stored in the file, name the stage to continue with
+`--stage` (it defaults to `mixed` for a resumed run).
 
 ## What it does
 
