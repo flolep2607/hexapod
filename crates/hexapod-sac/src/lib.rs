@@ -406,6 +406,49 @@ impl SacAgent {
         self.actor_vars.load(path)
     }
 
+    /// Load an actor whose observation vector is an exact prefix of the
+    /// current one. New inputs receive zero first-layer weights, preserving
+    /// the checkpoint's deterministic policy while allowing later fine-tuning
+    /// to use observations added by a newer environment.
+    pub fn load_actor_prefix<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
+        let saved = candle_core::safetensors::load(path, &self.device)?;
+        let current = self
+            .actor_vars
+            .data()
+            .lock()
+            .expect("actor variable map poisoned");
+        for (name, variable) in current.iter() {
+            let source = saved
+                .get(name)
+                .ok_or_else(|| candle_core::Error::Msg(format!("actor is missing {name}")))?;
+            if source.shape() == variable.shape() {
+                variable.set(source)?;
+                continue;
+            }
+            if name != "l1.weight" {
+                candle_core::bail!(
+                    "actor parameter {name} has shape {:?}, expected {:?}",
+                    source.shape(),
+                    variable.shape()
+                )
+            }
+            let (saved_hidden, saved_inputs) = source.dims2()?;
+            let (current_hidden, current_inputs) = variable.as_tensor().dims2()?;
+            if saved_hidden != current_hidden || saved_inputs > current_inputs {
+                candle_core::bail!(
+                    "actor input layer is {saved_hidden}x{saved_inputs}, expected a prefix of {current_hidden}x{current_inputs}"
+                )
+            }
+            let padding = Tensor::zeros(
+                (saved_hidden, current_inputs - saved_inputs),
+                DType::F32,
+                &self.device,
+            )?;
+            variable.set(&Tensor::cat(&[source, &padding], 1)?)?;
+        }
+        Ok(())
+    }
+
     /// Freeze the current deterministic policy as the quadratic fine-tuning
     /// prior. This keeps a useful initialized gait in-distribution while fresh
     /// critics learn its value; the live actor remains independently trainable.
@@ -609,6 +652,32 @@ mod tests {
         let actual = restored
             .action(&[0.1, 0.2, -0.3], &norm, false, &mut rng)
             .expect("restored action");
+        std::fs::remove_file(path).expect("remove temporary checkpoint");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn actor_checkpoint_can_gain_zero_weighted_observation_suffix() {
+        let source_norm = ObsNorm::new(3);
+        let target_norm = ObsNorm::new(5);
+        let mut rng = Rng::new(51);
+        let source = SacAgent::new(3, 2, &Device::Cpu, SacConfig::default(), 18).expect("source");
+        let expected = source
+            .action(&[0.1, 0.2, -0.3], &source_norm, false, &mut rng)
+            .expect("source action");
+        let path = std::env::temp_dir().join(format!(
+            "hexapod-sac-actor-prefix-{}.safetensors",
+            std::process::id()
+        ));
+        source.save_actor(&path).expect("save actor");
+        let mut restored =
+            SacAgent::new(5, 2, &Device::Cpu, SacConfig::default(), 19).expect("restored");
+        restored
+            .load_actor_prefix(&path)
+            .expect("load prefixed actor");
+        let actual = restored
+            .action(&[0.1, 0.2, -0.3, 7.0, -9.0], &target_norm, false, &mut rng)
+            .expect("expanded action");
         std::fs::remove_file(path).expect("remove temporary checkpoint");
         assert_eq!(actual, expected);
     }

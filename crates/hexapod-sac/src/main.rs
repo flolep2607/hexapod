@@ -178,13 +178,6 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             )
             .into());
         }
-        if normalizer.mean.len() != observations {
-            return Err(format!(
-                "initial checkpoint has {} legacy observations; it remains evaluable, but fine-tuning requires a {observations}-observation checkpoint",
-                normalizer.mean.len()
-            )
-            .into());
-        }
         normalizer
     } else {
         ObsNorm::new(observations)
@@ -207,7 +200,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         config.seed,
     )?;
     if let Some(path) = &config.init {
-        agent.load_actor(path)?;
+        agent.load_actor_prefix(path)?;
         agent.freeze_actor_prior()?;
     }
 
@@ -479,7 +472,7 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
         },
         config.seed,
     )?;
-    agent.load_actor(path)?;
+    agent.load_actor_prefix(path)?;
     let rollout = evaluate(
         &agent,
         &normalizer,
@@ -583,10 +576,16 @@ fn load_checkpoint_state(
     normalizer.n = metadata_required(&metadata, "norm_n")?.parse()?;
     normalizer.mean = parse_f64_list(metadata_required(&metadata, "norm_mean")?)?;
     normalizer.m2 = parse_f64_list(metadata_required(&metadata, "norm_m2")?)?;
-    normalizer.frozen = true;
     if normalizer.mean.len() != stored_observations || normalizer.m2.len() != stored_observations {
         return Err("checkpoint normalizer width does not match its observation width".into());
     }
+    if stored_observations == legacy_observations {
+        normalizer.mean.resize(observations, 0.0);
+        // A unit scale is a conservative default for observations that the
+        // migrated actor initially ignores through zero-padded input weights.
+        normalizer.m2.resize(observations, normalizer.n.max(1.0));
+    }
+    normalizer.frozen = true;
     Ok((hidden, normalizer))
 }
 

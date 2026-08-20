@@ -139,9 +139,9 @@ fresh critics before policy updates, and saves the loaded baseline before
 training. Optimizer and replay state are not resumed.
 
 Actors saved before executed setpoints were added keep their 85-element input
-contract and remain evaluable. New actors use 103 observations. Legacy actors
-are not accepted by `--init`, because silently widening a trained input layer
-would change the fine-tuning problem.
+contract and remain evaluable. New actors use 103 observations. `--init`
+losslessly widens a legacy actor by assigning zero first-layer weights and a
+unit normalization scale to the appended executed-setpoint observations.
 
 Joint checkpoints use `hexapod-joint-v1` and cannot be loaded as the browser's
 gait-level `hexapod-policy-v1`. Continue one with `--resume`; because training
