@@ -33,6 +33,8 @@ cargo run --release -p hexapod-sac -- --steps 500000 --envs 16 --replay 1000000 
 cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --steps 500000
 # Re-run held-out evaluation with the checkpoint's frozen normalizer.
 cargo run --release -p hexapod-sac -- --eval checkpoints/joint-sac-walk-v1.safetensors
+# Fine-tune a useful actor without restarting its gait or observation scale.
+cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --init checkpoints/joint-sac-walk-v1.safetensors --out checkpoints/joint-sac-walk-finetuned-v1.safetensors
 
 # Experimental Nexus 0.5 native-GPU batch path.
 cargo run --release -p hexapod-cli -- joint-train --backend nexus-gpu --batch-envs 128 --iters 20 --out joint-gpu.txt
@@ -118,6 +120,11 @@ does not open until held-out flat evaluation crosses its score gate; harder
 terrain is never trained on merely because a fixed iteration budget expired.
 The best actor is saved as safetensors with a `.meta` file containing its exact
 observation normalizer and run configuration.
+
+`--init` starts a new off-policy fine-tuning run from a saved actor. It freezes
+the checkpoint's observation normalizer, gathers the initial replay with that
+actor, bootstraps fresh critics before policy updates, and saves the loaded
+baseline before training. Optimizer and replay state are not resumed.
 
 Joint checkpoints use `hexapod-joint-v1` and cannot be loaded as the browser's
 gait-level `hexapod-policy-v1`. Continue one with `--resume`; because training

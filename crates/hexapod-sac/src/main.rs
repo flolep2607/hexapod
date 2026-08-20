@@ -36,6 +36,7 @@ struct TrainConfig {
     action_prior_cost: f64,
     device: String,
     out: PathBuf,
+    init: Option<PathBuf>,
     eval: Option<PathBuf>,
 }
 
@@ -70,6 +71,7 @@ impl TrainConfig {
                 value(&args, "--out")
                     .unwrap_or_else(|| "checkpoints/joint-sac-walk-v1.safetensors".into()),
             ),
+            init: value(&args, "--init").map(PathBuf::from),
             eval: value(&args, "--eval").map(PathBuf::from),
         })
     }
@@ -149,7 +151,19 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         .iter()
         .map(|environment| environment.state().to_vec())
         .collect::<Vec<_>>();
-    let mut normalizer = ObsNorm::new(observations);
+    let mut normalizer = if let Some(path) = &config.init {
+        let (hidden, normalizer) = load_checkpoint_state(path, observations, actions)?;
+        if hidden != config.hidden {
+            return Err(format!(
+                "initial checkpoint uses hidden width {hidden}, but --hidden is {}",
+                config.hidden
+            )
+            .into());
+        }
+        normalizer
+    } else {
+        ObsNorm::new(observations)
+    };
     let mut replay = JointReplay::new(config.replay_capacity, observations, actions)?;
     let mut rng = Rng::new(config.seed ^ 0x51AC_2026);
     let mut agent = SacAgent::new(
@@ -167,6 +181,9 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         },
         config.seed,
     )?;
+    if let Some(path) = &config.init {
+        agent.load_actor(path)?;
+    }
 
     let started = Instant::now();
     let mut transitions = 0usize;
@@ -188,12 +205,40 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         " steps   replay updates   score   dist  feet  alpha   q      losses (critic/actor)  wall"
     );
 
+    if config.init.is_some() {
+        let evaluation = evaluate(
+            &agent,
+            &normalizer,
+            &physics,
+            frame,
+            stage,
+            config.eval_episodes,
+            config.seed + 1_000_001,
+        )?;
+        best_score = evaluation.score;
+        save_checkpoint(&agent, &normalizer, &config, &evaluation)?;
+        println!(
+            "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2}  {alpha:>5.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+            transitions = 0,
+            replay_len = 0,
+            updates = 0,
+            score = evaluation.score,
+            distance = evaluation.distance,
+            support = evaluation.support,
+            alpha = agent.alpha()?,
+            q = 0.0,
+            critic = 0.0,
+            actor = 0.0,
+            wall = started.elapsed().as_secs_f64(),
+        );
+    }
+
     while transitions < config.steps {
         for state in &states {
             normalizer.observe(state);
         }
         let take = (config.steps - transitions).min(environments.len());
-        let unit_actions = if transitions < config.warmup_steps {
+        let unit_actions = if transitions < config.warmup_steps && config.init.is_none() {
             let hold = (take as f64 * config.warmup_hold_fraction).round() as usize;
             (0..take)
                 .flat_map(|environment| {
@@ -360,30 +405,10 @@ fn evaluate(
 }
 
 fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> AppResult<()> {
-    let metadata = std::fs::read_to_string(meta_path(path))?;
-    if metadata_field(&metadata, "format") != Some("hexapod-sac-actor-v1") {
-        return Err("checkpoint metadata is not hexapod-sac-actor-v1".into());
-    }
     let frame = Frame::new(6);
     let observations = n_obs(frame);
     let actions = n_act(frame);
-    let stored_observations = metadata_required(&metadata, "observations")?.parse::<usize>()?;
-    let stored_actions = metadata_required(&metadata, "actions")?.parse::<usize>()?;
-    if stored_observations != observations || stored_actions != actions {
-        return Err(format!(
-            "checkpoint dimensions {stored_observations}x{stored_actions}, expected {observations}x{actions}"
-        )
-        .into());
-    }
-    let hidden = metadata_required(&metadata, "hidden")?.parse::<usize>()?;
-    let mut normalizer = ObsNorm::new(observations);
-    normalizer.n = metadata_required(&metadata, "norm_n")?.parse()?;
-    normalizer.mean = parse_f64_list(metadata_required(&metadata, "norm_mean")?)?;
-    normalizer.m2 = parse_f64_list(metadata_required(&metadata, "norm_m2")?)?;
-    normalizer.frozen = true;
-    if normalizer.mean.len() != observations || normalizer.m2.len() != observations {
-        return Err("checkpoint normalizer width does not match its observation width".into());
-    }
+    let (hidden, normalizer) = load_checkpoint_state(path, observations, actions)?;
 
     let mut agent = SacAgent::new(
         observations,
@@ -436,10 +461,14 @@ fn save_checkpoint(
     }
     agent.save_actor(&config.out)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\ninit={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
         evaluation.score,
         evaluation.distance,
         config.seed,
+        config
+            .init
+            .as_deref()
+            .map_or_else(|| "none".into(), |path| path.display().to_string()),
         normalizer.mean.len(),
         n_act(Frame::new(6)),
         config.hidden,
@@ -463,6 +492,35 @@ fn meta_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".meta");
     PathBuf::from(value)
+}
+
+fn load_checkpoint_state(
+    path: &Path,
+    observations: usize,
+    actions: usize,
+) -> AppResult<(usize, ObsNorm)> {
+    let metadata = std::fs::read_to_string(meta_path(path))?;
+    if metadata_field(&metadata, "format") != Some("hexapod-sac-actor-v1") {
+        return Err("checkpoint metadata is not hexapod-sac-actor-v1".into());
+    }
+    let stored_observations = metadata_required(&metadata, "observations")?.parse::<usize>()?;
+    let stored_actions = metadata_required(&metadata, "actions")?.parse::<usize>()?;
+    if stored_observations != observations || stored_actions != actions {
+        return Err(format!(
+            "checkpoint dimensions {stored_observations}x{stored_actions}, expected {observations}x{actions}"
+        )
+        .into());
+    }
+    let hidden = metadata_required(&metadata, "hidden")?.parse::<usize>()?;
+    let mut normalizer = ObsNorm::new(observations);
+    normalizer.n = metadata_required(&metadata, "norm_n")?.parse()?;
+    normalizer.mean = parse_f64_list(metadata_required(&metadata, "norm_mean")?)?;
+    normalizer.m2 = parse_f64_list(metadata_required(&metadata, "norm_m2")?)?;
+    normalizer.frozen = true;
+    if normalizer.mean.len() != observations || normalizer.m2.len() != observations {
+        return Err("checkpoint normalizer width does not match its observation width".into());
+    }
+    Ok((hidden, normalizer))
 }
 
 fn join_f64(values: &[f64]) -> String {
@@ -550,6 +608,7 @@ fn print_help() {
          --device cpu|cuda:N  tensor device (CUDA requires --features cuda)\n\
          --seed N             deterministic run seed\n\
          --out PATH           best actor safetensors checkpoint\n\
+         --init PATH          fine-tune an actor with its frozen normalizer\n\
          --eval PATH          evaluate a saved actor with its frozen normalizer"
     );
 }
