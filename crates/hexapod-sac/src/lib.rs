@@ -197,6 +197,7 @@ impl SacAgent {
         )?;
 
         deterministic_init(&actor_vars, seed, device)?;
+        initialize_actor_output(&actor_vars, actions, device)?;
         deterministic_init(&critic_vars, seed ^ 0xA5A5_A5A5_A5A5_A5A5, device)?;
         copy_parameters(&critic_vars, &target_vars, 1.0)?;
 
@@ -428,6 +429,21 @@ fn deterministic_init(vars: &VarMap, seed: u64, device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn initialize_actor_output(vars: &VarMap, actions: usize, device: &Device) -> Result<()> {
+    let data = vars.data().lock().expect("actor variable map poisoned");
+    let weight = data
+        .get("out.weight")
+        .ok_or_else(|| candle_core::Error::Msg("actor is missing out.weight".into()))?;
+    let bias = data
+        .get("out.bias")
+        .ok_or_else(|| candle_core::Error::Msg("actor is missing out.bias".into()))?;
+    weight.set(&Tensor::zeros(weight.shape(), DType::F32, device)?)?;
+    let mut values = vec![0.0f32; actions * 2];
+    values[actions..].fill(-1.5);
+    bias.set(&Tensor::from_vec(values, actions * 2, device)?)?;
+    Ok(())
+}
+
 fn copy_parameters(source: &VarMap, target: &VarMap, tau: f64) -> Result<()> {
     let source = source
         .data()
@@ -473,6 +489,17 @@ mod tests {
             .action(&[0.2, -0.7, 1.1], &norm, false, &mut rng_b)
             .expect("action B");
         assert_eq!(action_a, action_b);
+    }
+
+    #[test]
+    fn actor_starts_at_the_exact_standing_action() {
+        let norm = ObsNorm::new(3);
+        let mut rng = Rng::new(2);
+        let agent = SacAgent::new(3, 2, &Device::Cpu, SacConfig::default(), 45).expect("agent");
+        let action = agent
+            .action(&[4.0, -2.0, 0.7], &norm, false, &mut rng)
+            .expect("action");
+        assert_eq!(action, vec![0.0; 2]);
     }
 
     #[test]
