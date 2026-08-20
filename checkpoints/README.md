@@ -14,6 +14,22 @@ cargo run --release -p hexapod-sac --features cuda -- \
   --eval-episodes 20 --seed 30360831
 ```
 
+`joint-sac-run-cpu-selected-140k-v1.safetensors` is the first retained
+`RUN-FLAT` improvement. It losslessly migrates the gate-clearing walker to the
+103-element observation contract, ramps commands from 0.8 to 2.0 m/s, and
+delays actor updates until the critics have trained at full speed.
+The best actor was retained at 110,000 transitions from a 140,000-transition
+run (seed 20260906). Canonical CPU inference scores 0.213 over 64 evaluations:
+1.26 m in 4.0 s, 2.44 mean supporting feet, and no fall, versus 0.162 for its
+parent at the running command. It is a reproducible intermediate, not yet the
+0.40 `RUN-FLAT` promotion checkpoint. Re-evaluate it with:
+
+```bash
+cargo run --release -p hexapod-sac -- \
+  --eval checkpoints/joint-sac-run-cpu-selected-140k-v1.safetensors \
+  --eval-episodes 64 --seed 20269999
+```
+
 `all-terrain-v6.txt` is the recommended controller. It was trained in staged
 all-terrain passes, always keeping every course in the training suite while
 temporarily weighting `GAPS`, `JUMP`, and `SLALOM`. On a disjoint audit of 600
