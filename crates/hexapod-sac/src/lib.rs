@@ -157,6 +157,7 @@ pub struct UpdateStats {
     pub alpha_loss: f32,
     pub alpha: f32,
     pub mean_q: f32,
+    pub mean_entropy_per_action: f32,
 }
 
 pub struct SacAgent {
@@ -335,7 +336,8 @@ impl SacAgent {
         let critic_loss_value = critic_loss.to_vec0::<f32>()?;
         self.critic_optim.backward_step(&critic_loss)?;
 
-        let (actor_loss_value, alpha_loss_value, mean_q) = if update_policy {
+        let (actor_loss_value, alpha_loss_value, mean_q, mean_entropy_per_action) = if update_policy
+        {
             let actor_epsilon = epsilon_tensor(batch_size, self.actions, rng, &self.device)?;
             let (policy_actions, log_probability) =
                 self.actor.sample(&observations, &actor_epsilon)?;
@@ -367,14 +369,22 @@ impl SacAgent {
                 .affine(-1.0, 0.0)?
                 .mean_all()?;
             let alpha_loss_value = alpha_loss.to_vec0::<f32>()?;
+            let mean_entropy_per_action =
+                -log_probability.mean_all()?.to_vec0::<f32>()? / self.actions as f32;
             self.alpha_optim.backward_step(&alpha_loss)?;
             (
                 actor_loss_value,
                 alpha_loss_value,
                 policy_q.mean_all()?.to_vec0::<f32>()?,
+                mean_entropy_per_action,
             )
         } else {
-            (0.0, 0.0, q1.minimum(&q2)?.mean_all()?.to_vec0::<f32>()?)
+            (
+                0.0,
+                0.0,
+                q1.minimum(&q2)?.mean_all()?.to_vec0::<f32>()?,
+                0.0,
+            )
         };
 
         copy_parameters(&self.critic_vars, &self.target_vars, self.config.tau)?;
@@ -384,6 +394,7 @@ impl SacAgent {
             alpha_loss: alpha_loss_value,
             alpha: self.alpha()?,
             mean_q,
+            mean_entropy_per_action,
         })
     }
 

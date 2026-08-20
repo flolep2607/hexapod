@@ -35,6 +35,8 @@ cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --steps 50
 cargo run --release -p hexapod-sac -- --eval checkpoints/joint-sac-walk-v1.safetensors
 # Fine-tune a useful actor without restarting its gait or observation scale.
 cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --init checkpoints/joint-sac-walk-v1.safetensors --out checkpoints/joint-sac-walk-finetuned-v1.safetensors
+# Train the next flat-ground curriculum objective explicitly.
+cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --stage run-flat --steps 500000 --out checkpoints/joint-sac-run-v1.safetensors
 
 # Experimental Nexus 0.5 native-GPU batch path.
 cargo run --release -p hexapod-cli -- joint-train --backend nexus-gpu --batch-envs 128 --iters 20 --out joint-gpu.txt
@@ -117,12 +119,12 @@ batch, while Candle differentiates the policy and value networks. Until Nexus
 matches the reference plant's standing dynamics, SAC uses parallel reusable
 Rapier worlds for experience and may use CUDA for the network updates.
 
-The SAC curriculum currently exposes only `WALK-FLAT` on purpose. Random-action
-smoke tests validate plumbing but are not locomotion evidence. The next stage
-does not open until held-out flat evaluation crosses its score gate; harder
-terrain is never trained on merely because a fixed iteration budget expired.
-The best actor is saved as safetensors with a `.meta` file containing its exact
-observation normalizer and run configuration.
+The SAC CLI exposes `WALK-FLAT` and `RUN-FLAT` explicitly. Random-action smoke
+tests validate plumbing but are not locomotion evidence. Start `RUN-FLAT` only
+after held-out walking evaluation crosses its score gate; harder terrain is
+never trained merely because a fixed iteration budget expired. The best actor
+is saved as safetensors with a `.meta` file containing its stage, exact
+observation normalizer, and run configuration.
 
 `--init` starts a new off-policy fine-tuning run from a saved actor. It freezes
 the checkpoint's observation normalizer, gathers the initial replay with that

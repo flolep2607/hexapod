@@ -16,6 +16,7 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 
 #[derive(Clone, Debug)]
 struct TrainConfig {
+    stage: Stage,
     steps: usize,
     environments: usize,
     replay_capacity: usize,
@@ -48,6 +49,7 @@ impl TrainConfig {
             std::process::exit(0);
         }
         Ok(Self {
+            stage: parse_stage(value(&args, "--stage").as_deref().unwrap_or("walk-flat"))?,
             steps: parse(&args, "--steps", 500_000)?,
             environments: parse(&args, "--envs", 16)?,
             replay_capacity: parse(&args, "--replay", 1_000_000)?,
@@ -136,7 +138,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     let observations = n_obs(frame);
     let actions = n_act(frame);
     let physics = Physics::default();
-    let stage = Stage::WalkFlat;
+    let stage = config.stage;
     let mut environments = (0..config.environments)
         .map(|index| {
             JointEnv::new(
@@ -202,7 +204,8 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     let mut best_score = f64::NEG_INFINITY;
 
     println!(
-        "# native SAC · {} envs · replay {} · batch {} · UTD {:.2} · {:?}",
+        "# native SAC · {} · {} envs · replay {} · batch {} · UTD {:.2} · {:?}",
+        stage.name(),
         config.environments,
         config.replay_capacity,
         config.batch_size,
@@ -210,7 +213,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         device
     );
     println!(
-        " steps   replay updates   score   dist  feet  alpha   q      losses (critic/actor)  wall"
+        " steps   replay updates   score   dist  feet    alpha entropy   q      losses (critic/actor)  wall"
     );
 
     if config.init.is_some() {
@@ -227,7 +230,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         best_score = evaluation.score;
         save_checkpoint(&agent, &normalizer, &config, &evaluation)?;
         println!(
-            "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2}  {alpha:>5.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+            "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
             transitions = 0,
             replay_len = 0,
             updates = 0,
@@ -235,6 +238,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             distance = evaluation.distance,
             support = evaluation.support,
             alpha = agent.alpha()?,
+            entropy = 0.0,
             q = 0.0,
             critic = 0.0,
             actor = 0.0,
@@ -339,14 +343,16 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 alpha_loss: 0.0,
                 alpha: agent.alpha()?,
                 mean_q: 0.0,
+                mean_entropy_per_action: 0.0,
             });
             println!(
-                "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2}  {alpha:>5.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+                "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
                 replay_len = replay.len(),
                 score = evaluation.score,
                 distance = evaluation.distance,
                 support = evaluation.support,
                 alpha = stats.alpha,
+                entropy = stats.mean_entropy_per_action,
                 q = stats.mean_q,
                 critic = stats.critic_loss,
                 actor = stats.actor_loss,
@@ -427,6 +433,8 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
     let frame = Frame::new(6);
     let observations = n_obs(frame);
     let actions = n_act(frame);
+    let metadata = std::fs::read_to_string(meta_path(path))?;
+    let stage = parse_stage(metadata_required(&metadata, "stage")?)?;
     let (hidden, normalizer) = load_checkpoint_state(path, observations, actions)?;
     let actor_observations = normalizer.mean.len();
 
@@ -446,14 +454,15 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
         &normalizer,
         &Physics::default(),
         frame,
-        Stage::WalkFlat,
+        stage,
         actor_observations,
         config.eval_episodes,
         config.seed + 1_000_001,
     )?;
     println!(
-        "# SAC checkpoint {} · WALK-FLAT · {} held-out episode(s) · {:?}",
+        "# SAC checkpoint {} · {} · {} held-out episode(s) · {:?}",
         path.display(),
+        stage.name(),
         config.eval_episodes,
         device
     );
@@ -482,7 +491,8 @@ fn save_checkpoint(
     }
     agent.save_actor(&config.out)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\ninit={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage={}\nscore={:.17}\ndistance={:.17}\nseed={}\ninit={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        config.stage.name(),
         evaluation.score,
         evaluation.distance,
         config.seed,
@@ -609,9 +619,18 @@ where
     }
 }
 
+fn parse_stage(value: &str) -> AppResult<Stage> {
+    match value.to_ascii_lowercase().replace('_', "-").as_str() {
+        "walk-flat" | "walk" => Ok(Stage::WalkFlat),
+        "run-flat" | "run" => Ok(Stage::RunFlat),
+        _ => Err(format!("unsupported SAC stage {value:?}; use walk-flat or run-flat").into()),
+    }
+}
+
 fn print_help() {
     println!(
         "hexapod-sac — native off-policy motor learner\n\n\
+         --stage NAME         walk-flat or run-flat (default walk-flat)\n\
          --steps N            collected transitions (default 500000)\n\
          --envs N             parallel reusable Rapier worlds (default 16)\n\
          --replay N           replay capacity (default 1000000)\n\
@@ -635,4 +654,16 @@ fn print_help() {
          --init PATH          fine-tune an actor with its frozen normalizer\n\
          --eval PATH          evaluate a saved actor with its frozen normalizer"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sac_stage_names_are_explicit_and_reject_harder_terrain() {
+        assert_eq!(parse_stage("walk-flat").expect("walk"), Stage::WalkFlat);
+        assert_eq!(parse_stage("RUN_FLAT").expect("run"), Stage::RunFlat);
+        assert!(parse_stage("mixed").is_err());
+    }
 }
