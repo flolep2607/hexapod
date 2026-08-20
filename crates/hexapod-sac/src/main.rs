@@ -184,25 +184,22 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     };
     let mut replay = JointReplay::new(config.replay_capacity, observations, actions)?;
     let mut rng = Rng::new(config.seed ^ 0x51AC_2026);
-    let mut agent = SacAgent::new(
-        observations,
-        actions,
-        &device,
-        SacConfig {
-            hidden: config.hidden,
-            actor_lr: config.actor_lr,
-            reward_scale: config.reward_scale,
-            initial_alpha: config.initial_alpha,
-            target_entropy_per_action: config.target_entropy_per_action,
-            action_prior_cost: config.action_prior_cost,
-            ..SacConfig::default()
-        },
-        config.seed,
-    )?;
+    let sac_config = SacConfig {
+        hidden: config.hidden,
+        actor_lr: config.actor_lr,
+        reward_scale: config.reward_scale,
+        initial_alpha: config.initial_alpha,
+        target_entropy_per_action: config.target_entropy_per_action,
+        action_prior_cost: config.action_prior_cost,
+        ..SacConfig::default()
+    };
+    let mut agent = SacAgent::new(observations, actions, &device, sac_config, config.seed)?;
     if let Some(path) = &config.init {
         agent.load_actor_prefix(path)?;
         agent.freeze_actor_prior()?;
     }
+    let mut evaluation_agent =
+        SacAgent::new(observations, actions, &Device::Cpu, sac_config, config.seed)?;
 
     let started = Instant::now();
     let mut transitions = 0usize;
@@ -213,7 +210,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     let mut best_score = f64::NEG_INFINITY;
 
     println!(
-        "# native SAC · {} · speed {:.2}->{:.2} over {} steps · {} envs · replay {} · batch {} · UTD {:.2} · {:?}",
+        "# native SAC · {} · speed {:.2}->{:.2} over {} steps · {} envs · replay {} · batch {} · UTD {:.2} · train {:?} · eval Cpu",
         stage.name(),
         config.start_speed,
         stage.speed(),
@@ -229,8 +226,9 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     );
 
     if config.init.is_some() {
+        evaluation_agent.copy_actor_from(&agent)?;
         let evaluation = evaluate(
-            &agent,
+            &evaluation_agent,
             &normalizer,
             &physics,
             frame,
@@ -350,8 +348,9 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         }
 
         if transitions >= next_evaluation || transitions == config.steps {
+            evaluation_agent.copy_actor_from(&agent)?;
             let evaluation = evaluate(
-                &agent,
+                &evaluation_agent,
                 &normalizer,
                 &physics,
                 frame,

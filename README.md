@@ -113,6 +113,11 @@ curriculum promotion still use the stricter net-progress episode score.
 Observations include the executed joint setpoints, so actuator slew does not
 hide controller state from the actor or critics.
 
+CUDA accelerates actor/critic updates, but checkpoint promotion always runs a
+CPU copy of the actor. This makes the saved score match the deployment inference
+path even when tiny backend floating-point differences alter a contact-rich
+trajectory.
+
 The tensor implementation is Candle 0.11. CPU is the dependency-light default;
 the `cuda` feature moves batched actor and critic work to NVIDIA GPUs. Nexus and
 Candle solve different problems here: Nexus is the experimental GPU physics

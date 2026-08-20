@@ -449,6 +449,38 @@ impl SacAgent {
         Ok(())
     }
 
+    /// Copy actor parameters across devices without moving optimizer state.
+    /// Training uses this to evaluate CUDA updates through a canonical CPU
+    /// inference path before a checkpoint is promoted.
+    pub fn copy_actor_from(&mut self, source: &Self) -> Result<()> {
+        if self.observations != source.observations
+            || self.actions != source.actions
+            || self.config.hidden != source.config.hidden
+        {
+            candle_core::bail!("actor architectures do not match")
+        }
+        let source = source
+            .actor_vars
+            .data()
+            .lock()
+            .expect("source actor variable map poisoned")
+            .iter()
+            .map(|(name, variable)| (name.clone(), variable.as_tensor().detach()))
+            .collect::<Vec<_>>();
+        let target = self
+            .actor_vars
+            .data()
+            .lock()
+            .expect("target actor variable map poisoned");
+        for (name, tensor) in source {
+            let variable = target
+                .get(&name)
+                .ok_or_else(|| candle_core::Error::Msg(format!("actor is missing {name}")))?;
+            variable.set(&tensor.to_device(&self.device)?)?;
+        }
+        Ok(())
+    }
+
     /// Freeze the current deterministic policy as the quadratic fine-tuning
     /// prior. This keeps a useful initialized gait in-distribution while fresh
     /// critics learn its value; the live actor remains independently trainable.
@@ -679,6 +711,23 @@ mod tests {
             .action(&[0.1, 0.2, -0.3, 7.0, -9.0], &target_norm, false, &mut rng)
             .expect("expanded action");
         std::fs::remove_file(path).expect("remove temporary checkpoint");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn actor_parameters_copy_without_optimizer_or_initialization_state() {
+        let norm = ObsNorm::new(3);
+        let mut rng = Rng::new(52);
+        let source = SacAgent::new(3, 2, &Device::Cpu, SacConfig::default(), 20).expect("source");
+        let expected = source
+            .action(&[0.2, -0.1, 0.4], &norm, false, &mut rng)
+            .expect("source action");
+        let mut target =
+            SacAgent::new(3, 2, &Device::Cpu, SacConfig::default(), 21).expect("target");
+        target.copy_actor_from(&source).expect("copy actor");
+        let actual = target
+            .action(&[0.2, -0.1, 0.4], &norm, false, &mut rng)
+            .expect("target action");
         assert_eq!(actual, expected);
     }
 
