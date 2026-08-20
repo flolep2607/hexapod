@@ -113,15 +113,17 @@ pub const MAX_JOINT_OBS: usize = 3 * MAX_LEGS  // joint angles
     + 2                                       // next trench near/far lips
     + N_TERRAIN_SCAN                          // forward terrain heights
     + 2 * MAX_LEGS                            // per-leg clock sin, cos
-    + 1; // bias
+    + 1                                       // bias
+    + 3 * MAX_LEGS; // executed joint setpoints
 
 pub const MAX_JOINT_ACT: usize = 3 * MAX_LEGS;
 
 /// Observation width for `frame`.
 pub fn n_obs(frame: Frame) -> usize {
     let n = frame.legs();
-    // 3n angles + 3n rates + n contacts + 2n phase, then the body block.
-    9 * n + 3 + 3 + 2 + 1 + 2 + 1 + 1 + 2 + N_TERRAIN_SCAN + 1
+    // 3n angles + 3n rates + n contacts + 2n phase + 3n setpoints, then the
+    // body block. Setpoints are appended so legacy observations stay a prefix.
+    12 * n + 3 + 3 + 2 + 1 + 2 + 1 + 1 + 2 + N_TERRAIN_SCAN + 1
 }
 
 /// Action width for `frame`.
@@ -974,7 +976,17 @@ impl JointEnv {
             self.observation[phase + i * 2 + 1] = ph.cos();
         }
         self.observation[phase + n * 2] = 1.0;
-        debug_assert_eq!(phase + n * 2 + 1, self.observation.len());
+        let setpoints = phase + n * 2 + 1;
+        for i in 0..n {
+            for c in 0..3 {
+                self.observation[setpoints + i * 3 + c] = clamp(
+                    (self.q_cmd[i][c] - self.neutral[i][c]) / ACT_RANGE,
+                    -1.0,
+                    1.0,
+                );
+            }
+        }
+        debug_assert_eq!(setpoints + n * 3, self.observation.len());
     }
 
     fn refresh_observation(&mut self) -> TickState {
@@ -2427,15 +2439,31 @@ pub fn from_text(text: &str) -> Result<JointPolicy, String> {
     let mut mean = nums(&get("norm_mean")?)?;
     let mut m2 = nums(&get("norm_m2")?)?;
 
-    // Course-aware jump features were appended to v1 after terrain scans
-    // already existed. Preserve checkpoints from any intermediate width by
-    // inserting initially unused input columns; resumed training can learn
-    // their weights without changing the policy's pre-migration output.
+    // Preserve checkpoints as observations evolve by adding initially unused
+    // input columns. Resumed training can learn their weights without changing
+    // the policy's pre-migration output.
     let current_obs = n_obs(frame);
     let old_obs = mean.len();
     let added = current_obs.saturating_sub(old_obs);
     let old_theta = old_obs * N_HIDDEN + N_HIDDEN + N_HIDDEN * n_act(frame) + n_act(frame);
-    if (1..=3).contains(&added)
+    if added == n_act(frame)
+        && theta.len() == old_theta
+        && mean.len() == old_obs
+        && m2.len() == old_obs
+    {
+        // Executed setpoints were appended after the legacy bias input, so the
+        // complete old observation remains an exact prefix.
+        let rest = theta.split_off(old_obs * N_HIDDEN);
+        let mut migrated = Vec::with_capacity(n_theta(frame));
+        for row in theta.chunks_exact(old_obs) {
+            migrated.extend_from_slice(row);
+            migrated.extend(std::iter::repeat_n(0.0, added));
+        }
+        migrated.extend(rest);
+        theta = migrated;
+        mean.extend(std::iter::repeat_n(0.0, added));
+        m2.extend(std::iter::repeat_n(norm_n.max(1.0), added));
+    } else if (1..=3).contains(&added)
         && theta.len() == old_theta
         && mean.len() == old_obs
         && m2.len() == old_obs
@@ -2615,6 +2643,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observation_exposes_executed_setpoints_and_reset_clears_them() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut env = JointEnv::new(frame, &phys, terrain, Stage::WalkFlat);
+        let setpoint_start = n_obs(frame) - n_act(frame);
+        assert!(
+            env.state()[setpoint_start..]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+
+        let step = env
+            .step(&vec![ACT_RANGE; n_act(frame)])
+            .expect("valid joint action");
+        let setpoints = &step.observation[setpoint_start..];
+        assert!(setpoints.iter().any(|value| value.abs() > 0.01));
+        assert!(setpoints.iter().all(|value| value.abs() <= 1.0));
+
+        let reset = env.reset();
+        assert!(reset[setpoint_start..].iter().all(|value| *value == 0.0));
+    }
+
     /// The seeded policy holds the machine up on flat ground. This is the
     /// baseline every later stage builds on, and it is also the check that the
     /// plant's motors can carry the chassis at all.
@@ -2646,7 +2698,7 @@ mod tests {
     fn the_observation_vector_is_the_width_it_claims() {
         for legs in [4usize, 6, 10] {
             let frame = Frame::new(legs);
-            let expect = 9 * legs + 16 + N_TERRAIN_SCAN;
+            let expect = 12 * legs + 16 + N_TERRAIN_SCAN;
             assert_eq!(n_obs(frame), expect, "{legs} legs");
             assert_eq!(n_act(frame), 3 * legs);
             assert!(n_obs(frame) <= MAX_JOINT_OBS);
@@ -3174,6 +3226,37 @@ mod tests {
         assert_eq!(
             &migrated.norm.m2[task_index..task_index + 3],
             &[legacy.norm.n; 3]
+        );
+    }
+
+    #[test]
+    fn checkpoint_without_executed_setpoints_is_migrated_losslessly() {
+        let frame = Frame::new(6);
+        let mut expected = JointPolicy::seeded(frame, 13);
+        expected.norm.n = 25.0;
+        let old_obs = n_obs(frame) - n_act(frame);
+        for row in expected.theta[..n_obs(frame) * N_HIDDEN].chunks_exact_mut(n_obs(frame)) {
+            row[old_obs..].fill(0.0);
+        }
+
+        let mut legacy = expected.clone();
+        let rest = legacy.theta.split_off(n_obs(frame) * N_HIDDEN);
+        let mut old_theta = Vec::with_capacity(old_obs * N_HIDDEN + rest.len());
+        for row in legacy.theta.chunks_exact(n_obs(frame)) {
+            old_theta.extend_from_slice(&row[..old_obs]);
+        }
+        old_theta.extend(rest);
+        legacy.theta = old_theta;
+        legacy.norm.mean.truncate(old_obs);
+        legacy.norm.m2.truncate(old_obs);
+
+        let migrated = from_text(&to_text(&legacy)).expect("migrate setpoint observations");
+        assert_eq!(migrated.theta, expected.theta);
+        assert_eq!(migrated.norm.mean.len(), n_obs(frame));
+        assert_eq!(&migrated.norm.mean[old_obs..], &vec![0.0; n_act(frame)]);
+        assert_eq!(
+            &migrated.norm.m2[old_obs..],
+            &vec![legacy.norm.n; n_act(frame)]
         );
     }
 

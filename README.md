@@ -107,7 +107,8 @@ large minibatches, and held-out deterministic evaluation. True episode endings
 are stored separately from time-limit truncation so Bellman targets bootstrap
 only when they should. Critics learn from the local posture/support/speed
 signal; checkpoint selection and curriculum promotion still use the stricter
-net-progress episode score.
+net-progress episode score. Observations include the executed joint setpoints,
+so actuator slew does not hide controller state from the actor or critics.
 
 The tensor implementation is Candle 0.11. CPU is the dependency-light default;
 the `cuda` feature moves batched actor and critic work to NVIDIA GPUs. Nexus and
@@ -128,6 +129,11 @@ the checkpoint's observation normalizer, gathers the initial replay with that
 actor, uses a frozen copy of the actor as the fine-tuning prior, bootstraps
 fresh critics before policy updates, and saves the loaded baseline before
 training. Optimizer and replay state are not resumed.
+
+Actors saved before executed setpoints were added keep their 85-element input
+contract and remain evaluable. New actors use 103 observations. Legacy actors
+are not accepted by `--init`, because silently widening a trained input layer
+would change the fine-tuning problem.
 
 Joint checkpoints use `hexapod-joint-v1` and cannot be loaded as the browser's
 gait-level `hexapod-policy-v1`. Continue one with `--resume`; because training

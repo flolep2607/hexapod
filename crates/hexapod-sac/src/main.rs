@@ -160,6 +160,13 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             )
             .into());
         }
+        if normalizer.mean.len() != observations {
+            return Err(format!(
+                "initial checkpoint has {} legacy observations; it remains evaluable, but fine-tuning requires a {observations}-observation checkpoint",
+                normalizer.mean.len()
+            )
+            .into());
+        }
         normalizer
     } else {
         ObsNorm::new(observations)
@@ -213,6 +220,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             &physics,
             frame,
             stage,
+            observations,
             config.eval_episodes,
             config.seed + 1_000_001,
         )?;
@@ -321,6 +329,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 &physics,
                 frame,
                 stage,
+                observations,
                 config.eval_episodes,
                 config.seed + 1_000_001,
             )?;
@@ -361,6 +370,7 @@ fn evaluate(
     physics: &Physics,
     frame: Frame,
     stage: Stage,
+    actor_observations: usize,
     episodes: usize,
     seed: u64,
 ) -> AppResult<JointRollout> {
@@ -374,7 +384,15 @@ fn evaluate(
             stage,
         );
         while !environment.is_done() {
-            let unit = agent.action(environment.state(), normalizer, false, &mut rng)?;
+            let state = environment.state();
+            if actor_observations > state.len() {
+                return Err(format!(
+                    "actor expects {actor_observations} observations, environment provides {}",
+                    state.len()
+                )
+                .into());
+            }
+            let unit = agent.action(&state[..actor_observations], normalizer, false, &mut rng)?;
             let action = unit
                 .iter()
                 .map(|value| *value as f64 * ACT_RANGE)
@@ -410,9 +428,10 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
     let observations = n_obs(frame);
     let actions = n_act(frame);
     let (hidden, normalizer) = load_checkpoint_state(path, observations, actions)?;
+    let actor_observations = normalizer.mean.len();
 
     let mut agent = SacAgent::new(
-        observations,
+        actor_observations,
         actions,
         device,
         SacConfig {
@@ -428,6 +447,7 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
         &Physics::default(),
         frame,
         Stage::WalkFlat,
+        actor_observations,
         config.eval_episodes,
         config.seed + 1_000_001,
     )?;
@@ -506,19 +526,22 @@ fn load_checkpoint_state(
     }
     let stored_observations = metadata_required(&metadata, "observations")?.parse::<usize>()?;
     let stored_actions = metadata_required(&metadata, "actions")?.parse::<usize>()?;
-    if stored_observations != observations || stored_actions != actions {
+    let legacy_observations = observations.saturating_sub(actions);
+    if (stored_observations != observations && stored_observations != legacy_observations)
+        || stored_actions != actions
+    {
         return Err(format!(
-            "checkpoint dimensions {stored_observations}x{stored_actions}, expected {observations}x{actions}"
+            "checkpoint dimensions {stored_observations}x{stored_actions}, expected {observations}x{actions} (or legacy {legacy_observations}x{actions})"
         )
         .into());
     }
     let hidden = metadata_required(&metadata, "hidden")?.parse::<usize>()?;
-    let mut normalizer = ObsNorm::new(observations);
+    let mut normalizer = ObsNorm::new(stored_observations);
     normalizer.n = metadata_required(&metadata, "norm_n")?.parse()?;
     normalizer.mean = parse_f64_list(metadata_required(&metadata, "norm_mean")?)?;
     normalizer.m2 = parse_f64_list(metadata_required(&metadata, "norm_m2")?)?;
     normalizer.frozen = true;
-    if normalizer.mean.len() != observations || normalizer.m2.len() != observations {
+    if normalizer.mean.len() != stored_observations || normalizer.m2.len() != stored_observations {
         return Err("checkpoint normalizer width does not match its observation width".into());
     }
     Ok((hidden, normalizer))
