@@ -1,0 +1,479 @@
+use candle_core::Device;
+use hexapod_core::Physics;
+use hexapod_core::joint_rl::{
+    ACT_RANGE, JointEnv, JointReplay, JointRollout, ObsNorm, Stage, n_act, n_obs,
+};
+use hexapod_core::math::Rng;
+use hexapod_core::robot::Frame;
+use hexapod_core::terrain::{Course, Terrain};
+use hexapod_sac::{SacAgent, SacConfig, UpdateStats};
+use rayon::prelude::*;
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+type AppResult<T> = Result<T, Box<dyn Error>>;
+
+#[derive(Clone, Debug)]
+struct TrainConfig {
+    steps: usize,
+    environments: usize,
+    replay_capacity: usize,
+    warmup_steps: usize,
+    batch_size: usize,
+    updates_per_step: f64,
+    eval_interval: usize,
+    eval_episodes: usize,
+    seed: u64,
+    hidden: usize,
+    device: String,
+    out: PathBuf,
+    eval: Option<PathBuf>,
+}
+
+impl TrainConfig {
+    fn from_args() -> AppResult<Self> {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+            print_help();
+            std::process::exit(0);
+        }
+        Ok(Self {
+            steps: parse(&args, "--steps", 500_000)?,
+            environments: parse(&args, "--envs", 16)?,
+            replay_capacity: parse(&args, "--replay", 1_000_000)?,
+            warmup_steps: parse(&args, "--warmup", 10_000)?,
+            batch_size: parse(&args, "--batch", 256)?,
+            updates_per_step: parse(&args, "--utd", 1.0)?,
+            eval_interval: parse(&args, "--eval-interval", 10_000)?,
+            eval_episodes: parse(&args, "--eval-episodes", 8)?,
+            seed: parse(&args, "--seed", 1)?,
+            hidden: parse(&args, "--hidden", 256)?,
+            device: value(&args, "--device").unwrap_or_else(|| "cpu".into()),
+            out: PathBuf::from(
+                value(&args, "--out")
+                    .unwrap_or_else(|| "checkpoints/joint-sac-walk-v1.safetensors".into()),
+            ),
+            eval: value(&args, "--eval").map(PathBuf::from),
+        })
+    }
+
+    fn validate(&self) -> AppResult<()> {
+        if self.steps == 0
+            || self.environments == 0
+            || self.replay_capacity == 0
+            || self.batch_size == 0
+            || self.eval_interval == 0
+            || self.eval_episodes == 0
+            || self.hidden == 0
+        {
+            return Err("counts must all be non-zero".into());
+        }
+        if self.replay_capacity < self.batch_size {
+            return Err("--replay must be at least --batch".into());
+        }
+        if !self.updates_per_step.is_finite() || self.updates_per_step < 0.0 {
+            return Err("--utd must be finite and non-negative".into());
+        }
+        Ok(())
+    }
+}
+
+fn main() -> AppResult<()> {
+    let config = TrainConfig::from_args()?;
+    config.validate()?;
+    let device = select_device(&config.device)?;
+    if let Some(policy) = config.eval.clone() {
+        evaluate_checkpoint(&config, &device, &policy)
+    } else {
+        train(config, device)
+    }
+}
+
+fn train(config: TrainConfig, device: Device) -> AppResult<()> {
+    let frame = Frame::new(6);
+    let observations = n_obs(frame);
+    let actions = n_act(frame);
+    let physics = Physics::default();
+    let stage = Stage::WalkFlat;
+    let mut environments = (0..config.environments)
+        .map(|index| {
+            JointEnv::new(
+                frame,
+                &physics,
+                Terrain::new(Course::Flat, config.seed + index as u64),
+                stage,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut states = environments
+        .iter()
+        .map(|environment| environment.state().to_vec())
+        .collect::<Vec<_>>();
+    let mut normalizer = ObsNorm::new(observations);
+    let mut replay = JointReplay::new(config.replay_capacity, observations, actions)?;
+    let mut rng = Rng::new(config.seed ^ 0x51AC_2026);
+    let mut agent = SacAgent::new(
+        observations,
+        actions,
+        &device,
+        SacConfig {
+            hidden: config.hidden,
+            ..SacConfig::default()
+        },
+        config.seed,
+    )?;
+
+    let started = Instant::now();
+    let mut transitions = 0usize;
+    let mut next_evaluation = config.eval_interval;
+    let mut update_budget = 0.0f64;
+    let mut updates = 0usize;
+    let mut last_stats: Option<UpdateStats> = None;
+    let mut best_score = f64::NEG_INFINITY;
+
+    println!(
+        "# native SAC · {} envs · replay {} · batch {} · UTD {:.2} · {:?}",
+        config.environments,
+        config.replay_capacity,
+        config.batch_size,
+        config.updates_per_step,
+        device
+    );
+    println!(
+        " steps   replay updates   score   dist  feet  alpha   q      losses (critic/actor)  wall"
+    );
+
+    while transitions < config.steps {
+        for state in &states {
+            normalizer.observe(state);
+        }
+        let take = (config.steps - transitions).min(environments.len());
+        let unit_actions = if transitions < config.warmup_steps {
+            (0..take * actions)
+                .map(|_| rng.range(-1.0, 1.0) as f32)
+                .collect::<Vec<_>>()
+        } else {
+            let flat = states[..take]
+                .iter()
+                .flat_map(|state| state.iter().copied())
+                .collect::<Vec<_>>();
+            agent.action(&flat, &normalizer, true, &mut rng)?
+        };
+        let physical_actions = unit_actions
+            .chunks_exact(actions)
+            .map(|action| {
+                action
+                    .iter()
+                    .map(|value| *value as f64 * ACT_RANGE)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let results = environments[..take]
+            .par_iter_mut()
+            .zip(&physical_actions)
+            .map(|(environment, action)| environment.step(action))
+            .collect::<Vec<_>>();
+
+        for index in 0..take {
+            let step = results[index]
+                .as_ref()
+                .map_err(|error| format!("environment {index}: {error}"))?;
+            replay.push(
+                &states[index],
+                &unit_actions[index * actions..(index + 1) * actions]
+                    .iter()
+                    .map(|value| *value as f64)
+                    .collect::<Vec<_>>(),
+                step.reward,
+                &step.observation,
+                step.terminated,
+                step.truncated,
+            )?;
+            states[index] = if step.terminated || step.truncated {
+                environments[index].reset().to_vec()
+            } else {
+                step.observation.clone()
+            };
+        }
+        transitions += take;
+
+        if transitions >= config.warmup_steps && replay.len() >= config.batch_size {
+            update_budget += config.updates_per_step * take as f64;
+            while update_budget >= 1.0 {
+                let batch = replay.sample(config.batch_size, &mut rng)?;
+                last_stats = Some(agent.update(&batch, &normalizer, &mut rng)?);
+                updates += 1;
+                update_budget -= 1.0;
+            }
+        }
+
+        if transitions >= next_evaluation || transitions == config.steps {
+            let evaluation = evaluate(
+                &agent,
+                &normalizer,
+                &physics,
+                frame,
+                stage,
+                config.eval_episodes,
+                config.seed + 1_000_001,
+            )?;
+            let stats = last_stats.unwrap_or(UpdateStats {
+                critic_loss: 0.0,
+                actor_loss: 0.0,
+                alpha_loss: 0.0,
+                alpha: agent.alpha()?,
+                mean_q: 0.0,
+            });
+            println!(
+                "{transitions:>7} {replay_len:>8} {updates:>7}  {score:>6.3} {distance:>6.2} {support:>5.2}  {alpha:>5.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+                replay_len = replay.len(),
+                score = evaluation.score,
+                distance = evaluation.distance,
+                support = evaluation.support,
+                alpha = stats.alpha,
+                q = stats.mean_q,
+                critic = stats.critic_loss,
+                actor = stats.actor_loss,
+                wall = started.elapsed().as_secs_f64(),
+            );
+            if evaluation.score > best_score {
+                best_score = evaluation.score;
+                save_checkpoint(&agent, &normalizer, &config, &evaluation)?;
+            }
+            while next_evaluation <= transitions {
+                next_evaluation += config.eval_interval;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn evaluate(
+    agent: &SacAgent,
+    normalizer: &ObsNorm,
+    physics: &Physics,
+    frame: Frame,
+    stage: Stage,
+    episodes: usize,
+    seed: u64,
+) -> AppResult<JointRollout> {
+    let mut total = JointRollout::default();
+    let mut rng = Rng::new(seed ^ 0xE7A1);
+    for episode in 0..episodes {
+        let mut environment = JointEnv::new(
+            frame,
+            physics,
+            Terrain::new(Course::Flat, seed + episode as u64),
+            stage,
+        );
+        while !environment.is_done() {
+            let unit = agent.action(environment.state(), normalizer, false, &mut rng)?;
+            let action = unit
+                .iter()
+                .map(|value| *value as f64 * ACT_RANGE)
+                .collect::<Vec<_>>();
+            environment.step(&action)?;
+        }
+        let rollout = environment.summary();
+        total.score += rollout.score;
+        total.distance += rollout.distance;
+        total.secs += rollout.secs;
+        total.support += rollout.support;
+        total.air += rollout.air;
+        total.reached += rollout.reached;
+        total.waypoint_fraction += rollout.waypoint_fraction;
+        total.completion_rate += rollout.completion_rate;
+        total.finish_time += rollout.finish_time;
+        total.fell |= rollout.fell;
+    }
+    let count = episodes as f64;
+    total.score /= count;
+    total.distance /= count;
+    total.secs /= count;
+    total.support /= count;
+    total.air /= count;
+    total.waypoint_fraction /= count;
+    total.completion_rate /= count;
+    total.finish_time /= count;
+    Ok(total)
+}
+
+fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> AppResult<()> {
+    let metadata = std::fs::read_to_string(meta_path(path))?;
+    if metadata_field(&metadata, "format") != Some("hexapod-sac-actor-v1") {
+        return Err("checkpoint metadata is not hexapod-sac-actor-v1".into());
+    }
+    let frame = Frame::new(6);
+    let observations = n_obs(frame);
+    let actions = n_act(frame);
+    let stored_observations = metadata_required(&metadata, "observations")?.parse::<usize>()?;
+    let stored_actions = metadata_required(&metadata, "actions")?.parse::<usize>()?;
+    if stored_observations != observations || stored_actions != actions {
+        return Err(format!(
+            "checkpoint dimensions {stored_observations}x{stored_actions}, expected {observations}x{actions}"
+        )
+        .into());
+    }
+    let hidden = metadata_required(&metadata, "hidden")?.parse::<usize>()?;
+    let mut normalizer = ObsNorm::new(observations);
+    normalizer.n = metadata_required(&metadata, "norm_n")?.parse()?;
+    normalizer.mean = parse_f64_list(metadata_required(&metadata, "norm_mean")?)?;
+    normalizer.m2 = parse_f64_list(metadata_required(&metadata, "norm_m2")?)?;
+    normalizer.frozen = true;
+    if normalizer.mean.len() != observations || normalizer.m2.len() != observations {
+        return Err("checkpoint normalizer width does not match its observation width".into());
+    }
+
+    let mut agent = SacAgent::new(
+        observations,
+        actions,
+        device,
+        SacConfig {
+            hidden,
+            ..SacConfig::default()
+        },
+        config.seed,
+    )?;
+    agent.load_actor(path)?;
+    let rollout = evaluate(
+        &agent,
+        &normalizer,
+        &Physics::default(),
+        frame,
+        Stage::WalkFlat,
+        config.eval_episodes,
+        config.seed + 1_000_001,
+    )?;
+    println!(
+        "# SAC checkpoint {} · WALK-FLAT · {} held-out episode(s) · {:?}",
+        path.display(),
+        config.eval_episodes,
+        device
+    );
+    println!("score   dist   wp %  finish %  time  feet  fell");
+    println!(
+        "{:.3}  {:>5.2}  {:>5.1}  {:>8.1}  {:>4.2}  {:>4.2}  {}",
+        rollout.score,
+        rollout.distance,
+        100.0 * rollout.waypoint_fraction,
+        100.0 * rollout.completion_rate,
+        rollout.finish_time,
+        rollout.support,
+        if rollout.fell { "yes" } else { "no" },
+    );
+    Ok(())
+}
+
+fn save_checkpoint(
+    agent: &SacAgent,
+    normalizer: &ObsNorm,
+    config: &TrainConfig,
+    evaluation: &JointRollout,
+) -> AppResult<()> {
+    if let Some(parent) = config.out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    agent.save_actor(&config.out)?;
+    let metadata = format!(
+        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        evaluation.score,
+        evaluation.distance,
+        config.seed,
+        normalizer.mean.len(),
+        n_act(Frame::new(6)),
+        config.hidden,
+        normalizer.n,
+        join_f64(&normalizer.mean),
+        join_f64(&normalizer.m2),
+    );
+    std::fs::write(meta_path(&config.out), metadata)?;
+    Ok(())
+}
+
+fn meta_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".meta");
+    PathBuf::from(value)
+}
+
+fn join_f64(values: &[f64]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:.17}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn metadata_field<'a>(metadata: &'a str, key: &str) -> Option<&'a str> {
+    metadata.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate == key).then_some(value)
+    })
+}
+
+fn metadata_required<'a>(metadata: &'a str, key: &str) -> AppResult<&'a str> {
+    metadata_field(metadata, key)
+        .ok_or_else(|| format!("checkpoint metadata is missing {key}").into())
+}
+
+fn parse_f64_list(value: &str) -> AppResult<Vec<f64>> {
+    value
+        .split(',')
+        .map(|item| item.parse::<f64>().map_err(Into::into))
+        .collect()
+}
+
+fn select_device(name: &str) -> AppResult<Device> {
+    match name {
+        "cpu" => Ok(Device::Cpu),
+        #[cfg(feature = "cuda")]
+        "cuda" | "cuda:0" => Ok(Device::new_cuda(0)?),
+        #[cfg(feature = "cuda")]
+        value if value.starts_with("cuda:") => {
+            let ordinal = value[5..].parse::<usize>()?;
+            Ok(Device::new_cuda(ordinal)?)
+        }
+        #[cfg(not(feature = "cuda"))]
+        value if value.starts_with("cuda") => {
+            Err("CUDA support is not compiled; rebuild hexapod-sac with --features cuda".into())
+        }
+        _ => Err(format!("unknown device {name:?}; use cpu or cuda[:N]").into()),
+    }
+}
+
+fn value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|argument| argument == flag)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+fn parse<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> AppResult<T>
+where
+    T::Err: Error + 'static,
+{
+    match value(args, flag) {
+        Some(value) => Ok(value.parse()?),
+        None => Ok(default),
+    }
+}
+
+fn print_help() {
+    println!(
+        "hexapod-sac — native off-policy motor learner\n\n\
+         --steps N            collected transitions (default 500000)\n\
+         --envs N             parallel reusable Rapier worlds (default 16)\n\
+         --replay N           replay capacity (default 1000000)\n\
+         --warmup N           random transitions before gradients (default 10000)\n\
+         --batch N            replay minibatch (default 256)\n\
+         --utd X              gradient updates per transition (default 1.0)\n\
+         --eval-interval N    held-out evaluation cadence (default 10000)\n\
+         --eval-episodes N    held-out episodes (default 8)\n\
+         --hidden N           units in each actor/critic layer (default 256)\n\
+         --device cpu|cuda:N  tensor device (CUDA requires --features cuda)\n\
+         --seed N             deterministic run seed\n\
+         --out PATH           best actor safetensors checkpoint\n\
+         --eval PATH          evaluate a saved actor with its frozen normalizer"
+    );
+}

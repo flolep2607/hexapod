@@ -1,0 +1,28 @@
+[package]
+name = "hexapod-sac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Soft Actor-Critic trainer for the motor-level hexapod environment."
+rust-version = "1.92"
+
+[[bin]]
+name = "hexapod-sac"
+path = "src/main.rs"
+
+[lib]
+name = "hexapod_sac"
+path = "src/lib.rs"
+
+[dependencies]
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+hexapod-core = { path = "../hexapod-core", features = ["rapier"] }
+rayon = "1.12.0"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[lints]
+workspace = true

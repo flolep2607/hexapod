@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/hexapod-core", "crates/hexapod-cli", "crates/hexapod-wasm"]
+members = [
+    "crates/hexapod-core",
+    "crates/hexapod-cli",
+    "crates/hexapod-wasm",
+    "crates/hexapod-sac",
+]
 
 [workspace.package]
 version = "0.1.0"

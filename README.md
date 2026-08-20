@@ -27,6 +27,13 @@ cargo run --release -p hexapod-cli -- joint-train --iters 400 --out joint.txt
 cargo run --release -p hexapod-cli -- joint-eval --policy joint.txt --eval-seeds 3
 cargo run --release -p hexapod-cli -- joint-train --resume joint.txt --stage mixed --iters 200 --out joint.txt
 
+# Replay-based motor learning. This deliberately starts on WALK-FLAT only.
+cargo run --release -p hexapod-sac -- --steps 500000 --envs 16 --replay 1000000 --batch 256
+# NVIDIA tensor training; Rapier environments still run in parallel on CPUs.
+cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 --steps 500000
+# Re-run held-out evaluation with the checkpoint's frozen normalizer.
+cargo run --release -p hexapod-sac -- --eval checkpoints/joint-sac-walk-v1.safetensors
+
 # Experimental Nexus 0.5 native-GPU batch path.
 cargo run --release -p hexapod-cli -- joint-train --backend nexus-gpu --batch-envs 128 --iters 20 --out joint-gpu.txt
 ```
@@ -86,6 +93,31 @@ cargo gpu install
 Each successful training run writes the checkpoint plus a `.meta` companion
 recording the backend, Nexus version, seed, batch size, curriculum entry stage,
 and physics settings needed to reproduce the run.
+
+### Native replay learner
+
+`hexapod-sac` is the gradient-learning path. It uses the same step-wise Rapier
+environment and exact warmed resets as joint-level evaluation, but collects
+many worlds in parallel into a gradually allocated circular replay buffer.
+The learner uses twin critics and target networks, tanh-corrected stochastic
+actions, automatic entropy tuning, normalized observations, scaled rewards,
+large minibatches, and held-out deterministic evaluation. True episode endings
+are stored separately from time-limit truncation so Bellman targets bootstrap
+only when they should.
+
+The tensor implementation is Candle 0.11. CPU is the dependency-light default;
+the `cuda` feature moves batched actor and critic work to NVIDIA GPUs. Nexus and
+Candle solve different problems here: Nexus is the experimental GPU physics
+batch, while Candle differentiates the policy and value networks. Until Nexus
+matches the reference plant's standing dynamics, SAC uses parallel reusable
+Rapier worlds for experience and may use CUDA for the network updates.
+
+The SAC curriculum currently exposes only `WALK-FLAT` on purpose. Random-action
+smoke tests validate plumbing but are not locomotion evidence. The next stage
+does not open until held-out flat evaluation crosses its score gate; harder
+terrain is never trained on merely because a fixed iteration budget expired.
+The best actor is saved as safetensors with a `.meta` file containing its exact
+observation normalizer and run configuration.
 
 Joint checkpoints use `hexapod-joint-v1` and cannot be loaded as the browser's
 gait-level `hexapod-policy-v1`. Continue one with `--resume`; because training
