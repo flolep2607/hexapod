@@ -229,7 +229,7 @@ already had only ever see the next footfall, which is far too late to turn on.
 The scan sees the invisible walls too — they are invisible, not undetectable,
 and a policy that cannot sense a fence cannot avoid one.
 
-Nine courses plus a parkour jump, all generated from a seed:
+Thirteen courses plus two parkour jumps, all generated from a seed:
 
 | course | what is in it |
 | --- | --- |
@@ -275,12 +275,33 @@ and a half minutes of in-page training on `SLALOM` is about 1300 iterations.
 
 And it transfers. Trained on `MIXED` seed 1 for 300 iterations, then scored on
 all nine courses (`hexapod sweep`):
+| `BEAM` | A ~3 m plank over a void that spans the corridor, wandering side to side |
+| `PILLARS` | A field of pillars with no gate and no pattern, and a ~2.7 m lane through it |
+| `WASHBOARD` | A train of 10–22 cm ridges at a fixed 55 cm–1 m pitch |
+| `CHASM` | Trenches 1.9–2.35 m across with a raised apron behind each. A longer running jump |
+| `GLACIER` | Slalom gates on one unbroken sheet of ice |
 
 | course | hand-tuned | learned | waypoints reached |
 | --- | ---: | ---: | ---: |
 | `FLAT` | 86.5 | **138.3** | 11 → 11 |
 | `STEPS`\* | 61.9 | **63.5** | 11 → 6 |
 | `RUBBLE`\* | 59.8 | **113.3** | 11 → 11 |
+The last five exist because the first ten left whole skills untested. `BEAM` is
+the only course where a foot cannot land anywhere within a stride of where it
+was aimed — a metre off the plank there is nothing, so the machine has to track
+a line rather than a heading. `PILLARS` is navigation without a gate to aim at:
+several openings, no pattern, and a lane narrower than a slalom gate to hold for
+the length of the field. `WASHBOARD` is the course that pays for the online
+cycle-time action, because a fixed stride either matches the ridge pitch or
+fights it and no single cycle time wins both. `CHASM` asks how far the machine
+can jump rather than whether it can. `GLACIER` is the turn `SLICK` never asks
+for: changing direction on a fifth of the grip is a different problem from
+walking straight on it.
+
+A course is only worth training on if it has headroom. `PILLARS` first shipped
+with a 3.4 m lane, and the baseline gait and the learned policy both completed
+it every single time — no gradient, nothing to learn. It is 2.7 m now.
+
 | `GAPS`\* | −43.6 | **−26.2** | 9 → 9 |
 | `MIXED` | 58.2 | **121.6** | 10 → 10 |
 | `MIXED`\* | 52.5 | **104.7** | 11 → 10 |

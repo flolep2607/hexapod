@@ -9,9 +9,7 @@
 use crate::dynamics::Physics;
 use crate::math::Rng;
 use crate::policy::{n_theta, Normalizer, Policy};
-use crate::sim::{
-    evaluate, rollout, Cmd, Rollout, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
-};
+use crate::sim::{cruise_band, evaluate, rollout, Cmd, Rollout};
 use crate::terrain::Terrain;
 
 /// Suite training is a navigation task first and a gait-quality task second.
@@ -243,17 +241,8 @@ impl Trainer {
                             terrains.len(),
                         );
                         let terrain = &terrains[terrain_i];
-                        let cmd = if terrain.course.is_jump() {
-                            Cmd::at(
-                                JUMP_CRUISE_MIN
-                                    + self.rng.unit()
-                                        * (JUMP_CRUISE_MAX - JUMP_CRUISE_MIN),
-                            )
-                        } else {
-                            Cmd::at(
-                                CRUISE_MIN + self.rng.unit() * (CRUISE_MAX - CRUISE_MIN),
-                            )
-                        };
+                        let (lo, hi) = cruise_band(terrain.course);
+                        let cmd = Cmd::at(lo + self.rng.unit() * (hi - lo));
                         (terrain_i, cmd)
                     })
                     .collect()
@@ -632,18 +621,26 @@ mod tests {
     #[test]
     fn exploration_samples_the_whole_commanded_speed_range() {
         // Both sides of a direction must share a command, and the commands
-        // across an iteration must span the range rather than sit on one
-        // speed — that is what stops the optimiser specialising.
-        let mut r = Rng::new(4);
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for _ in 0..200 {
-            let v = CRUISE_MIN + r.unit() * (CRUISE_MAX - CRUISE_MIN);
-            assert!((CRUISE_MIN..=CRUISE_MAX).contains(&v));
-            lo = lo.min(v);
-            hi = hi.max(v);
+        // across an iteration must span the course's band rather than sit on
+        // one speed — that is what stops the optimiser specialising.
+        for course in [Course::Mixed, Course::Jump, Course::Chasm] {
+            let (min, max) = cruise_band(course);
+            let mut r = Rng::new(4);
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for _ in 0..200 {
+                let v = min + r.unit() * (max - min);
+                assert!((min..=max).contains(&v), "{course:?} sampled {v}");
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            assert!(hi - lo > (max - min) * 0.8, "{course:?} barely explored");
         }
-        assert!(hi - lo > (CRUISE_MAX - CRUISE_MIN) * 0.8);
+        // And the bands are ordered by what the course physically demands: a
+        // stepable course can be walked, a JUMP trench needs a run, and a
+        // CHASM trench needs a faster one.
+        assert!(cruise_band(Course::Jump).0 > cruise_band(Course::Mixed).0);
+        assert!(cruise_band(Course::Chasm).0 > cruise_band(Course::Jump).0);
     }
 
     #[test]

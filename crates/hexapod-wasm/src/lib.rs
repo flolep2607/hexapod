@@ -22,10 +22,7 @@ use hexapod_core::math::{convex_hull_xz, polygon_margin, squash, unsquash};
 use hexapod_core::oneleg::OneLegDrill;
 use hexapod_core::plant::ArticulatedPlant;
 use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
-use hexapod_core::sim::{
-    Cmd, Sim, CRUISE_DEFAULT, CRUISE_MAX, CRUISE_MIN, JUMP_CRUISE_DEFAULT, JUMP_CRUISE_MAX,
-    JUMP_CRUISE_MIN,
-};
+use hexapod_core::sim::{cruise_band, cruise_default, Cmd, Sim};
 use hexapod_core::terrain::{Course, Terrain, Z_MAX};
 use hexapod_core::{Frame, MAX_LEGS, MIN_LEGS};
 
@@ -144,7 +141,7 @@ fn make(seed: u64) -> App {
         build,
         servo: None,
         phys,
-        cruise: CRUISE_DEFAULT,
+        cruise: cruise_default(course),
         nav: true,
         meter: TorqueMeter::default(),
         sizing: Sizing::default(),
@@ -177,11 +174,7 @@ pub extern "C" fn hx_set_course(kind: u32, seed: u32) {
     a.terrain = Terrain::new(a.course, a.course_seed);
     a.course_buf = a.terrain.export();
     a.route_buf = a.terrain.export_route();
-    a.cruise = if a.course.is_jump() {
-        JUMP_CRUISE_DEFAULT
-    } else {
-        CRUISE_DEFAULT
-    };
+    a.cruise = cruise_default(a.course);
     a.reset_training();
     a.reset_live();
 }
@@ -424,29 +417,18 @@ pub extern "C" fn hx_set_servo(index: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn hx_set_cruise(v: f64) {
     let a = app();
-    a.cruise = if a.course.is_jump() {
-        v.clamp(JUMP_CRUISE_MIN, JUMP_CRUISE_MAX)
-    } else {
-        v.clamp(CRUISE_MIN, CRUISE_MAX)
-    };
+    let (lo, hi) = cruise_band(a.course);
+    a.cruise = v.clamp(lo, hi);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hx_cruise_lo() -> f64 {
-    if app().course.is_jump() {
-        JUMP_CRUISE_MIN
-    } else {
-        CRUISE_MIN
-    }
+    cruise_band(app().course).0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hx_cruise_hi() -> f64 {
-    if app().course.is_jump() {
-        JUMP_CRUISE_MAX
-    } else {
-        CRUISE_MAX
-    }
+    cruise_band(app().course).1
 }
 
 /// Measure peak joint torques over one full gait cycle of the active policy.

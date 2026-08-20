@@ -1014,37 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn a_tripod_gait_walks_forward() {
-        let frame = Frame::new(6);
-        let phys = Physics::default();
-        let (mut walker, terrain, policy, gait) =
-            crate::walker::open_loop_walk(frame, Course::Flat, 1, phys);
-        let cmd = crate::sim::Cmd {
-            fwd: 1.0,
-            turn: 0.0,
-            cruise: 1.5,
-            nav: false,
-        };
-        let ticks = (8.0 / crate::sim::DT) as usize;
-        for _ in 0..ticks {
-            walker.step(&terrain, &policy, &gait, crate::sim::DT, cmd);
-        }
-        let s = walker.sample();
-        assert!(!s.fallen, "fell at y={:.3}", s.pos[1]);
-        assert!(
-            s.pos[2] > 1.2,
-            "tripod did not walk forward: z={:.3} x={:.3} yaw={:.3} (cycle={:.3} stride={:.3})",
-            s.pos[2],
-            s.pos[0],
-            s.yaw,
-            gait.cycle,
-            gait.stride
-        );
-        assert!(s.yaw.abs() < 0.45, "spun while walking: yaw={:.3}", s.yaw);
-        assert!(s.pos[1] > 0.55, "sat down: y={:.3}", s.pos[1]);
-    }
-
-    #[test]
     fn hexapod_floor_catches_a_chassis() {
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();

@@ -43,10 +43,15 @@ pub enum Course {
     Slick = 7,
     Gauntlet = 8,
     Jump = 9,
+    Beam = 10,
+    Pillars = 11,
+    Washboard = 12,
+    Chasm = 13,
+    Glacier = 14,
 }
 
 /// Every course, in the order the dashboard lists them.
-pub const COURSES: [Course; 10] = [
+pub const COURSES: [Course; 15] = [
     Course::Flat,
     Course::Steps,
     Course::Rubble,
@@ -57,6 +62,11 @@ pub const COURSES: [Course; 10] = [
     Course::Slick,
     Course::Gauntlet,
     Course::Jump,
+    Course::Beam,
+    Course::Pillars,
+    Course::Washboard,
+    Course::Chasm,
+    Course::Glacier,
 ];
 
 impl Course {
@@ -76,15 +86,26 @@ impl Course {
             Course::Slick => "SLICK",
             Course::Gauntlet => "GAUNTLET",
             Course::Jump => "JUMP",
+            Course::Beam => "BEAM",
+            Course::Pillars => "PILLARS",
+            Course::Washboard => "WASHBOARD",
+            Course::Chasm => "CHASM",
+            Course::Glacier => "GLACIER",
         }
     }
 
-    /// JUMP is a parkour walking course: trenches wider than a stride, and
-    /// platforms you can only reach by jumping the gap in front of them. The
-    /// reward is still speed tracking; the jump action is how you stay on it.
+    /// The parkour courses: trenches wider than a stride, and platforms you
+    /// can only reach by jumping the gap in front of them. The reward is
+    /// still speed tracking; the jump action is how you stay on it.
+    ///
+    /// This flag does real work beyond naming. It opens the takeoff detector
+    /// in the plant, and it selects the faster command band for training and
+    /// evaluation — a trench wider than a stride is cleared with a run-up or
+    /// not at all, so scoring these courses at a walking speed would be
+    /// scoring a machine that was never going to make it.
     #[inline]
     pub fn is_jump(self) -> bool {
-        matches!(self, Course::Jump)
+        matches!(self, Course::Jump | Course::Chasm)
     }
 }
 
@@ -104,6 +125,9 @@ pub const GRIP_ICE: f64 = 0.22;
 /// which resolves grip through whichever surface supplies the height, would
 /// never see it.
 const ICE_THICK: f64 = 0.01;
+/// Narrowest plank the machine can actually stand on: six legs stand at
+/// about ±1.2 m, so anything under this has nowhere to put the middle pair.
+pub const BEAM_MIN_W: f64 = 2.8;
 /// Height of a slalom wall. Well above anything a leg can reach, so it is not
 /// an obstacle to climb — it is somewhere the machine cannot go.
 pub const WALL_TOP: f64 = 1.8;
@@ -193,7 +217,7 @@ impl Terrain {
         t.generate();
         t.finish_route();
         t.rebuild_buckets();
-        if t.course.is_jump() {
+        if t.course.is_jump() || t.course == Course::Beam {
             t.snap_waypoints_to_ground();
         }
         t
@@ -548,7 +572,166 @@ impl Terrain {
                 self.gen_slick(&mut r, 51.0, Z_MAX - 4.0);
             }
             Course::Jump => self.gen_parkour(&mut r),
+            Course::Beam => self.gen_beam(&mut r),
+            Course::Pillars => self.gen_pillars(&mut r),
+            Course::Washboard => self.gen_washboard(&mut r, 5.0, Z_MAX - 4.0),
+            Course::Chasm => self.gen_chasm(&mut r),
+            Course::Glacier => self.gen_glacier(&mut r, 8.0, 42.0),
         }
+    }
+
+    /// A catwalk over a void. Every other course lets a foot land anywhere
+    /// within a stride of where it was aimed; here the whole machine has to
+    /// track a line, because a metre to either side there is nothing.
+    ///
+    /// The plank is never narrower than [`BEAM_MIN_W`]. Six legs stand at
+    /// roughly ±1.2 m, so something narrower has nowhere to put the middle
+    /// pair — it would not be a hard course, it would be an impossible one,
+    /// and an impossible course teaches a policy only to give up early.
+    fn gen_beam(&mut self, r: &mut Rng) {
+        let mut z = 6.0;
+        while z < Z_MAX - 9.0 {
+            let span = r.range(6.0, 10.0);
+            let w = r.range(BEAM_MIN_W, BEAM_MIN_W + 0.9);
+            let reach = CORRIDOR_HALF - w * 0.5 - 0.3;
+            let cx = r.range(-reach, reach);
+            self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + span, -0.90, GRIP_PIT);
+            self.push(cx - w * 0.5, cx + w * 0.5, z, z + span, 0.14, GRIP_STEP);
+            // Line up on the plank while there is still floor to do it on,
+            // then a station every couple of metres along it: a route that
+            // only marked the two ends would let the machine cut the corner
+            // straight through the void.
+            self.waypoints.push([cx, z - 1.6]);
+            let mut d = 1.5;
+            while d < span {
+                self.waypoints.push([cx, z + d]);
+                d += 2.0;
+            }
+            self.waypoints.push([cx, z + span + 1.4]);
+            // Wide enough that the next plank's approach station lands after
+            // this one's exit station, so the route stays strictly ordered.
+            z += span + r.range(3.4, 5.0);
+        }
+    }
+
+    /// A field of pillars, with no gate and no pattern.
+    ///
+    /// The slalom tells you where to go by leaving exactly one opening in a
+    /// wall that spans the corridor. This does not: the openings are wide,
+    /// there are several, and the route picks one. What it trains is holding
+    /// a line through clutter, which is a different skill from aiming at the
+    /// single hole in a wall.
+    fn gen_pillars(&mut self, r: &mut Rng) {
+        // Chassis circumradius is 0.95 m on six legs, so this leaves a lane
+        // about 2.7 m wide — narrower than a slalom gate, and the machine has
+        // to hold it for the length of the field rather than through one
+        // wall. At 1.7 m the lane was wide enough to walk down without
+        // steering at all, and both the baseline and the learned policy
+        // cleared the course every time: no gradient, nothing learned.
+        const CLEAR: f64 = 1.35;
+        let mut z = 7.0;
+        let mut path = 0.0f64;
+        while z < Z_MAX - 5.0 {
+            // The lane wanders, bounded so it never hugs the fence — a lane
+            // against the corridor wall is a corner to cut, not a lane.
+            path = clamp(path + r.range(-2.6, 2.6), -3.0, 3.0);
+            let mut x = -CORRIDOR_HALF + r.range(0.1, 0.6);
+            while x < CORRIDOR_HALF - 0.4 {
+                let w = r.range(0.5, 1.0);
+                let d = r.range(0.5, 1.0);
+                if x + w < path - CLEAR || x > path + CLEAR {
+                    self.push(x, x + w, z, z + d, WALL_TOP, GRIP_STEP);
+                }
+                x += w + r.range(0.35, 1.05);
+            }
+            self.waypoints.push([path, z + 0.5]);
+            // Close enough together that the lane is a continuous line to be
+            // held, not a sequence of independent doorways with room to
+            // recover between them.
+            z += r.range(2.1, 3.0);
+        }
+    }
+
+    /// A ridge train at a fixed pitch. Nothing here is tall enough to matter
+    /// on its own — the point is the spacing, which either matches the stride
+    /// or fights it, and a gait with one fixed cycle time cannot have it both
+    /// ways. This is the course that pays for the online cycle-time action.
+    fn gen_washboard(&mut self, r: &mut Rng, z_from: f64, z_to: f64) {
+        let mut z = z_from;
+        while z < z_to - 6.0 {
+            let pitch = r.range(0.55, 1.05);
+            let ridge = r.range(0.18, 0.30).min(pitch * 0.6);
+            let h = r.range(0.10, 0.22);
+            let run = r.range(5.0, 9.0);
+            let mut d = 0.0;
+            while d < run {
+                self.push(
+                    -CORRIDOR_HALF,
+                    CORRIDOR_HALF,
+                    z + d,
+                    z + d + ridge,
+                    h,
+                    GRIP_STEP,
+                );
+                d += pitch;
+            }
+            z += run + r.range(1.5, 3.0);
+        }
+    }
+
+    /// The long version of the parkour course. JUMP asks whether the machine
+    /// can jump at all; this asks how far, and gives it a run-up to do it
+    /// from. Fewer trenches, each wider, each with a raised apron on the far
+    /// side so a landing that is barely long enough still catches an edge.
+    fn gen_chasm(&mut self, r: &mut Rng) {
+        let mut z = 6.0;
+        while z < Z_MAX - 10.0 {
+            let gap = r.range(1.90, 2.35);
+            self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + gap, -1.10, GRIP_PIT);
+            let apron = r.range(2.2, 3.4);
+            let lip = r.range(0.10, 0.22);
+            self.push(
+                -CORRIDOR_HALF,
+                CORRIDOR_HALF,
+                z + gap,
+                z + gap + apron,
+                lip,
+                GRIP_STEP,
+            );
+            self.waypoints.push([0.0, z + gap + (apron * 0.5).min(1.5)]);
+            // A run-up long enough to be back at commanded speed before the
+            // next lip. Trenches back to back would be a standing jump.
+            z += gap + apron + r.range(4.0, 6.0);
+        }
+    }
+
+    /// Ice with somewhere to be. SLICK asks whether the machine stays upright
+    /// on a fifth of the grip; this asks it to change direction on one, which
+    /// is where a low-friction foot actually gets you into trouble.
+    ///
+    /// The gates stop well short of the finish line on purpose. Turning on a
+    /// fifth of the grip is slow, and a full-length iced slalom put both the
+    /// baseline gait and the trained policy at 90% of the route with the
+    /// clock run out — nobody finished, so the course scored every policy
+    /// identically and taught nothing. It is a shorter field with a clear
+    /// run-out now, which grades the turning rather than the horizon.
+    fn gen_glacier(&mut self, r: &mut Rng, z_from: f64, z_to: f64) {
+        self.gen_slalom(r, z_from, z_to);
+        // One unbroken sheet, not patches. The interesting moment is the
+        // turn into a gate, and a bare stripe that the turn happens to land
+        // on is a course that is sometimes SLICK and sometimes SLALOM rather
+        // than the thing neither of them tests. It is also one prism instead
+        // of a dozen, and height lookups are the innermost loop here.
+        self.push(
+            -CORRIDOR_HALF,
+            CORRIDOR_HALF,
+            z_from - 3.0,
+            z_to + 2.0,
+            ICE_THICK,
+            GRIP_ICE,
+        );
+        // No debris on top of it. SLICK is already ice with humps; the one
+        // variable this course adds is the turn, so nothing else changes.
     }
 
     /// Parkour: trenches too wide to step (max stride 1.45 m) and platforms
@@ -584,8 +767,9 @@ impl Terrain {
     }
 
     /// Centreline stations that landed in a trench are walked forward onto
-    /// solid ground. JUMP places its own landings; this is the backstop so a
-    /// finish_route station cannot ask the machine to stand in a pit.
+    /// solid ground. The parkour courses and BEAM place their own landings;
+    /// this is the backstop so a finish_route station cannot ask the machine
+    /// to stand in a pit.
     fn snap_waypoints_to_ground(&mut self) {
         let n = self.waypoints.len();
         for i in 0..n {
@@ -1070,6 +1254,130 @@ mod tests {
             assert!(
                 t.height(w[0], w[1]) > -0.12,
                 "waypoint ({:.2}, {:.2}) is in a pit",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_beam_is_a_plank_over_a_void_and_the_route_stays_on_it() {
+        let t = Terrain::new(Course::Beam, 5);
+        let voids: Vec<_> = t.obstacles.iter().filter(|o| o.top < 0.0).collect();
+        assert!(!voids.is_empty(), "BEAM has nothing to fall into");
+        for v in &voids {
+            // The void spans the corridor, and the plank does not.
+            assert!(v.x1 - v.x0 > 2.0 * CORRIDOR_HALF - 0.01);
+            let cz = (v.z0 + v.z1) * 0.5;
+            let plank = t
+                .obstacles
+                .iter()
+                .find(|o| o.top > 0.0 && o.z0 <= cz && o.z1 >= cz)
+                .unwrap_or_else(|| panic!("void at z={:.1} has no plank over it", v.z0));
+            assert!(
+                plank.x1 - plank.x0 >= BEAM_MIN_W,
+                "plank is {:.2} m wide — narrower than a stance",
+                plank.x1 - plank.x0
+            );
+            // Either side of it is the drop.
+            assert!(t.height(plank.x0 - 0.4, cz) < 0.0);
+            assert!(t.height(plank.x1 + 0.4, cz) < 0.0);
+        }
+        // And no station on the route asks the machine to stand in the void.
+        for w in &t.waypoints {
+            assert!(
+                t.height(w[0], w[1]) > -0.12,
+                "waypoint ({:.2}, {:.2}) is over the drop",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn the_pillar_lane_is_wide_enough_for_the_machine_to_fit_down() {
+        let t = Terrain::new(Course::Pillars, 12);
+        let pillars = t.obstacles.iter().filter(|o| o.top > 1.0).count();
+        assert!(pillars > 40, "only {pillars} pillars — that is not a field");
+        // A chassis-sized disc centred on any station is clear of all of them.
+        let r = 0.95;
+        for w in &t.waypoints {
+            assert!(
+                t.height_disc(w[0], w[1], r) < 1.0,
+                "the lane is blocked at ({:.2}, {:.2})",
+                w[0],
+                w[1]
+            );
+        }
+        // The lane is a lane and not a straight line down the middle.
+        let sway = t.waypoints.iter().map(|p| p[0].abs()).fold(0.0f64, f64::max);
+        assert!(sway > 1.5, "the pillar route barely moves: {sway:.2}");
+    }
+
+    #[test]
+    fn the_washboard_is_a_regular_train_of_low_ridges() {
+        let t = Terrain::new(Course::Washboard, 4);
+        assert!(t.obstacles.len() > 40, "too few ridges to be a washboard");
+        // Every ridge is low — the difficulty is the pitch, not the height.
+        for ob in &t.obstacles {
+            assert!(
+                ob.top > 0.0 && ob.top <= 0.22,
+                "a {:.2} m ridge is a step, not a corrugation",
+                ob.top
+            );
+        }
+        // Walking the centreline crosses ridges repeatedly, not once.
+        let mut crossings = 0;
+        let mut on = false;
+        for i in 0..2000 {
+            let h = t.height(0.0, 5.0 + i as f64 * 0.03);
+            if (h > 0.05) != on {
+                on = !on;
+                crossings += 1;
+            }
+        }
+        assert!(crossings > 40, "only {crossings} edges along the centreline");
+    }
+
+    #[test]
+    fn a_chasm_is_a_longer_jump_than_the_parkour_course_asks_for() {
+        let t = Terrain::new(Course::Chasm, 6);
+        let pits: Vec<_> = t.obstacles.iter().filter(|o| o.top < 0.0).collect();
+        assert!(!pits.is_empty(), "CHASM has no chasms");
+        for p in &pits {
+            // Wider than every JUMP trench, which top out at 1.95 m.
+            assert!(
+                p.z1 - p.z0 > 1.85,
+                "a {:.2} m trench is a JUMP trench",
+                p.z1 - p.z0
+            );
+            // With something to land on immediately past the far lip.
+            assert!(
+                t.height(0.0, p.z1 + 0.5) > 0.05,
+                "nothing to land on past the trench at z={:.1}",
+                p.z0
+            );
+        }
+        // And it is scored as a running course, not a walking one.
+        assert!(Course::Chasm.is_jump());
+    }
+
+    #[test]
+    fn the_glacier_puts_ice_where_the_turning_happens() {
+        let t = Terrain::new(Course::Glacier, 9);
+        assert!(
+            t.obstacles.iter().any(|o| o.top > 1.0),
+            "GLACIER has no gates to turn through"
+        );
+        // Every station on the weaving part of the route is on ice, which is
+        // the whole point: SLICK is a straight line, this is not.
+        let gates: Vec<_> = t.waypoints.iter().filter(|w| w[0].abs() > 0.5).collect();
+        assert!(gates.len() >= 4, "only {} gate stations", gates.len());
+        for w in &gates {
+            assert_eq!(
+                t.grip(w[0], w[1]),
+                GRIP_ICE,
+                "gate station ({:.2}, {:.2}) is on bare ground",
                 w[0],
                 w[1]
             );

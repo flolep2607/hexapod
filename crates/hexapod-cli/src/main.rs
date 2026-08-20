@@ -46,8 +46,8 @@ use hexapod_core::sim::Sim;
 use hexapod_core::power::{parts_of, solve, Kind, Sizing, TorqueTrace};
 use hexapod_core::policy::{Normalizer, Preset, MAX_OBS};
 use hexapod_core::sim::{
-    evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, EVAL_SPEEDS, JUMP_CRUISE_MAX,
-    JUMP_CRUISE_MIN, JUMP_EVAL_SPEEDS,
+    evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
+    JUMP_EVAL_SPEEDS,
 };
 use hexapod_core::oneleg::{OneLegDrill, Phase};
 use hexapod_core::walker::WalkSample;
@@ -224,9 +224,12 @@ fn train(
         phys.swing_mass(frame) / phys.mass_kg * 100.0
     );
     if course.is_jump() {
+        let (lo, hi) = hexapod_core::sim::cruise_band(course);
+        let e = hexapod_core::sim::eval_speeds(course);
         println!(
-            "commanded speeds sampled from {JUMP_CRUISE_MIN:.1} to {JUMP_CRUISE_MAX:.1} m/s; \
-             scored on the mean over 4.0 / 5.0 / 5.5 — a running jump, not a walk"
+            "commanded speeds sampled from {lo:.1} to {hi:.1} m/s; \
+             scored on the mean over {:.1} / {:.1} / {:.1} — a running jump, not a walk",
+            e[0], e[1], e[2]
         );
     } else {
         println!(
@@ -827,8 +830,9 @@ fn all_terrain(
         .unwrap_or(3);
     if cfg.n_dirs < hexapod_core::terrain::COURSES.len() {
         eprintln!(
-            "note: {} directions cover the 10 terrain families over multiple iterations; --dirs 10 or more covers every family per update",
-            cfg.n_dirs
+            "note: {} directions cover the {n} terrain families over multiple iterations; --dirs {n} or more covers every family per update",
+            cfg.n_dirs,
+            n = hexapod_core::terrain::COURSES.len()
         );
     }
 
@@ -875,9 +879,10 @@ fn all_terrain(
     }
     let mut trainer = Trainer::new(starting, cfg, phys, seed ^ 0xA5A5);
     println!(
-        "all-terrain curriculum: {} weighted scenarios from {} unique (10 courses x {train_seeds} seeds), {}s horizon",
+        "all-terrain curriculum: {} weighted scenarios from {} unique ({} courses x {train_seeds} seeds), {}s horizon",
         train_suite.len(),
         unique_suite.len(),
+        hexapod_core::terrain::COURSES.len(),
         cfg.horizon
     );
     println!(
@@ -1223,11 +1228,7 @@ fn print_course_detail(
     seed: u64,
     eval_seeds: usize,
 ) {
-    let speeds: &[f64] = if course.is_jump() {
-        &JUMP_EVAL_SPEEDS
-    } else {
-        &EVAL_SPEEDS
-    };
+    let speeds: &[f64] = hexapod_core::sim::eval_speeds(course);
     println!(
         "\n{:<7} {:>5} {:>5} {:>9} {:>8} {:>10} {:>8} {:>7} {:>7} {:>9}",
         "policy", "seed", "m/s", "reward", "z m", "waypoints", "time s", "x m", "jumps", "state"

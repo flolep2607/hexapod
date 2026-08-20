@@ -49,6 +49,16 @@ const COURSE_NOTES = {
     "Parkour. Trenches wider than a stride, and platforms you can only reach by jumping the gap in front of them. The command is still a speed: run, jump, land without stripping the servos.",
 };
 const courseName = (i) => (COURSES[i] || "Flat").toUpperCase();
+  BEAM:
+    "A plank about three metres wide over a void that spans the corridor, wandering from one side to the other. Every other course lets a foot land anywhere within a stride; here the machine has to track a line, because a metre off it there is nothing.",
+  PILLARS:
+    "A field of pillars with no gate and no pattern. The slalom leaves exactly one opening and tells you where it is; this leaves several and the route picks one, so what it costs is holding a line through clutter rather than aiming at a hole in a wall.",
+  WASHBOARD:
+    "A train of 10-22 cm ridges at a fixed pitch, 55 cm to a metre apart. Nothing here is tall enough to matter on its own — the spacing either matches the stride or fights it, and this is the course that pays for the online cycle-time action.",
+  CHASM:
+    "The long version of the parkour course. Trenches 1.9-2.35 m across, each with a raised apron on the far side and a run-up in front of it. JUMP asks whether the machine can jump; this asks how far.",
+  GLACIER:
+    "Slalom gates on one unbroken sheet of ice. SLICK asks whether the machine stays upright on a fifth of the grip; this asks it to change direction on one, which is where a low-friction foot actually gets you into trouble.",
 const isJump = () => courseName(state.courseKind) === "JUMP";
 
 const COL = {

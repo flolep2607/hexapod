@@ -49,7 +49,7 @@ use crate::policy::{
 use crate::robot::{
     clamp_joints, fk_body, fk_world, solve_ik, to_body, Frame, BODY_H, FEMUR, MAX_LEGS, TIBIA,
 };
-use crate::terrain::{Terrain, WAYPOINT_R};
+use crate::terrain::{Course, Terrain, WAYPOINT_R};
 
 /// Simulation tick. 100 Hz keeps swing arcs smooth without making rollouts
 /// expensive, and matches the control rate of a real servo bus.
@@ -89,6 +89,55 @@ pub const JUMP_CRUISE_MAX: f64 = CRUISE_MAX;
 pub const JUMP_CRUISE_DEFAULT: f64 = 4.5;
 /// Speeds the jump-course evaluation averages over.
 pub const JUMP_EVAL_SPEEDS: [f64; 3] = [4.0, 5.0, 5.5];
+
+/// Speeds sampled on CHASM. Its trenches run to 2.35 m, and a takeoff capped
+/// at 2.8 m/s up does not clear that below roughly 4.5 m/s forward — measured,
+/// not assumed: at 4.0 m/s the trained policy and the baseline both cleared
+/// zero of five seeds, and at 5.0 m/s both cleared five of five.
+pub const CHASM_CRUISE_MIN: f64 = 4.5;
+pub const CHASM_CRUISE_MAX: f64 = CRUISE_MAX;
+/// What the dashboard's speed dial starts at on CHASM.
+pub const CHASM_CRUISE_DEFAULT: f64 = 5.0;
+/// Speeds the CHASM evaluation averages over.
+pub const CHASM_EVAL_SPEEDS: [f64; 3] = [4.5, 5.25, 6.0];
+
+/// The speed schedule a course is scored on, and the band training samples
+/// from. This is a property of the course, not a flag on it.
+///
+/// A course scored at a speed nothing can survive is not a hard course, it is
+/// a course with part of its grade nailed to zero. CHASM read exactly 66.7%
+/// for the hand-tuned gait and for three successive checkpoints — two of
+/// three speeds, every time — because no policy was ever going to clear a
+/// 2.3 m trench at 4.0 m/s. That third of the score carried no gradient and
+/// no information; it just dragged the suite mean down by a constant.
+#[inline]
+pub fn eval_speeds(course: Course) -> &'static [f64; 3] {
+    match course {
+        Course::Chasm => &CHASM_EVAL_SPEEDS,
+        c if c.is_jump() => &JUMP_EVAL_SPEEDS,
+        _ => &EVAL_SPEEDS,
+    }
+}
+
+/// `(min, max)` of the commanded speeds training samples for a course.
+#[inline]
+pub fn cruise_band(course: Course) -> (f64, f64) {
+    match course {
+        Course::Chasm => (CHASM_CRUISE_MIN, CHASM_CRUISE_MAX),
+        c if c.is_jump() => (JUMP_CRUISE_MIN, JUMP_CRUISE_MAX),
+        _ => (CRUISE_MIN, CRUISE_MAX),
+    }
+}
+
+/// What a speed dial should start at for a course.
+#[inline]
+pub fn cruise_default(course: Course) -> f64 {
+    match course {
+        Course::Chasm => CHASM_CRUISE_DEFAULT,
+        c if c.is_jump() => JUMP_CRUISE_DEFAULT,
+        _ => CRUISE_DEFAULT,
+    }
+}
 
 /// Body-velocity controller bandwidth, 1/s. The gait asks for a speed; this is
 /// how hard it asks. Anything traction cannot deliver becomes slip.
@@ -2047,12 +2096,7 @@ pub fn evaluate(
     phys: &Physics,
     secs: f64,
 ) -> Rollout {
-    let speeds: &[f64] = if terrain.course.is_jump() {
-        &JUMP_EVAL_SPEEDS
-    } else {
-        &EVAL_SPEEDS
-    };
-    evaluate_at_speeds(terrain, policy, phys, secs, speeds)
+    evaluate_at_speeds(terrain, policy, phys, secs, eval_speeds(terrain.course))
 }
 
 fn evaluate_at_speeds(
@@ -2103,7 +2147,7 @@ mod tests {
     use super::*;
     use crate::dynamics::Actuator;
     use crate::policy::{act_jump, n_gait, n_obs, n_theta, obs_cmd_speed, Preset};
-    use crate::terrain::Course;
+
 
     fn baseline() -> Policy {
         Policy::seeded(Preset::Tripod, Frame::default())
