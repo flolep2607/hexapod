@@ -90,7 +90,6 @@ const WORKER_MUTATIONS = [
   "hx_set_legs",
   "hx_set_preset",
   "hx_set_mode",
-  "hx_set_oneleg_leg",
   "hx_reset_live",
   "hx_set_param",
   "hx_set_train_cfg",
@@ -119,7 +118,6 @@ const state = {
   iterMs: 0,
   build: { mass: 2.0, femurMm: 80, safety: 1.35 },
   cruise: 4.0,
-  onelegLeg: 0,
   /* Name of the loaded checkpoint, or null while the seed gait is in force. */
   policy: null,
   /* Index into the servo catalogue whose torque-speed line drives the joints,
@@ -843,15 +841,6 @@ function buildLegUI() {
         `<div class="bar"><span>${n}</span><div class="track"><div class="fill" id="load${i}"></div></div></div>`
     )
     .join("");
-  const ol = $("onelegBtns");
-  if (ol) {
-    ol.innerHTML = legNames()
-      .map(
-        (n, i) =>
-          `<button class="btn" data-oneleg="${i}" data-on="${i === state.onelegLeg}">${n}</button>`
-      )
-      .join("");
-  }
 }
 
 function buildStaticUI() {
@@ -974,64 +963,33 @@ function syncSliders() {
   });
   const lock = $("paramLock");
   if (lock) {
-    lock.textContent =
-      state.mode === 1 ? "set by policy" : state.mode === 2 ? "one-leg drill" : "crawl";
+    lock.textContent = state.mode === 1 ? "set by policy" : "baseline gait";
   }
 }
 
 function setMode(mode) {
-  if (mode === 2 && state.courseKind !== 0) {
-    state.courseKind = 0;
-    api.hx_set_course(0, state.seed);
-    readCourse();
-    document
-      .querySelectorAll("[data-course]")
-      .forEach((b) => (b.dataset.on = String(+b.dataset.course === 0)));
-    $("hCourse").textContent = "FLAT";
-    $("trCourse").textContent = "FLAT";
-    $("tSummary").textContent =
-      `FLAT · seed ${state.seed} · ${api.hx_course_len()} obstacles · ${api.hx_route_len()} waypoints`;
-    $("tNote").textContent = COURSE_NOTES.FLAT || "";
-  }
   state.mode = mode;
   api.hx_set_mode(mode);
   const btnBase = $("btnBase");
   const btnLearn = $("btnLearn");
   if (btnBase) btnBase.dataset.on = mode === 0;
   if (btnLearn) btnLearn.dataset.on = mode === 1;
-  const btnOl = $("btnOneleg");
   const btnWalk = $("btnWalk");
-  if (btnOl) btnOl.dataset.on = String(mode === 2);
-  if (btnWalk) btnWalk.dataset.on = String(mode !== 2);
-  $("hPolicy").textContent = mode === 2 ? "ONE LEG" : mode === 1 ? "LEARNED" : "CRAWL";
+  if (btnWalk) btnWalk.dataset.on = "true";
+  $("hPolicy").textContent = mode === 1 ? "LEARNED" : "BASELINE";
   const secGait = $("secGait");
   if (secGait) secGait.hidden = true;
   const secCruise = $("secCruise");
-  if (secCruise) secCruise.hidden = mode === 2;
+  if (secCruise) secCruise.hidden = false;
   syncSliders();
   refreshGaitTable();
-  if (mode === 2) {
-    api.hx_set_oneleg_leg(state.onelegLeg);
-    state.cmd = { fwd: 0, turn: 0 };
+  if (state.cmd.fwd === 0 && state.cmd.turn === 0) {
+    state.cmd = { fwd: 1, turn: 0 };
     document.querySelectorAll("[data-cmd]").forEach((b) => (b.dataset.on = "false"));
-    const stop = document.querySelector('[data-cmd="stop"]');
-    if (stop) stop.dataset.on = "true";
-    if (stage && stage.setView) {
-      stage.setView("orbit");
-      stage.az = -1.05;
-      stage.el = 0.34;
-      stage.dist = 5.2;
-    }
-    log(`drill.oneleg("${legNames()[state.onelegLeg] || "L1"}")`);
-  } else {
-    if (state.cmd.fwd === 0 && state.cmd.turn === 0) {
-      state.cmd = { fwd: 1, turn: 0 };
-      document.querySelectorAll("[data-cmd]").forEach((b) => (b.dataset.on = "false"));
-      const fwd = document.querySelector('[data-cmd="fwd"]');
-      if (fwd) fwd.dataset.on = "true";
-    }
-    log(mode === 1 ? "policy.use(\"learned\")" : "policy.use(\"hand-tuned\")");
+    const fwd = document.querySelector('[data-cmd="fwd"]');
+    if (fwd) fwd.dataset.on = "true";
   }
+  log(mode === 1 ? "policy.use(\"learned\")" : "policy.use(\"hand-tuned\")");
 }
 
 function setTab(name) {
@@ -1488,52 +1446,16 @@ function updateReadouts(t) {
       ? "TURNING"
       : "WALKING"
     : "STANDING";
-  const oneleg = L.T_ONELEG != null && t[L.T_ONELEG] > 0.5;
-  // The learned policy drives a gait, not the one-foot-at-a-time crawl, so it
-  // reads the walking HUD.
-  const crawl = !oneleg && state.mode === 0;
-  const plantHud = oneleg || crawl;
   const hudWalk = $("hudWalk");
-  const hudDrill = $("hudDrill");
   const hudWalkMore = $("hudWalkMore");
   const hudGaitBits = $("hudGaitBits");
-  if (hudWalk) hudWalk.hidden = plantHud;
-  if (hudDrill) hudDrill.hidden = !plantHud;
-  if (hudWalkMore) hudWalkMore.hidden = plantHud;
-  if (hudGaitBits) hudGaitBits.hidden = plantHud;
-  if (plantHud) {
-    const phases = ["SETTLE", "LIFT", "SHIFT", "PLACE", "PAUSE"];
-    const movingLeg = Math.round(t[L.T_MOVE_LEG]);
-    const phaseName = phases[Math.round(t[L.T_MOVE_PHASE])] || (oneleg ? "ONE-LEG" : "CRAWL");
-    $("hudOlLeg").textContent = legNames()[movingLeg] || String(movingLeg);
-    $("hudOlPhase").textContent = phaseName;
-    $("hudOlMove").textContent = String(Math.round(t[L.T_MOVE_I]));
-    $("hudOlClear").textContent = fmt(t[L.T_FOOT_CLEAR], 2);
-    $("hudOlDrift").textContent = fmt(t[L.T_STANCE_DRIFT], 2);
-    $("hudOlXz").textContent = fmt(t[L.T_CHASSIS_XZ], 2);
-    $("hState").textContent = phaseName;
-    const kind = $("hudDrillKind");
-    if (kind) kind.textContent = oneleg ? "ONE LEG" : "CRAWL";
-    const callout = $("drillCallout");
-    const calloutLine = $("drillCalloutLine");
-    if (callout) callout.hidden = false;
-    if (calloutLine) {
-      calloutLine.textContent = oneleg
-        ? `${legNames()[movingLeg] || "L1"} · ${phaseName} · the red leg is the only one commanded`
-        : `${legNames()[movingLeg] || "L1"} · ${phaseName} · one foot plants, the rest hold`;
-    }
-    if (callout && callout.firstChild && callout.firstChild.nodeType === 3) {
-      callout.firstChild.textContent = oneleg ? "ONE LEG MOVING" : "CRAWL ";
-    }
-  } else {
-    const callout = $("drillCallout");
-    if (callout) callout.hidden = true;
-  }
+  if (hudWalk) hudWalk.hidden = false;
+  if (hudWalkMore) hudWalkMore.hidden = false;
+  if (hudGaitBits) hudGaitBits.hidden = false;
   $("banner").textContent = broken ? "BROKEN" : "DEAD";
   $("banner").dataset.on = String(fallen || broken);
 
-  $("hudGait").textContent =
-    state.mode === 2 ? "ONE LEG" : state.mode === 1 ? "LEARNED" : "CRAWL";
+  $("hudGait").textContent = state.mode === 1 ? "LEARNED" : "BASELINE";
   $("hudDuty").textContent = fmt(t[L.T_DUTY_NOW], 2);
   $("hudY").textContent = (t[L.T_POS + 1] >= 0 ? "+" : "") + fmt(t[L.T_POS + 1], 2);
   $("hudPhase").textContent = fmt(t[L.T_PHASE], 2);
@@ -1729,9 +1651,7 @@ function loadPolicyText(name, text) {
   log(`policy.load("${name}")`);
   // The module has already adopted it and switched itself to the learned
   // policy. Re-applying the course brings the page's own bookkeeping along and
-  // puts the machine back on the terrain the Terrain tab is showing — the
-  // empty-field drill parks it on FLAT, and a checkpoint is not there to walk
-  // an empty plane.
+  // puts the machine back on the terrain the Terrain tab is showing.
   applyCourse();
   refreshPolicyPanel();
   return null;
@@ -1804,7 +1724,6 @@ function wire() {
   const btnLearnWire = $("btnLearn");
   if (btnBase) btnBase.addEventListener("click", () => setMode(0));
   if (btnLearnWire) btnLearnWire.addEventListener("click", () => setMode(1));
-  $("btnOneleg").addEventListener("click", () => setMode(2));
   // With a checkpoint loaded, walking means walking it.
   $("btnWalk").addEventListener("click", () => setMode(state.policy ? 1 : 0));
   const setPlant = (kind) => {
@@ -1865,16 +1784,6 @@ function wire() {
   cfg();
 
   document.addEventListener("click", (e) => {
-    const ol = e.target.closest("[data-oneleg]");
-    if (ol) {
-      state.onelegLeg = +ol.dataset.oneleg;
-      document
-        .querySelectorAll("[data-oneleg]")
-        .forEach((b) => (b.dataset.on = String(+b.dataset.oneleg === state.onelegLeg)));
-      api.hx_set_oneleg_leg(state.onelegLeg);
-      if (state.mode !== 2) setMode(2);
-      else log(`drill.leg("${legNames()[state.onelegLeg]}")`);
-    }
     const cb = e.target.closest("[data-course]");
     if (cb) {
       state.courseKind = +cb.dataset.course;
@@ -2070,32 +1979,11 @@ async function boot() {
   scorePolicy();
   updateTrainingPanel();
   describeMachine();
-  setMode(2);
+  setMode(0);
 
   /* Hooks for the end-to-end test, which drives the real page rather than
    * reimplementing any of it. Nothing else uses them. */
   window.__hxFalls = falls;
-  window.__hxOneleg = () => {
-    const t = telemetry();
-    const legs = Math.round(t[L.T_LEGS]) || 6;
-    const stance = [];
-    for (let i = 0; i < legs; i++) stance.push(t[L.T_STANCE + i] > 0.5 ? 1 : 0);
-    const phases = ["settle", "lift", "shift", "place", "pause"];
-    return {
-      on: L.T_ONELEG != null && t[L.T_ONELEG] > 0.5,
-      moving: Math.round(t[L.T_MOVE_LEG] || 0),
-      phase: Math.round(t[L.T_MOVE_PHASE] || 0),
-      phaseName: phases[Math.round(t[L.T_MOVE_PHASE] || 0)] || "—",
-      clear: t[L.T_FOOT_CLEAR] || 0,
-      drift: t[L.T_STANCE_DRIFT] || 0,
-      chassis: t[L.T_CHASSIS_XZ] || 0,
-      dest: L.T_DEST != null ? [t[L.T_DEST], t[L.T_DEST + 1], t[L.T_DEST + 2]] : [0, 0, 0],
-      stance,
-      policy: $("hPolicy").textContent,
-      state: $("hState").textContent,
-      course: $("hCourse").textContent,
-    };
-  };
   // Advance the actual WASM plant deterministically without waiting for wall
   // time. The smoke suite still verifies the animation loop separately; long
   // physics assertions use this to avoid sleeping through simulated seconds.

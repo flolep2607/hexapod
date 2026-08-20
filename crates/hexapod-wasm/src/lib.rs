@@ -19,7 +19,6 @@ use hexapod_core::dynamics::{robot_com, Physics};
 use hexapod_core::hardware::{Build, TorqueMeter};
 use hexapod_core::hardware::{Servo, NM_TO_KGCM, SERVOS};
 use hexapod_core::math::{convex_hull_xz, polygon_margin, squash, unsquash};
-use hexapod_core::oneleg::OneLegDrill;
 use hexapod_core::plant::ArticulatedPlant;
 use hexapod_core::policy::{n_theta, Gait, Policy, Preset, GAIT_BOUNDS};
 use hexapod_core::sim::{cruise_band, cruise_default, Cmd, Sim};
@@ -30,7 +29,6 @@ use layout::*;
 
 const MODE_BASELINE: u32 = 0;
 const MODE_LEARNED: u32 = 1;
-const MODE_ONELEG: u32 = 2;
 
 /// Which plant carries the learned policy on screen. The centroidal one is
 /// what ARS trained against, so it reproduces the checkpoint's behaviour
@@ -68,17 +66,11 @@ struct App {
     /// body; joint angles still never travel back. ARS trains on the
     /// centroidal step alone, with no plant in the loop.
     plant: Option<ArticulatedPlant>,
-    /// Empty-field drill: five legs hold their world plants, one relocates.
-    /// When this is `Some`, `plant` is unused and the canvas reads the drill.
-    oneleg: Option<OneLegDrill>,
-    /// Which leg the dashboard drill keeps relocating.
-    oneleg_leg: usize,
     /// World plants for stance feet. Without these the live gait sweeps a
     /// stride through the floor every cycle and the machine skates.
     locks: hexapod_core::walker::StanceLocks,
     mode: u32,
-    /// Plant the learned policy drives in the walk view. The crawl drill and
-    /// the empty-field drill own their own plant and ignore this.
+    /// Plant the policy drives in the walk view.
     plant_kind: u32,
     since_fall: f64,
     /// Leftover sim time from the last frame. Playback speed buys more ticks,
@@ -153,12 +145,10 @@ fn make(seed: u64) -> App {
         live: Sim::default(),
         live_gait,
         plant: None,
-        oneleg: None,
-        oneleg_leg: 0,
         locks: hexapod_core::walker::StanceLocks::new(),
         // The dashboard is a leg-placement lab first: boot into the empty-field
         // drill and require an explicit Walk action before running the course.
-        mode: MODE_ONELEG,
+        mode: MODE_LEARNED,
         plant_kind: PLANT_CENTROIDAL,
         since_fall: 0.0,
         acc: 0.0,
@@ -313,19 +303,6 @@ pub extern "C" fn hx_set_mode(mode: u32) {
     }
 }
 
-/// Pin which leg the empty-field drill relocates. Ignored unless the one-leg
-/// mode is on; switching it on the live drill respawns from standing.
-#[unsafe(no_mangle)]
-pub extern "C" fn hx_set_oneleg_leg(leg: u32) {
-    let a = app();
-    let n = a.frame.legs().max(1);
-    a.oneleg_leg = (leg as usize) % n;
-    if a.mode == MODE_ONELEG {
-        a.start_oneleg();
-        a.publish();
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn hx_reset_live() {
     app().reset_live();
@@ -417,8 +394,8 @@ pub extern "C" fn hx_train(iters: u32) -> f64 {
     a.apply_live_gait_limits();
     if a.mode != MODE_LEARNED {
         a.mode = MODE_LEARNED;
-        // The crawl drill owns the live plant in the other modes; the policy
-        // cannot drive it, so the walk view has to be respawned here.
+        // Switching which policy drives has to respawn the live machine, so
+        // the checkpoint starts from standing rather than mid-stride.
         a.reset_live();
     }
     // Publish here: the live view only calls `hx_step` while unpaused, and
@@ -771,19 +748,14 @@ impl App {
     }
 
     fn reset_live(&mut self) {
-        match self.mode {
-            MODE_ONELEG => self.start_oneleg(),
-            // The learned policy is a gait controller, not a crawl: it gets
-            // the plant it was trained to drive, so what is on screen is the
-            // checkpoint walking rather than the hand-written crawl.
-            MODE_LEARNED => self.start_walk(),
-            _ => self.start_crawl(),
-        }
+        // Every mode now stands the machine on the articulated plant and
+        // hands it to a policy; `plant_kind` decides whether that plant is
+        // Rapier or the centroidal model.
+        self.start_walk();
     }
 
     /// Stand the machine on the course and hand it to the policy.
     fn start_walk(&mut self) {
-        self.oneleg = None;
         self.locks.reset();
         self.live.reset(&self.terrain, &self.live_gait, &self.phys);
         if self.plant_kind == PLANT_ARTICULATED {
@@ -800,52 +772,6 @@ impl App {
         } else {
             self.plant = None;
         }
-        self.since_fall = 0.0;
-    }
-
-    /// Crawl: five legs hold, one plants along the command, chassis shifts.
-    fn start_crawl(&mut self) {
-        let drill =
-            OneLegDrill::spawn_on(self.frame, &self.phys, &self.terrain, self.course_seed, true);
-        let (p, yaw, pitch, roll) = drill.plant.chassis_pose();
-        self.live.observe_pose(p, yaw, pitch, roll, drill.plant.chassis_vel());
-        self.live.t = 0.0;
-        self.live.fallen = false;
-        self.live.broken = false;
-        for i in 0..self.frame.legs() {
-            self.live.feet[i].world = drill.plant.leg_joints_world(i)[3];
-            self.live.feet[i].stance = true;
-        }
-        self.oneleg = Some(drill);
-        self.plant = None;
-        self.locks.reset();
-        self.since_fall = 0.0;
-    }
-
-    /// Empty plane, five legs holding settled joints, one free foot.
-    fn start_oneleg(&mut self) {
-        if self.course != Course::Flat {
-            self.course = Course::Flat;
-            self.terrain = Terrain::new(Course::Flat, self.course_seed);
-            self.course_buf = self.terrain.export();
-            self.route_buf = self.terrain.export_route();
-        }
-        let n = self.frame.legs().max(1);
-        let mut drill = OneLegDrill::spawn(self.frame, &self.phys, self.course_seed);
-        drill.pin_leg(self.oneleg_leg % n);
-        drill.start_lifting();
-        let (p, yaw, pitch, roll) = drill.plant.chassis_pose();
-        self.live.observe_pose(p, yaw, pitch, roll, drill.plant.chassis_vel());
-        self.live.t = 0.0;
-        self.live.fallen = false;
-        self.live.broken = false;
-        for i in 0..self.frame.legs() {
-            self.live.feet[i].world = drill.plant.leg_joints_world(i)[3];
-            self.live.feet[i].stance = true;
-        }
-        self.oneleg = Some(drill);
-        self.plant = None;
-        self.locks.reset();
         self.since_fall = 0.0;
     }
 
@@ -901,46 +827,6 @@ impl App {
     }
 
     fn step(&mut self, dt: f64, fwd: f64, turn: f64) {
-        if self.oneleg.is_some() {
-            let fallen = self
-                .oneleg
-                .as_ref()
-                .map(|d| d.sample().fallen)
-                .unwrap_or(false);
-            if fallen {
-                self.since_fall += dt;
-                if self.since_fall > 1.2 {
-                    self.reset_live();
-                }
-                return;
-            }
-            let n = self.ticks(dt);
-            let h = hexapod_core::DT;
-            if let Some(drill) = self.oneleg.as_mut() {
-                if drill.crawl {
-                    drill.set_cmd(Cmd {
-                        fwd: fwd.clamp(-1.0, 1.0),
-                        turn: turn.clamp(-1.0, 1.0),
-                        cruise: self.cruise,
-                        nav: self.nav && turn.abs() < 0.02,
-                    });
-                }
-                for _ in 0..n {
-                    drill.step(h);
-                }
-                let s = drill.sample();
-                self.live.observe_pose(s.pos, s.yaw, s.pitch, s.roll, s.vel);
-                self.live.t = s.t;
-                self.live.fallen = s.fallen;
-                self.live.slip = s.slip;
-                for i in 0..self.frame.legs() {
-                    self.live.feet[i].world = drill.plant.leg_joints_world(i)[3];
-                    self.live.feet[i].stance = !(i == s.moving && s.phase.swinging());
-                }
-            }
-            return;
-        }
-
         // Auto-recover so the viewport never gets stuck on a fallen robot.
         if self.live.fallen
             || self.live.broken
@@ -998,12 +884,7 @@ impl App {
         let n = self.frame.legs();
         // Canvas reads Rapier body transforms. `Sim` stays centroidal: writing
         // plant pose back through the integrator rewinds the gait clock.
-        let draw_plant = self
-            .oneleg
-            .as_ref()
-            .map(|d| &d.plant)
-            .or(self.plant.as_ref());
-        let plant_draw = draw_plant.map(|plant| {
+        let plant_draw = self.plant.as_ref().map(|plant| {
             let (pos, yaw, pitch, roll) = plant.chassis_pose();
             let mut q = [[0.0f64; 3]; MAX_LEGS];
             let mut joints = [[[0.0f64; 3]; 4]; MAX_LEGS];
@@ -1197,65 +1078,24 @@ impl App {
         t[T_JUMPS] = s.jumps as f32;
         t[T_TASK] = if s.jump_clock > 0.0 { 1.0 } else { 0.0 };
         t[T_CLEARANCE] = s.clearance as f32;
-        t[T_PLANT] = if self.plant.is_some() || self.oneleg.is_some() {
-            1.0
-        } else {
-            0.0
-        };
+        t[T_PLANT] = if self.plant.is_some() { 1.0 } else { 0.0 };
         t[T_N_HINGES] = (self.frame.legs() * 3) as f32;
 
-        if let Some(d) = self.oneleg.as_ref() {
-            let s = d.sample();
-            let qcmd = d.cmd_q();
-            t[T_ONELEG] = if d.crawl { 0.0 } else { 1.0 };
-            t[T_MOVE_LEG] = s.moving as f32;
-            t[T_MOVE_PHASE] = s.phase.as_u32() as f32;
-            t[T_MOVE_I] = s.move_i as f32;
-            t[T_STANCE_DRIFT] = s.stance_drift as f32;
-            t[T_CHASSIS_XZ] = s.chassis_xz as f32;
-            t[T_FOOT_CLEAR] = s.foot_clear as f32;
-            t[T_TIME] = s.t as f32;
-            t[T_SLIP_RATE] = s.slip as f32;
-            t[T_FALLEN] = if s.fallen { 1.0 } else { 0.0 };
-            t[T_MODE] = if d.crawl {
-                self.mode as f32
-            } else {
-                MODE_ONELEG as f32
-            };
-            for i in 0..n {
-                let origin = d.origin_world[i];
-                t[T_ORIGIN + i * 3] = origin[0] as f32;
-                t[T_ORIGIN + i * 3 + 1] = origin[1] as f32;
-                t[T_ORIGIN + i * 3 + 2] = origin[2] as f32;
-                t[T_STANCE + i] = if i == s.moving && s.phase.swinging() {
-                    0.0
-                } else {
-                    1.0
-                };
-                let td = if i == s.moving { s.dest_world } else { origin };
-                for c in 0..3 {
-                    t[T_QCMD + i * 3 + c] = qcmd[i][c] as f32;
-                    t[T_TD + i * 3 + c] = td[c] as f32;
-                }
-            }
-            t[T_DEST] = s.dest_world[0] as f32;
-            t[T_DEST + 1] = s.dest_world[1] as f32;
-            t[T_DEST + 2] = s.dest_world[2] as f32;
-        } else {
-            t[T_ONELEG] = 0.0;
-            t[T_MOVE_LEG] = 0.0;
-            t[T_MOVE_PHASE] = 0.0;
-            t[T_MOVE_I] = 0.0;
-            t[T_STANCE_DRIFT] = 0.0;
-            t[T_CHASSIS_XZ] = 0.0;
-            t[T_FOOT_CLEAR] = 0.0;
-            for i in 0..MAX_LEGS * 3 {
-                t[T_ORIGIN + i] = 0.0;
-            }
-            t[T_DEST] = 0.0;
-            t[T_DEST + 1] = 0.0;
-            t[T_DEST + 2] = 0.0;
+        // The drill that used to own these slots is gone; the layout keeps
+        // them so the page's telemetry offsets do not have to be renumbered.
+        t[T_ONELEG] = 0.0;
+        t[T_MOVE_LEG] = 0.0;
+        t[T_MOVE_PHASE] = 0.0;
+        t[T_MOVE_I] = 0.0;
+        t[T_STANCE_DRIFT] = 0.0;
+        t[T_CHASSIS_XZ] = 0.0;
+        t[T_FOOT_CLEAR] = 0.0;
+        for i in 0..MAX_LEGS * 3 {
+            t[T_ORIGIN + i] = 0.0;
         }
+        t[T_DEST] = 0.0;
+        t[T_DEST + 1] = 0.0;
+        t[T_DEST + 2] = 0.0;
     }
 }
 
@@ -1440,16 +1280,20 @@ mod tests {
             "a loaded checkpoint is a trained policy"
         );
         assert_eq!(tel()[T_MODE] as u32, MODE_LEARNED);
-        // The crawl drill cannot be driven by a policy, so the walk view has to
-        // have taken over. Its plant flag is off on the centroidal model.
-        assert!(tel()[T_PLANT] < 0.5, "the policy drives the plant it was trained on");
+        // The walk view has to have taken over. Its plant flag is off on the
+        // centroidal model.
+        assert!(
+            tel()[T_PLANT] < 0.5,
+            "the policy drives the plant it was trained on"
+        );
 
         let start = [tel()[T_POS], tel()[T_POS + 2]];
         for _ in 0..300 {
             hx_step(1.0 / 60.0, 1.0, 0.0);
         }
         hx_publish();
-        let moved = ((tel()[T_POS] - start[0]).powi(2) + (tel()[T_POS + 2] - start[1]).powi(2)).sqrt();
+        let moved =
+            ((tel()[T_POS] - start[0]).powi(2) + (tel()[T_POS + 2] - start[1]).powi(2)).sqrt();
         assert!(moved > 0.5, "the loaded policy did not walk: {moved:.3} m");
 
         // Watching one controller over several courses is the whole point, so
@@ -1474,7 +1318,11 @@ mod tests {
         let other = Policy::seeded(Preset::default_for(eight), eight);
         assert_eq!(load(&hexapod_core::checkpoint::to_text(&other)), 0);
         assert!(message().contains("8 legs"), "{}", message());
-        assert_eq!(hx_policy_loaded(), 0, "a refused checkpoint changes nothing");
+        assert_eq!(
+            hx_policy_loaded(),
+            0,
+            "a refused checkpoint changes nothing"
+        );
     }
 
     #[test]
@@ -1495,96 +1343,6 @@ mod tests {
     }
 
     #[test]
-    fn oneleg_mode_lifts_one_foot_on_an_empty_field() {
-        hx_init(1);
-        hx_set_course(0, 1);
-        hx_set_oneleg_leg(0);
-        hx_set_mode(MODE_ONELEG);
-        hx_set_oneleg_leg(0);
-        assert!(tel()[T_ONELEG] > 0.5, "T_ONELEG={}", tel()[T_ONELEG]);
-        assert_eq!(tel()[T_MOVE_LEG], 0.0);
-
-        let dt = hexapod_core::DT;
-        let ticks = (2.4 / dt) as usize;
-        let mut max_clear = 0.0f32;
-        let mut saw_one_swing = false;
-        let mut dest0: Option<[f32; 3]> = None;
-        let mut dest_wander = 0.0f32;
-        for _ in 0..ticks {
-            hx_step(dt, 0.0, 0.0);
-            let t = tel();
-            assert!(t[T_ONELEG] > 0.5);
-            assert_eq!(t[T_MOVE_LEG], 0.0);
-            max_clear = max_clear.max(t[T_FOOT_CLEAR]);
-            let mut swing = 0u32;
-            for i in 0..6 {
-                if t[T_STANCE + i] < 0.5 {
-                    swing += 1;
-                }
-            }
-            let phase = t[T_MOVE_PHASE];
-            if phase >= 1.0 && phase <= 3.0 {
-                assert_eq!(swing, 1, "phase {phase} swung {swing} legs");
-                saw_one_swing = true;
-                let dest = [t[T_DEST], t[T_DEST + 1], t[T_DEST + 2]];
-                if let Some(d0) = dest0 {
-                    let wander = ((dest[0] - d0[0]).powi(2)
-                        + (dest[1] - d0[1]).powi(2)
-                        + (dest[2] - d0[2]).powi(2))
-                    .sqrt();
-                    dest_wander = dest_wander.max(wander);
-                } else {
-                    dest0 = Some(dest);
-                }
-            } else {
-                dest0 = None;
-                assert_eq!(swing, 0, "phase {phase} should plant every foot");
-            }
-        }
-        assert!(saw_one_swing, "never entered lift/shift/place");
-        assert!(
-            max_clear > 0.12,
-            "moving foot never left the floor: clearance={max_clear}"
-        );
-        assert!(
-            dest_wander < 0.01,
-            "landing mark crawled during the swing: {dest_wander}"
-        );
-    }
-
-    #[test]
-    fn initialization_defaults_to_the_oneleg_drill() {
-        hx_init(1);
-        assert!(tel()[T_ONELEG] > 0.5, "T_ONELEG={}", tel()[T_ONELEG]);
-        assert_eq!(tel()[T_MODE], MODE_ONELEG as f32);
-    }
-
-    #[test]
-    fn walk_mode_crawls_with_at_most_one_swing() {
-        hx_init(1);
-        hx_set_course(0, 1);
-        hx_set_mode(MODE_BASELINE);
-        assert!(tel()[T_ONELEG] < 0.5, "walk used the drill flag");
-        let dt = hexapod_core::DT;
-        let ticks = (3.0 / dt) as usize;
-        let mut max_swing = 0u32;
-        for _ in 0..ticks {
-            hx_step(dt, 1.0, 0.0);
-            let t = tel();
-            assert!(t[T_ONELEG] < 0.5);
-            let mut swing = 0u32;
-            for i in 0..6 {
-                if t[T_STANCE + i] < 0.5 {
-                    swing += 1;
-                }
-            }
-            max_swing = max_swing.max(swing);
-            assert!(swing <= 1, "walk swung {swing} legs");
-        }
-        assert!(max_swing <= 1);
-    }
-
-    #[test]
     fn setting_a_preset_does_not_respawn_the_live_plant() {
         hx_init(1);
         hx_set_course(0, 1);
@@ -1597,10 +1355,7 @@ mod tests {
         hx_set_preset(2);
         hx_step(dt, 1.0, 0.0);
         let t1 = tel()[T_TIME];
-        assert!(
-            t1 > t0,
-            "preset respawned the plant: t {t0} -> {t1}"
-        );
+        assert!(t1 > t0, "preset respawned the plant: t {t0} -> {t1}");
         assert!(tel()[T_ONELEG] < 0.5);
     }
 }

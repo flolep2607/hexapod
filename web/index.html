@@ -9,7 +9,7 @@
     </div>
     <div class="wordmark">HEXAPOD<small>GAIT LAB</small></div>
     <div class="chips right">
-      <div class="chip"><span class="k">Mode</span><b id="hPolicy" class="hot">ONE LEG</b></div>
+      <div class="chip"><span class="k">Mode</span><b id="hPolicy" class="hot">BASELINE</b></div>
       <div class="chip"><span class="k">Course</span><b id="hCourse">MIXED</b></div>
       <div class="chip"><span class="k">State</span><b id="hState" class="hot">WALKING</b></div>
     </div>
@@ -88,20 +88,16 @@
         <div class="viewwrap">
           <canvas id="view"></canvas>
           <div class="hud tl">DOF <b id="hudDof">18</b> · LEGS <b id="hudLegs">6</b>
-<span id="hudGaitBits" hidden>GAIT <b id="hudGait">ONE LEG</b> · DUTY <b id="hudDuty">0.50</b></span></div>
+<span id="hudGaitBits" hidden>GAIT <b id="hudGait">BASELINE</b> · DUTY <b id="hudDuty">0.50</b></span></div>
           <div class="hud tr">CAM <b id="hudCam">ORBIT</b> · 1 ORBIT · 2 TOP · 3 SIDE
 SCROLL TO ZOOM · WASD / QE · [ ] SPEED
 <b id="hudHit"></b></div>
           <div class="hud bl" id="hudWalk" hidden>BODY Y<b id="hudY">+0.88</b> · PHASE <b id="hudPhase">0.00</b>
 MARGIN <b id="hudMargin">0.00</b> m · SAG <b id="hudSag">0.0</b> mm
 vx <b id="hudVx">+0.00</b>  vy <b id="hudVy">+0.00</b>  vz <b id="hudVz">+0.00</b>  slip <b id="hudSlip">0.00</b></div>
-          <div class="hud bl" id="hudDrill"> <span id="hudDrillKind">CRAWL</span> <b id="hudOlLeg">L1</b> · <b id="hudOlPhase">LIFT</b> · move <b id="hudOlMove">0</b>
-clearance <b id="hudOlClear">0.00</b> m · stance drift <b id="hudOlDrift">0.00</b> m
-chassis Δxz <b id="hudOlXz">0.00</b> m · grey X = plant start</div>
           <div class="hud br2" id="hudWalkMore" hidden>V <b id="hudV">0.00</b> / <b id="hudVc">4.00</b> m/s · HEAD <b id="hudHead">+0°</b> · ω <b id="hudW">0.00</b>
 CYCLE <b id="hudCycle">0.47</b> s · STRIDE <b id="hudStride">1.08</b> m
 NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b> m · BRG <b id="hudBrg">+0°</b></div>
-          <div class="drill-callout" id="drillCallout">ONE LEG MOVING<small id="drillCalloutLine">L1 · LIFT · the red leg is the only one commanded</small></div>
           <div class="banner" id="banner">DEAD</div>
         </div>
       </div>
@@ -176,7 +172,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             </div>
             <p class="note">Phase offsets decide which legs swing together. Starting from a tripod, the
             learner is free to invent any coordination pattern it likes — the table is the
-            nominal gait it ended up with, not what the live crawl is doing.</p>
+            nominal gait it ended up with, not what the live robot is doing.</p>
           </div>
         </div>
       </div>
@@ -292,7 +288,6 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
             <thead><tr><th>Mark</th><th>Meaning</th></tr></thead>
             <tbody>
               <tr><td>Solid red ring</td><td>Foot planted; ring grows with its share of the load</td></tr>
-              <tr><td>Red highlighted leg</td><td>The free leg in the one-leg drill. The other five hold their settled joints</td></tr>
               <tr><td>Grey X on the floor</td><td>Where that foot was at the start of this plant. If the foot leaves the X, friction lost</td></tr>
               <tr><td>Dashed grey ring</td><td>Where a swinging leg intends to touch down</td></tr>
               <tr><td>Dashed red polygon</td><td>Support polygon — the convex hull of the planted feet</td></tr>
@@ -333,13 +328,12 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
       </div>
 
       <div class="sec">
-        <div class="sec-bar"><h2>Empty-field drill</h2></div>
+        <div class="sec-bar"><h2>Live robot</h2></div>
         <div class="row2">
-          <button class="btn" id="btnOneleg" data-on="true">One leg</button>
           <button class="btn" id="btnWalk">Walk</button>
         </div>
-        <div class="row3" id="onelegBtns"></div>
-        <p class="note" id="onelegNote">Empty plane. Five legs hold and only react. The red one relocates. Grey X is the plant: if a foot leaves it, grip lost. Walk is the same plant, one foot at a time, along the command — unless a trained policy is loaded below, in which case Walk hands the machine to it.</p>
+        <p class="note" id="walkNote">Stands the machine on the course and hands it to a policy — the
+          baseline gait, or a trained checkpoint once one is loaded below.</p>
       </div>
 
       <div class="sec" id="secCruise">
@@ -373,7 +367,7 @@ NAV <b id="hudNav">AUTO</b> · WP <b id="hudWp">1/8</b> · <b id="hudWpD">0.0</b
         <div class="sec-bar"><h2>Frame</h2><span class="k" id="legsNote"></span></div>
         <label class="slider"><span class="hd"><span class="k">Legs</span><b id="vLegs">6 legs</b></span>
           <input type="range" id="rLegs" min="4" max="10" step="2" value="6"></label>
-        <p class="note">Four legs to ten, in pairs. A quadruped crawls; six and up
+        <p class="note">Four legs to ten, in pairs. Six and up
         can stand on a pentagon while one foot relocates.</p>
       </div>
 

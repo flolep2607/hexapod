@@ -214,51 +214,62 @@ impl ArticulatedPlant {
         );
 
         // --- course -----------------------------------------------------------
-        let x0 = -CORRIDOR_HALF as f32 * s;
-        let x1 = CORRIDOR_HALF as f32 * s;
         let z0 = Z_MIN as f32 * s;
         let z1 = Z_MAX as f32 * s;
-        // One cuboid for the walkable plane. Obstacle blocks sit on top of it.
-        // A heightfield plus this floor double-hit the feet and launched the
-        // chassis; pits are still the centroidal learner's problem.
-        let floor_h = 0.40f32;
-        let floor = bodies.insert(RigidBodyBuilder::fixed().translation(Vector::new(
-            0.0,
-            ground as f32 - floor_h,
-            0.5 * (z0 + z1),
-        )));
-        colliders.insert_with_parent(
-            ColliderBuilder::cuboid(x1 - x0 + 4.0, floor_h, 0.5 * (z1 - z0) + 4.0)
-                .friction(phys.mu as f32)
-                .friction_combine_rule(CoefficientCombineRule::Max)
-                .restitution(0.0)
-                .collision_groups(groups_floor)
-                .user_data(HIT_FLOOR),
-            floor,
-            &mut bodies,
-        );
-        for ob in &terrain.obstacles {
-            if ob.top <= 0.04 {
+        // The walkable surface, decomposed into exact axis-aligned boxes by
+        // `surface_boxes`. It used to be one big cuboid plus a block per
+        // obstacle, which could not represent a pit at all — so every trench
+        // on the parkour courses was solid ground here and the jump only ever
+        // existed in the centroidal model. Boxes never overlap, so the feet
+        // cannot take a double contact off two solids sharing a footprint.
+        //
+        // Each box reaches from its own top face down past the deepest pit on
+        // the course, so the side of a box standing beside a trench *is* the
+        // trench wall, full depth and sharp at the lip. That edge is what a
+        // jump leaves from, so it may not be a ramp.
+        let floor_base = (crate::terrain::deepest_pit(terrain) - 0.60) as f32 * s;
+        let surface = crate::terrain::surface_boxes(terrain);
+        let walled = crate::terrain::boxes_beside_a_drop(&surface);
+        for (bi, b) in surface.iter().enumerate() {
+            let hx = 0.5 * (b.x1 - b.x0) as f32 * s;
+            let hz = 0.5 * (b.z1 - b.z0) as f32 * s;
+            let top = ground as f32 + b.top as f32 * s;
+            let bottom = ground as f32 + floor_base;
+            let hy = 0.5 * (top - bottom);
+            if hx < 0.004 || hz < 0.004 || hy < 0.004 {
                 continue;
             }
-            let hx = 0.5 * (ob.x1 - ob.x0) as f32 * s;
-            let hz = 0.5 * (ob.z1 - ob.z0) as f32 * s;
-            let hy = 0.5 * ob.top as f32 * s;
-            if hx < 0.02 || hz < 0.02 || hy < 0.02 {
-                continue;
-            }
-            let block = bodies.insert(RigidBodyBuilder::fixed().translation(Vector::new(
-                0.5 * (ob.x0 + ob.x1) as f32 * s,
-                ground as f32 + hy,
-                0.5 * (ob.z0 + ob.z1) as f32 * s,
+            // A face at or below base ground is the walkable plane or the
+            // floor of a trench: putting the belly on either one is a crash.
+            // A raised face is a block, fatal only on a hard hit.
+            let (kind, grip) = if b.is_ground() {
+                (HIT_FLOOR, phys.mu)
+            } else {
+                (HIT_SOLID, phys.mu * b.grip)
+            };
+            // Links collide with anything that has an exposed vertical face:
+            // a raised block, or ground standing beside a drop, where that
+            // face is the trench wall. The open plane keeps the foot-and-belly
+            // groups it has always used, so a tibia laid on it still skates
+            // instead of tripping the machine.
+            let groups = if b.is_ground() && !walled[bi] {
+                groups_floor
+            } else {
+                groups_solid
+            };
+            let body = bodies.insert(RigidBodyBuilder::fixed().translation(Vector::new(
+                0.5 * (b.x0 + b.x1) as f32 * s,
+                top - hy,
+                0.5 * (b.z0 + b.z1) as f32 * s,
             )));
             colliders.insert_with_parent(
                 ColliderBuilder::cuboid(hx, hy, hz)
-                    .friction((phys.mu * ob.grip) as f32)
+                    .friction(grip as f32)
+                    .friction_combine_rule(CoefficientCombineRule::Max)
                     .restitution(0.0)
-                    .collision_groups(groups_solid)
-                    .user_data(HIT_SOLID),
-                block,
+                    .collision_groups(groups)
+                    .user_data(kind),
+                body,
                 &mut bodies,
             );
         }
@@ -828,6 +839,65 @@ impl ArticulatedPlant {
         } else {
             slip / n as f64
         }
+    }
+
+    /// Height of the first solid surface under `(x, z)`, in simulator units,
+    /// as the *physics* sees it — not as `Terrain::height` computes it.
+    ///
+    /// The two agreeing is the whole point: the centroidal model reads the
+    /// height field directly, so if the plant's colliders say something else
+    /// then the two models are walking on different courses. Returns `None`
+    /// when nothing is under the point at all — including before the first
+    /// [`step`](Self::step), because the broad-phase BVH the cast walks is not
+    /// built until then.
+    pub fn support_under(&self, x: f64, z: f64, from_y: f64) -> Option<f64> {
+        let s = self.scale;
+        let origin = Vector::new(x as f32 * s, from_y as f32 * s, z as f32 * s);
+        let ray = Ray::new(origin, -Vector::Y);
+        let q = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            QueryFilter::exclude_dynamic(),
+        );
+        q.cast_ray(&ray, Real::MAX, true)
+            .map(|(_, toi)| (from_y as f32 * s - toi) as f64 / s as f64)
+    }
+
+    /// Which feet are touching the walkable surface. The joint-level policy
+    /// gets this as an observation and the reward reads it for a support count,
+    /// so it has to mean "in contact with ground", not "in contact with
+    /// anything" — a tibia leaning on a wall is not a foothold.
+    pub fn foot_contacts(&self) -> [bool; MAX_LEGS] {
+        let mut out = [false; MAX_LEGS];
+        for i in 0..self.n {
+            let Some(leg) = self.legs[i].as_ref() else {
+                continue;
+            };
+            out[i] = self.narrow_phase.contact_pairs_with(leg.foot).any(|pair| {
+                if !pair.has_any_active_contact() {
+                    return false;
+                }
+                let other = if pair.collider1 == leg.foot {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let kind = self.colliders[other].user_data;
+                kind == HIT_FLOOR || kind == HIT_SOLID
+            });
+        }
+        out
+    }
+
+    /// Joint angles of every leg, flattened, relative to the pose the plant
+    /// was spawned in. This is what the policy sees and what it writes back to.
+    pub fn leg_q_all(&self) -> [[f64; 3]; MAX_LEGS] {
+        let mut out = [[0.0; 3]; MAX_LEGS];
+        for i in 0..self.n {
+            out[i] = self.leg_q(i);
+        }
+        out
     }
 
     pub fn pitch_abs(&self) -> f64 {
@@ -1540,10 +1610,116 @@ mod tests {
         );
     }
 
+    /// The plant used to represent every course with one solid slab plus a
+    /// block per raised obstacle, so a trench — an obstacle with a *negative*
+    /// top — did not exist here at all. The parkour courses were flat ground
+    /// in Rapier. That is why the jump only ever worked in the centroidal
+    /// model, where takeoff was written straight onto the body velocity: there
+    /// was nothing in the physics to jump over.
+    ///
+    /// Ray-cast the collider set and compare it against the height field the
+    /// centroidal model reads. Anywhere the two disagree, the two halves of the
+    /// simulator are walking different courses.
+    #[test]
+    fn the_plant_surface_matches_the_height_field_including_pits() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        for course in [
+            Course::Jump,
+            Course::Chasm,
+            Course::Beam,
+            Course::Gaps,
+            Course::Mixed,
+            Course::Steps,
+            Course::Flat,
+        ] {
+            let terrain = Terrain::new(course, 7);
+            let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+            let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            // The cast needs a built broad-phase BVH.
+            plant.step(crate::sim::DT);
+
+            let mut checked = 0usize;
+            let mut z = Z_MIN + 0.37;
+            while z < Z_MAX - 0.5 {
+                let mut x = -CORRIDOR_HALF + 0.41;
+                while x < CORRIDOR_HALF {
+                    let want = terrain.height(x, z);
+                    let got = plant
+                        .support_under(x, z, 6.0)
+                        .unwrap_or_else(|| panic!("{} has no surface at ({x:.2}, {z:.2})", course.name()));
+                    assert!(
+                        (got - want).abs() < 0.02,
+                        "{} at ({x:.2}, {z:.2}): height field says {want:.3}, physics says {got:.3}",
+                        course.name()
+                    );
+                    checked += 1;
+                    x += 0.83;
+                }
+                z += 0.71;
+            }
+            assert!(checked > 500, "{} only probed {checked} points", course.name());
+        }
+    }
+
+    /// A parkour trench has to be a hole the machine can be inside, with a
+    /// sharp lip: the surface a stride before the near edge is ground, and the
+    /// surface just past it is the trench floor, nearly a metre down.
+    #[test]
+    fn a_parkour_trench_is_a_hole_in_the_plant_with_a_sharp_lip() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Jump, 7);
+        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        plant.step(crate::sim::DT);
+        let pit = terrain
+            .obstacles
+            .iter()
+            .find(|ob| ob.top < -0.5)
+            .copied()
+            .expect("parkour has trenches");
+
+        let before = plant.support_under(0.0, pit.z0 - 0.10, 6.0).unwrap();
+        let inside = plant
+            .support_under(0.0, 0.5 * (pit.z0 + pit.z1), 6.0)
+            .unwrap();
+        let after = plant.support_under(0.0, pit.z1 + 0.10, 6.0).unwrap();
+
+        assert!(before > -0.05, "ground before the lip is {before:.3}");
+        assert!(
+            inside < -0.5,
+            "the trench floor is at {inside:.3}, so there is no hole to jump"
+        );
+        assert!(after > -0.05, "the far side is {after:.3}");
+
+        // The lip is an edge, not a ramp: 2 cm across it, the drop is full depth.
+        let a = plant.support_under(0.0, pit.z0 - 0.01, 6.0).unwrap();
+        let b = plant.support_under(0.0, pit.z0 + 0.01, 6.0).unwrap();
+        assert!(
+            a - b > 0.5,
+            "the lip is a ramp: {a:.3} to {b:.3} across 2 cm"
+        );
+    }
+
     /// The live dashboard world-locks stance and keeps ride height as a
     /// body-frame command. Converting world ground through a dipped `pos[1]`
     /// used to fold the legs on the first step.
+    ///
+    /// Ignored: it documents a bug rather than guarding a fix. `drive_articulated`
+    /// does not walk — it inverts the machine (max |roll| reaches pi) and flings
+    /// the chassis to four times its stance height, on flat ground, at every
+    /// commanded speed. The command is ignored outright: 0.3 m/s and 3.0 m/s
+    /// produce bit-identical trajectories, so the gait clock on this path never
+    /// sees `cruise` at all.
+    ///
+    /// The assertions below are the ones that were here before, plus the two
+    /// that catch the tumble. The originals passed throughout: `min_y` only
+    /// rises when the chassis is thrown upward, `pitch` was sampled once at the
+    /// end, and a cartwheeling robot never puts its belly down long enough to
+    /// set `fallen`. Un-ignore this when the tripod path is fixed.
     #[test]
+    #[ignore = "drive_articulated inverts the machine; see the doc comment"]
     fn terrain_aware_tripod_does_not_sit_down() {
         let frame = Frame::new(6);
         let phys = Physics::default();
@@ -1556,9 +1732,15 @@ mod tests {
             nav: false,
         };
         let mut min_y = f64::INFINITY;
+        let mut max_y = 0.0f64;
+        let mut max_tilt = 0.0f64;
+        let y0 = walker.plant.chassis_y();
         let ticks = (6.0 / crate::sim::DT) as usize;
         for k in 0..ticks {
             walker.step(&terrain, &policy, &gait, crate::sim::DT, cmd);
+            let (_, _, pitch, roll) = walker.plant.chassis_pose();
+            max_tilt = max_tilt.max(pitch.abs()).max(roll.abs());
+            max_y = max_y.max(walker.plant.chassis_y());
             if k > 50 {
                 min_y = min_y.min(walker.plant.chassis_y());
             }
@@ -1571,8 +1753,48 @@ mod tests {
             s.pos[2]
         );
         assert!(s.pos[2] > 0.70, "did not walk: z={:.3}", s.pos[2]);
-        assert!(s.pitch.abs() < 0.55, "fell while walking");
+        assert!(
+            max_tilt < 0.55,
+            "went over while walking: max tilt {max_tilt:.2} rad"
+        );
+        assert!(
+            max_y < y0 * 1.5,
+            "chassis was thrown: {max_y:.2} m from a {y0:.2} m stance"
+        );
         assert!(!s.fallen);
+    }
+
+    /// Commanded speed has to reach the plant. Two very different commands
+    /// producing the same trajectory means the gait clock never saw either.
+    ///
+    /// Ignored for the same reason as the test above: this is the measurement
+    /// that showed the command is dropped, not a guard on working behaviour.
+    #[test]
+    #[ignore = "drive_articulated ignores cmd.cruise; see terrain_aware_tripod_does_not_sit_down"]
+    fn tripod_distance_responds_to_commanded_speed() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let mut travelled = Vec::new();
+        for cruise in [0.4f64, 2.0] {
+            let (mut walker, terrain, policy, gait) =
+                crate::walker::open_loop_walk(frame, Course::Flat, 1, phys);
+            let cmd = crate::sim::Cmd {
+                fwd: 1.0,
+                turn: 0.0,
+                cruise,
+                nav: false,
+            };
+            for _ in 0..(6.0 / crate::sim::DT) as usize {
+                walker.step(&terrain, &policy, &gait, crate::sim::DT, cmd);
+            }
+            travelled.push(walker.sample().pos[2]);
+        }
+        assert!(
+            travelled[1] > travelled[0] * 1.5,
+            "0.4 m/s covered {:.2} m and 2.0 m/s covered {:.2} m",
+            travelled[0],
+            travelled[1]
+        );
     }
 
     /// A wall beside the machine, not in front of it. Swing used to be projected

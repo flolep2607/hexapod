@@ -114,7 +114,8 @@ pub const T_N_HINGES: usize = 387;
 /// World xyz of the mass-weighted centre of mass of the drawn robot.
 pub const T_COM3: usize = 388; // 3
 
-/// 1 while the empty-field one-leg drill is running instead of a walk.
+/// Always 0. The drill that owned this slot is gone; the offset stays so the
+/// page's telemetry layout does not have to be renumbered.
 pub const T_ONELEG: usize = 391;
 /// Index of the free leg.
 pub const T_MOVE_LEG: usize = 392;

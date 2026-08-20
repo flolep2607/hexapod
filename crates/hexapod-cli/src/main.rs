@@ -3,8 +3,7 @@
 //!
 //! ```text
 //! hexapod train  [--course mixed] [--iters 200] [--seed 1] [--preset tripod]
-//! hexapod oneleg [--moves 6] [--leg L1] [--seed 1]
-//! hexapod watch  [--course flat] [--seconds 8] [--speed 1.5]
+//! hexapod joint-train [--iters 400] [--out policy.txt] [--seed 1]
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
 //! hexapod train-all [--iters 200] [--train-seeds 1] [--eval-seeds 2]
@@ -14,13 +13,12 @@
 //! hexapod servo                     the same gait on every servo
 //! ```
 //!
-//! `oneleg` is the empty-field drill: five legs hold their world plants
-//! (friction only, nothing welded to the floor) while one foot lifts
-//! and plants a random reachable spot in its workspace.
-//!
-//! `watch` runs the Rapier plant and prints pose, 3-axis velocity, heading,
-//! stance-foot slip and range/bearing to the next waypoint — numbers you can
-//! read when a canvas walk is too small or too icy to judge by eye.
+//! `joint-train` is the joint-level trainer: the policy commands all eighteen
+//! motors directly against the Rapier plant, with no gait and no IK, working up
+//! a curriculum from standing to parkour. It writes a `hexapod-joint-v1`
+//! checkpoint, which is a different format from the gait policies above
+//! because it drives a different thing. Native only — a rollout costs a Rapier
+//! step per tick, which is why this is not in the page.
 //!
 //! `--course` takes any of `flat steps rubble gaps mixed ramps slalom slick
 //! gauntlet jump`, matched case-insensitively against the names the simulator
@@ -30,9 +28,7 @@
 //! the legs weightless, which is what the simulator assumed before it had a
 //! leg-inertia model.
 //!
-//! `--legs N` sets the frame: any even count from 4 to 10. Four legs start on
-//! the crawl rather than the alternating gait, because a trot stands on two
-//! diagonal feet and this simulator judges stability statically.
+//! `--legs N` sets the frame: any even count from 4 to 10.
 //!
 //! `--servo NAME` picks the actuator the simulator drives its joints with, and
 //! `--mass` / `--scale` the machine it is driving. They change what the
@@ -49,8 +45,6 @@ use hexapod_core::sim::{
     evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
     JUMP_EVAL_SPEEDS,
 };
-use hexapod_core::oneleg::{OneLegDrill, Phase};
-use hexapod_core::walker::WalkSample;
 use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
 
 fn main() {
@@ -137,6 +131,7 @@ fn main() {
         "bench" => bench(frame, course, seed, phys),
         "bom" => bom(frame, course, seed, iters, cfg, phys, build),
         "sweep" => sweep(frame, iters, cfg, phys, seed),
+        "joint-train" => joint_train(frame, phys, &args),
         "train-all" | "all-terrain" => all_terrain(frame, seed, iters, cfg, phys, &args),
         "eval-all" => eval_all(seed, cfg, phys, &args),
         "speed" => speed(frame, course, seed, iters, cfg, phys),
@@ -146,19 +141,6 @@ fn main() {
         "parts" => parts_json(),
         "courses" => courses_json(),
         "system" => system(frame, course, seed, iters, cfg, phys, &args),
-        "oneleg" | "reach" => oneleg(frame, seed, phys, &args),
-        "scene" | "scenes" => scenes(frame, phys, &args),
-        "legs" => legs_probe(frame, phys, course, &args),
-        "churn" => churn(frame, phys, course, &args),
-        "crawl-train" => crawl_train(frame, phys, &args),
-        "watch" => {
-            let course = if flag(&args, "--course").is_some() {
-                course
-            } else {
-                Course::Flat
-            };
-            watch(frame, course, seed, preset, phys, &args)
-        }
         _ => train(frame, course, seed, iters, preset, cfg, phys),
     }
 }
@@ -388,362 +370,6 @@ fn bench(frame: Frame, course: Course, seed: u64, phys: Physics) {
 
 /// Rapier plant, printed as numbers: pose, 3-axis velocity, heading, slip,
 /// range and bearing to the next waypoint.
-fn watch(
-    frame: Frame,
-    course: Course,
-    seed: u64,
-    _preset: Preset,
-    phys: Physics,
-    args: &[String],
-) {
-    let seconds: f64 = flag(args, "--seconds")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8.0);
-    let every: f64 = f64::max(
-        flag(args, "--every")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.10),
-        DT,
-    );
-    let speed: f64 = flag(args, "--speed")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.5);
-    let nav = args.iter().any(|a| a == "--nav");
-
-    let terrain = Terrain::new(course, seed);
-    let mut drill = OneLegDrill::spawn_on(frame, &phys, &terrain, seed, true);
-    let cmd = Cmd {
-        fwd: 1.0,
-        turn: 0.0,
-        cruise: speed,
-        nav,
-    };
-    drill.set_cmd(cmd);
-
-    println!(
-        "# hexapod watch  {} on {}  course={} seed={}  cmd={:.2} m/s  nav={}  crawl",
-        frame.label(),
-        frame.legs(),
-        course.name(),
-        seed,
-        speed,
-        if nav { "on" } else { "off" },
-    );
-    println!(
-        "# t      x      y      z     yaw   pit   rol     vx     vy     vz   |v|  along   slip  \
-         dψ   wp_d   brg  wp  reach stance"
-    );
-
-    let ticks = (seconds / DT).round() as usize;
-    let emit_every = (every / DT).round().max(1.0) as usize;
-    let mut samples: Vec<WalkSample> = Vec::new();
-    let wall = Instant::now();
-
-    for k in 0..=ticks {
-        if k > 0 {
-            drill.set_cmd(cmd);
-            drill.step(DT);
-        }
-        let fallen = drill.sample().fallen;
-        if k % emit_every == 0 || k == ticks || fallen {
-            let s = watch_sample(&drill, terrain.waypoints.len());
-            print_watch_row(&s);
-            samples.push(s);
-            if fallen {
-                println!("# FALLEN at t={:.2}s", s.t);
-                break;
-            }
-        }
-    }
-
-    let elapsed = wall.elapsed().as_secs_f64();
-    print_watch_summary(&samples, speed, elapsed);
-}
-
-fn watch_sample(drill: &OneLegDrill, wp_n: usize) -> WalkSample {
-    let s = drill.sample();
-    let n = drill.frame.legs();
-    let mut stance = [false; hexapod_core::MAX_LEGS];
-    for i in 0..n {
-        stance[i] = !(i == s.moving && s.phase.swinging());
-    }
-    let (hs, hc) = s.yaw.sin_cos();
-    let along = s.vel[0] * (-hs) + s.vel[2] * hc;
-    let speed = (s.vel[0] * s.vel[0] + s.vel[2] * s.vel[2]).sqrt();
-    WalkSample {
-        t: s.t,
-        pos: s.pos,
-        yaw: s.yaw,
-        pitch: s.pitch,
-        roll: s.roll,
-        vel: s.vel,
-        speed,
-        along,
-        slip: s.slip,
-        yaw_rate: 0.0,
-        heading_deg: s.yaw.to_degrees(),
-        wp: 0,
-        wp_n,
-        wp_dist: 0.0,
-        bearing: 0.0,
-        bearing_deg: 0.0,
-        reached: 0,
-        cmd_speed: 0.0,
-        n_legs: n,
-        stance,
-        fallen: s.fallen,
-    }
-}
-
-fn print_watch_row(s: &WalkSample) {
-    println!(
-        "{:5.2} {:+6.3} {:+6.3} {:+6.3} {:+6.1} {:+5.1} {:+5.1} {:+6.3} {:+6.3} {:+6.3} \
-         {:5.2} {:+6.3} {:5.3} {:+5.2} {:6.2} {:+5.1} {:3} {:5} {}",
-        s.t,
-        s.pos[0],
-        s.pos[1],
-        s.pos[2],
-        s.heading_deg,
-        s.pitch.to_degrees(),
-        s.roll.to_degrees(),
-        s.vel[0],
-        s.vel[1],
-        s.vel[2],
-        s.speed,
-        s.along,
-        s.slip,
-        s.yaw_rate,
-        s.wp_dist,
-        s.bearing_deg,
-        s.wp + 1,
-        s.reached,
-        s.stance_bits()
-    );
-}
-
-fn print_watch_summary(samples: &[WalkSample], cmd: f64, wall_s: f64) {
-    let Some(first) = samples.first() else {
-        return;
-    };
-    let last = *samples.last().unwrap();
-    let n = samples.len().max(1) as f64;
-    let mean = |f: fn(&WalkSample) -> f64| samples.iter().map(f).sum::<f64>() / n;
-    let peak_along = samples
-        .iter()
-        .map(|s| s.along)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let min_y = samples.iter().map(|s| s.pos[1]).fold(f64::INFINITY, f64::min);
-    let alongs: Vec<f32> = samples.iter().map(|s| s.along as f32).collect();
-
-    println!();
-    println!("--- {:.2} s ({:.2} s wall) ---", last.t, wall_s);
-    println!(
-        "pose         x={:+.3}  y={:.3}  z={:+.3}   heading {:+.1}°  pitch {:+.1}°  roll {:+.1}°",
-        last.pos[0],
-        last.pos[1],
-        last.pos[2],
-        last.heading_deg,
-        last.pitch.to_degrees(),
-        last.roll.to_degrees()
-    );
-    println!(
-        "progress     Δz={:+.3} m  Δx={:+.3} m  heading drift {:+.1}°",
-        last.pos[2] - first.pos[2],
-        last.pos[0] - first.pos[0],
-        last.heading_deg - first.heading_deg
-    );
-    println!(
-        "velocity     mean |v|={:.3} m/s  mean along-heading={:+.3}  peak along={:+.3}  cmd={:.2}",
-        mean(|s| s.speed),
-        mean(|s| s.along),
-        peak_along,
-        cmd
-    );
-    println!(
-        "axis         mean vx={:+.3}  vy={:+.3}  vz={:+.3}   end vx={:+.3} vy={:+.3} vz={:+.3}",
-        mean(|s| s.vel[0]),
-        mean(|s| s.vel[1]),
-        mean(|s| s.vel[2]),
-        last.vel[0],
-        last.vel[1],
-        last.vel[2]
-    );
-    println!(
-        "slip         mean {:.3} m/s  end {:.3} m/s   (stance-foot rubber vs floor)",
-        mean(|s| s.slip),
-        last.slip
-    );
-    println!(
-        "waypoint     {}/{}  dist={:.2} m  bearing {:+.1}°  reached {}",
-        last.wp + 1,
-        last.wp_n.max(1),
-        last.wp_dist,
-        last.bearing_deg,
-        last.reached
-    );
-    println!(
-        "height       min {:.3}  end {:.3}{}",
-        min_y,
-        last.pos[1],
-        if last.fallen { "  FALLEN" } else { "" }
-    );
-    println!("along spark  {}", sparkline(&alongs));
-}
-
-/// Empty field: five legs hold their standing setpoints, one foot relocates
-/// inside its reachable workspace. Nothing is welded to the floor.
-fn oneleg(frame: Frame, seed: u64, phys: Physics, args: &[String]) {
-    let moves: usize = flag(args, "--moves")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(frame.legs());
-    let every: f64 = f64::max(
-        flag(args, "--every")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.10),
-        DT,
-    );
-    let mut drill = OneLegDrill::spawn(frame, &phys, seed);
-    if let Some(name) = flag(args, "--leg") {
-        let idx = (0..frame.legs()).find(|&i| {
-            frame.name(i).eq_ignore_ascii_case(&name) || name == i.to_string()
-        });
-        match idx {
-            Some(i) => drill.pin_leg(i),
-            None => {
-                eprintln!(
-                    "unknown leg {name:?}; try {}",
-                    (0..frame.legs())
-                        .map(|i| frame.name(i))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                std::process::exit(2);
-            }
-        }
-    }
-
-    println!(
-        "# hexapod oneleg  {} on {}  seed={}  moves={}  empty field, friction only",
-        frame.label(),
-        frame.legs(),
-        seed,
-        moves
-    );
-    println!(
-        "# stance legs hold their world plants; the free foot lifts and \
-         plants a random reachable spot in its workspace"
-    );
-    println!(
-        "# t     phase  mv leg    cmdx   cmdy   cmdz    actx   acty   actz  \
-         err  Δxz  drift travel   slip     vx     vy     vz  y    yaw"
-    );
-
-    let emit_every = (every / DT).round().max(1.0) as usize;
-    let mut k = 0usize;
-    let mut last_move = 0usize;
-    let mut last_leg = 0usize;
-    let mut last_phase = Phase::Settle;
-    let wall = Instant::now();
-    let mut summaries: Vec<(usize, &'static str, f64, f64, f64, f64)> = Vec::new();
-    // per-move peaks: travel, stance_drift, chassis_xz, end reach_err
-    let mut peak_travel = 0.0;
-    let mut peak_drift = 0.0;
-    let mut peak_xz = 0.0;
-
-    loop {
-        if k > 0 {
-            drill.step(DT);
-        }
-        let s = drill.sample();
-        if s.move_i != last_move {
-            summaries.push((
-                last_move,
-                frame.name(last_leg),
-                peak_travel,
-                peak_drift,
-                peak_xz,
-                s.reach_err,
-            ));
-            peak_travel = 0.0;
-            peak_drift = 0.0;
-            peak_xz = 0.0;
-            last_move = s.move_i;
-        }
-        last_leg = s.moving;
-        peak_travel = peak_travel.max(s.moving_travel);
-        peak_drift = peak_drift.max(s.stance_drift);
-        peak_xz = peak_xz.max(s.chassis_xz);
-
-        if k % emit_every == 0 || s.phase != last_phase || s.fallen {
-            println!(
-                "{:5.2} {:>6} {:3} {:<3} {:+6.3} {:+6.3} {:+6.3}  {:+6.3} {:+6.3} {:+6.3} \
-                 {:5.3} {:5.3} {:5.3} {:6.3} {:6.3} {:+6.3} {:+6.3} {:+6.3} {:5.3} {:+5.1}{}",
-                s.t,
-                s.phase.name(),
-                s.move_i,
-                frame.name(s.moving),
-                s.cmd_body[0],
-                s.cmd_body[1],
-                s.cmd_body[2],
-                s.foot_body[0],
-                s.foot_body[1],
-                s.foot_body[2],
-                s.reach_err,
-                s.chassis_xz,
-                s.stance_drift,
-                s.moving_travel,
-                s.slip,
-                s.vel[0],
-                s.vel[1],
-                s.vel[2],
-                s.pos[1],
-                s.yaw.to_degrees(),
-                if s.fallen { " FALLEN" } else { "" }
-            );
-        }
-        last_phase = s.phase;
-        if s.fallen {
-            println!("# FALLEN at t={:.2}s", s.t);
-            break;
-        }
-        if s.move_i >= moves && s.phase == Phase::Lift && s.phase_u < 0.05 && k > 10 {
-            break;
-        }
-        k += 1;
-        if k > (120.0 / DT) as usize {
-            break;
-        }
-    }
-
-    println!();
-    println!(
-        "--- {} moves in {:.2} s ({:.2} s wall) ---",
-        summaries.len().max(last_move),
-        drill.t,
-        wall.elapsed().as_secs_f64()
-    );
-    println!(
-        "{:<6} {:<4} {:>8} {:>10} {:>10}",
-        "move", "leg", "travel", "stanceΔ", "chassisΔ"
-    );
-    for (i, name, travel, drift, xz, _) in &summaries {
-        println!(
-            "{:<6} {:<4} {:8.3} {:10.3} {:10.3}",
-            i, name, travel, drift, xz
-        );
-    }
-    let s = drill.sample();
-    println!(
-        "end  y={:.3}  yaw={:+.1}°  pitch={:+.1}°  |v|={:.3}  fallen={}",
-        s.pos[1],
-        s.yaw.to_degrees(),
-        s.pitch.to_degrees(),
-        (s.vel[0] * s.vel[0] + s.vel[2] * s.vel[2]).sqrt(),
-        s.fallen
-    );
-}
-
-/// Train on MIXED, then check the policy on courses it never trained on.
 fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
     let train_terrain = Terrain::new(Course::Mixed, seed);
     let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
@@ -1696,268 +1322,87 @@ fn sparkline(v: &[f32]) -> String {
 
 // ------------------------------------------------------------------- scenes
 
-/// One headless scenario with pass/fail numbers, so a locomotion change can be
-/// judged from a terminal instead of a canvas. Every scene prints the same
-/// columns; `--json` emits them for scripting.
+// ------------------------------------------------------------- joint-train
+
+/// Train a joint-level policy through the curriculum and write a checkpoint.
 ///
-///   hexapod scene            run them all
-///   hexapod scene walk       run one
-///   hexapod scene --json     machine readable
-struct Report {
-    name: &'static str,
-    /// Worst joint tracking error over the run, radians. The god motor's own
-    /// score: if this is not near zero the joints are not following the gait
-    /// and every other number is measuring the wrong machine.
-    track: f64,
-    /// Lowest the chassis got, sim units. Ride height is 0.88.
-    min_y: f64,
-    /// Ground covered in the plane, sim units.
-    travel: f64,
-    /// Metres of stance-foot sliding summed over every planted foot.
-    slip: f64,
-    /// Distance to the waypoint at the end, or -1 when the scene has none.
-    to_goal: f64,
-    fell: bool,
-    /// Simulated seconds per wall second.
-    rt: f64,
-}
+///   hexapod joint-train [--iters 400] [--dirs 16] [--top 6] [--alpha 0.02]
+///                       [--sigma 0.03] [--scenarios 2] [--seed 1]
+///                       [--out checkpoints/joint-v1.txt]
+fn joint_train(frame: Frame, mut phys: Physics, args: &[String]) {
+    use hexapod_core::joint_rl::{to_text, train_curriculum, JointCfg, Stage};
 
-impl Report {
-    fn row(&self) -> String {
-        format!(
-            "{:<12} track {:6.3}  min_y {:6.3}  travel {:7.3}  slip {:8.2}  goal {:7.3}  {:>5}  {:6.1}x",
-            self.name,
-            self.track,
-            self.min_y,
-            self.travel,
-            self.slip,
-            self.to_goal,
-            if self.fell { "FELL" } else { "ok" },
-            self.rt
-        )
-    }
-    fn json(&self) -> String {
-        format!(
-            "{{\"name\":\"{}\",\"track\":{:.4},\"min_y\":{:.4},\"travel\":{:.4},\"slip\":{:.3},\"to_goal\":{:.4},\"fell\":{},\"rt\":{:.2}}}",
-            self.name, self.track, self.min_y, self.travel, self.slip, self.to_goal, self.fell, self.rt
-        )
-    }
-}
-
-fn scenes(frame: Frame, mut phys: Physics, args: &[String]) {
     motor_flags(&mut phys, args);
-    // args[0] is the subcommand. A scene name is the next bare word that is
-    // not the value of a flag.
-    let mut want = String::new();
-    let mut k = 1;
-    while k < args.len() {
-        if args[k].starts_with("--") {
-            k += 2;
-            continue;
-        }
-        want = args[k].clone();
-        break;
-    }
-    let json = args.iter().any(|a| a == "--json");
-    let secs: f64 = flag(args, "--seconds")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20.0);
-    let mut rows = Vec::new();
-    // The tripod path is a different controller from the crawl and breaks in
-    // different ways, so it gets its own scenes rather than sharing a knob.
-    for (name, course) in [("tripod", Course::Flat), ("tripod-rubble", Course::Rubble)] {
-        if !want.is_empty() && want != name {
-            continue;
-        }
-        rows.push(run_tripod(name, frame, phys, course, secs));
-    }
-    let all: [(&'static str, Course, f64, f64); 6] = [
-        ("stand", Course::Flat, 0.0, 0.0),
-        ("walk", Course::Flat, 1.0, 0.0),
-        ("turn", Course::Flat, 0.0, 1.0),
-        ("rubble", Course::Rubble, 1.0, 0.0),
-        ("steps", Course::Steps, 1.0, 0.0),
-        ("slalom", Course::Slalom, 1.0, 0.0),
-    ];
-    for (name, course, fwd, turn) in all {
-        if !want.is_empty() && want != name {
-            continue;
-        }
-        rows.push(run_scene(name, frame, phys, course, fwd, turn, secs));
-    }
-    if json {
-        println!(
-            "[{}]",
-            rows.iter().map(|r| r.json()).collect::<Vec<_>>().join(",")
-        );
-    } else {
-        println!("scene        joint-tracking  ride    ground     foot-slip   waypoint  state   speed");
-        for r in &rows {
-            println!("{}", r.row());
-        }
-    }
-}
-
-const TAU: f64 = std::f64::consts::TAU;
-
-fn run_scene(
-    name: &'static str,
-    frame: Frame,
-    phys: Physics,
-    course: Course,
-    fwd: f64,
-    turn: f64,
-    secs: f64,
-) -> Report {
-    use hexapod_core::sim::DT;
-    let terrain = Terrain::new(course, 1);
-    let mut drill = OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true);
-    drill.set_cmd(Cmd {
-        fwd,
-        turn,
-        cruise: 0.35,
-        nav: false,
-    });
-    let n = (secs / DT) as usize;
-    let mut min_y = f64::INFINITY;
-    let mut track: f64 = 0.0;
-    let mut slip = 0.0f64;
-    let mut fell = false;
-    let mut prev: Option<[[f64; 3]; hexapod_core::robot::MAX_LEGS]> = None;
-    let t0 = Instant::now();
-    for _ in 0..n {
-        drill.step(DT);
-        let s = drill.sample();
-        min_y = min_y.min(s.pos[1]);
-        fell |= s.fallen;
-        // Commanded joints versus where the joints actually are.
-        let cmd = drill.cmd_q();
-        for i in 0..frame.legs() {
-            let at = drill.plant.leg_q(i);
-            for j in 0..3 {
-                // Wrap the difference. `leg_q` is unwrapped and the command is
-                // not, so a raw subtraction reports ~pi whenever they straddle
-                // the branch cut — which reads as a catastrophic tracking
-                // failure that isn't there.
-                let d = at[j] - cmd[i][j];
-                let d = d - TAU * (d / TAU).round();
-                track = track.max(d.abs());
-            }
-        }
-        let mut feet = [[0.0; 3]; hexapod_core::robot::MAX_LEGS];
-        for i in 0..frame.legs() {
-            feet[i] = drill.plant.leg_joints_world(i)[3];
-        }
-        if let Some(p) = prev {
-            for i in 0..frame.legs() {
-                if i == s.moving && s.phase.swinging() {
-                    continue;
-                }
-                let d = feet[i][0] - p[i][0];
-                let e = feet[i][2] - p[i][2];
-                slip += (d * d + e * e).sqrt();
-            }
-        }
-        prev = Some(feet);
-    }
-    let rt = (n as f64 * DT) / t0.elapsed().as_secs_f64();
-    let s = drill.sample();
-    // Range to the waypoint the machine is currently aiming at.
-    let w = terrain.waypoint(0);
-    let (dx, dz) = (w[0] - s.pos[0], w[1] - s.pos[2]);
-    let to_goal = (dx * dx + dz * dz).sqrt();
-    Report {
-        name,
-        track,
-        min_y,
-        travel: s.chassis_xz,
-        slip,
-        to_goal,
-        fell,
-        rt,
-    }
-}
-
-fn run_tripod(
-    name: &'static str,
-    frame: Frame,
-    phys: Physics,
-    course: Course,
-    secs: f64,
-) -> Report {
-    use hexapod_core::sim::DT;
-    let (mut walker, terrain, policy, gait) =
-        hexapod_core::walker::open_loop_walk(frame, course, 1, phys);
-    let cmd = Cmd {
-        fwd: 1.0,
-        turn: 0.0,
-        cruise: 1.5,
-        nav: false,
+    let num = |k: &str, d: f64| -> f64 {
+        flag(args, k).and_then(|v| v.parse().ok()).unwrap_or(d)
     };
-    let n = (secs / DT) as usize;
-    let mut min_y = f64::INFINITY;
-    let mut fell = false;
-    // A tripod is symmetric, so the two sides should push equally. Any bias
-    // shows up as yaw, and yaw is why this gait walks off its own line.
-    let mut push = [0.0f64; 2];
-    let mut prev: Option<Vec<[f64; 3]>> = None;
-    let _ = &push;
-    let t0 = Instant::now();
-    for _ in 0..n {
-        walker.step(&terrain, &policy, &gait, DT, cmd);
-        let s = walker.sample();
-        min_y = min_y.min(s.pos[1]);
-        fell |= s.fallen;
-        let _ = (&mut push, &mut prev);
-    }
-    let s = walker.sample();
-    eprintln!(
-        "  tripod detail: yaw {:+.3} rad  x {:+.3}  z {:+.3}",
-        s.yaw, s.pos[0], s.pos[2]
+    let iters = num("--iters", 400.0) as usize;
+    let seed = num("--seed", 1.0) as u64;
+    let out = flag(args, "--out").unwrap_or_else(|| "checkpoints/joint-v1.txt".into());
+    // Defaults come from the core, not from here: two places to change a step
+    // size is one place to forget, and the last time these drifted apart a
+    // tuning run silently used the value it was supposed to be replacing.
+    let d = JointCfg::default();
+    let cfg = JointCfg {
+        dirs: num("--dirs", d.dirs as f64) as usize,
+        top: num("--top", d.top as f64) as usize,
+        alpha: num("--alpha", d.alpha),
+        sigma: num("--sigma", d.sigma),
+        scenarios: num("--scenarios", d.scenarios as f64) as usize,
+        workers: num("--workers", d.workers as f64) as usize,
+    };
+
+    println!(
+        "# hexapod joint-train  {} legs · {} motors · {} weights",
+        frame.legs(),
+        hexapod_core::joint_rl::n_act(frame),
+        hexapod_core::joint_rl::n_theta(frame),
     );
-    let rt = (n as f64 * DT) / t0.elapsed().as_secs_f64();
-    let s = walker.sample();
-    let w = terrain.waypoint(0);
-    let (dx, dz) = (w[0] - s.pos[0], w[1] - s.pos[2]);
-    Report {
-        name,
-        track: 0.0,
-        min_y,
-        travel: (s.pos[0] * s.pos[0] + s.pos[2] * s.pos[2]).sqrt(),
-        slip: 0.0,
-        to_goal: (dx * dx + dz * dz).sqrt(),
-        fell,
-        rt,
+    println!(
+        "# {} dirs x {} scenarios x 2 sides, alpha {:.3}, sigma {:.3}, budget {iters}",
+        cfg.dirs, cfg.scenarios, cfg.alpha, cfg.sigma
+    );
+    println!("# curriculum: {}", 
+        hexapod_core::joint_rl::STAGES.iter().map(|s| s.name()).collect::<Vec<_>>().join(" -> "));
+    println!();
+    println!("  iter  stage       score  target   dist    secs  feet   air  ");
+
+    let t0 = Instant::now();
+    let mut last_stage: Option<Stage> = None;
+    let policy = train_curriculum(frame, &phys, &cfg, iters, seed, |p, _| {
+        // One line per stage check. A promotion is the interesting event, so
+        // it is marked rather than left to be inferred from the score.
+        let mark = if p.promoted { "  <- cleared" } else { "" };
+        let fresh = last_stage != Some(p.stage);
+        if fresh {
+            println!("  ---- {} ----", p.stage.name());
+        }
+        last_stage = Some(p.stage);
+        println!(
+            "  {:>4}  {:<10} {:>6.3}  {:>6.3} {:>6.2} {:>7.2} {:>5.2} {:>5.2}{}  [{:.0}s]",
+            p.iter,
+            p.stage.name(),
+            p.score,
+            p.stage.promote_at(),
+            p.eval.distance,
+            p.eval.secs,
+            p.eval.support,
+            p.eval.air,
+            mark,
+            t0.elapsed().as_secs_f64(),
+        );
+    });
+
+    let text = to_text(&policy);
+    match std::fs::write(&out, &text) {
+        Ok(()) => println!("\nwrote {out}  ({} bytes)", text.len()),
+        Err(e) => {
+            eprintln!("\ncould not write {out}: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
-// -------------------------------------------------------------- leg diagnostics
-
-/// Per-leg motion, split by whether the leg was supposed to be moving.
-///
-///   hexapod legs [--seconds 20] [--course flat] [--drill]
-///
-/// A stance leg is holding a world plant: every number on its row should be
-/// near zero. Anything else is the machine walking on legs it believes are
-/// still, which reads on a canvas as the untouched legs swaying about.
-#[derive(Default, Clone, Copy)]
-struct LegTrace {
-    /// Path length of hip, knee, ankle and foot while the leg is planted.
-    stance_path: [f64; 4],
-    /// Summed absolute joint rotation while planted, per joint, radians.
-    stance_rot: [f64; 3],
-    /// Same two, while the leg is deliberately swinging.
-    swing_path: [f64; 4],
-    swing_rot: [f64; 3],
-    stance_ticks: u32,
-    swing_ticks: u32,
-    fouled: u32,
-    pinned: u32,
-    /// Worst off-axis twist seen on each hinge, radians. Should be zero.
-    twist: [f64; 3],
-}
-
-/// The plant knobs every diagnostic command accepts.
 fn motor_flags(phys: &mut Physics, args: &[String]) {
     if let Some(v) = flag(args, "--stiff").and_then(|v| v.parse().ok()) {
         phys.motor_stiff = v;
@@ -1981,424 +1426,6 @@ fn motor_flags(phys: &mut Physics, args: &[String]) {
         phys.foot_mu = v;
     }
 
-}
-
-fn legs_probe(frame: Frame, mut phys: Physics, course: Course, args: &[String]) {
-    use hexapod_core::sim::DT;
-    motor_flags(&mut phys, args);
-    let secs: f64 = flag(args, "--seconds")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20.0);
-    let drill = args.iter().any(|a| a == "--drill");
-    let terrain = Terrain::new(course, 1);
-    let mut d = if drill {
-        OneLegDrill::spawn(frame, &phys, 1)
-    } else {
-        OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true)
-    };
-    d.set_cmd(Cmd {
-        fwd: 1.0,
-        turn: 0.0,
-        cruise: 0.35,
-        nav: false,
-    });
-    let n = frame.legs();
-    let mut tr = vec![LegTrace::default(); n];
-    let mut prev_pts: Option<Vec<[[f64; 3]; 4]>> = None;
-    let mut prev_q: Option<Vec<[f64; 3]>> = None;
-    let mut leg_leg = 0u32;
-    let mut chassis_hit = 0u32;
-
-    for _ in 0..(secs / DT) as usize {
-        d.step(DT);
-        let s = d.sample();
-        let f = d.plant.faults();
-        leg_leg += f.leg_leg;
-        chassis_hit += f.chassis_hit;
-        let pts: Vec<[[f64; 3]; 4]> = (0..n).map(|i| d.plant.leg_joints_world(i)).collect();
-        let qs: Vec<[f64; 3]> = (0..n).map(|i| d.plant.leg_q(i)).collect();
-        if let (Some(pp), Some(pq)) = (&prev_pts, &prev_q) {
-            for i in 0..n {
-                let swinging = i == s.moving && s.phase.swinging();
-                let t = &mut tr[i];
-                if f.fouled[i] {
-                    t.fouled += 1;
-                }
-                if f.pinned[i] {
-                    t.pinned += 1;
-                }
-                let (path, rot) = if swinging {
-                    t.swing_ticks += 1;
-                    (&mut t.swing_path, &mut t.swing_rot)
-                } else {
-                    t.stance_ticks += 1;
-                    (&mut t.stance_path, &mut t.stance_rot)
-                };
-                for k in 0..4 {
-                    let dx = pts[i][k][0] - pp[i][k][0];
-                    let dy = pts[i][k][1] - pp[i][k][1];
-                    let dz = pts[i][k][2] - pp[i][k][2];
-                    path[k] += (dx * dx + dy * dy + dz * dz).sqrt();
-                }
-                for j in 0..3 {
-                    rot[j] += (qs[i][j] - pq[i][j]).abs();
-                }
-                let v = d.plant.hinge_violation(i);
-                for j in 0..3 {
-                    t.twist[j] = t.twist[j].max(v[j]);
-                }
-            }
-        }
-        prev_pts = Some(pts);
-        prev_q = Some(qs);
-    }
-
-    println!(
-        "{} legs, {:.0}s, course {:?}{}",
-        n,
-        secs,
-        course,
-        if drill { " (empty-field drill)" } else { "" }
-    );
-    println!("leg   stance: hip    knee   ankle  foot  | coxa   femur  tibia  | off-axis twist rad | foul pin");
-    for i in 0..n {
-        let t = tr[i];
-        println!(
-            "{:<5} {:6.3} {:6.3} {:6.3} {:6.3} | {:6.3} {:6.3} {:6.3} | {:5.3} {:5.3} {:5.3}  | {:4} {:3}",
-            frame.name(i),
-            t.stance_path[0],
-            t.stance_path[1],
-            t.stance_path[2],
-            t.stance_path[3],
-            t.stance_rot[0],
-            t.stance_rot[1],
-            t.stance_rot[2],
-            t.twist[0],
-            t.twist[1],
-            t.twist[2],
-            t.fouled,
-            t.pinned
-        );
-    }
-    let sf: f64 = tr.iter().map(|t| t.stance_path[3]).sum();
-    let sr: f64 = tr.iter().map(|t| t.stance_rot.iter().sum::<f64>()).sum();
-    println!(
-        "\ntotals: stance foot travel {sf:.3}  stance joint rotation {sr:.3} rad  \
-         leg-leg contact ticks {leg_leg}  chassis contact ticks {chassis_hit}"
-    );
-    println!("(a planted leg should score near zero on both stance columns)");
-}
-
-// ------------------------------------------------------------------- churn
-
-/// Motion that goes one way and comes back: it costs the machine everything
-/// and nets it nothing. Tracked per axis as total variation against net
-/// displacement, so a signal that travels 1.0 and ends where it started scores
-/// 100% wasted, while one that travels 1.0 in a straight line scores 0%.
-///
-///   hexapod churn [--seconds 20] [--drill] [--course flat] [--eps 1e-4]
-///
-/// The leg currently under command is excluded throughout — it is *supposed*
-/// to move. Everything reported here is the rest of the machine reacting.
-#[derive(Default, Clone, Copy)]
-struct Churn {
-    path: f64,
-    first: f64,
-    last: f64,
-    dir: i8,
-    rev: u32,
-    started: bool,
-}
-
-impl Churn {
-    fn push(&mut self, v: f64, eps: f64) {
-        if !self.started {
-            self.first = v;
-            self.last = v;
-            self.started = true;
-            return;
-        }
-        let d = v - self.last;
-        // Below the deadband it is solver noise, not a direction the machine
-        // chose. Counting it would drown the reversal rate in numerical dither.
-        if d.abs() < eps {
-            return;
-        }
-        self.last = v;
-        self.path += d.abs();
-        let s = if d > 0.0 { 1 } else { -1 };
-        if self.dir != 0 && s != self.dir {
-            self.rev += 1;
-        }
-        self.dir = s;
-    }
-    fn net(&self) -> f64 {
-        self.last - self.first
-    }
-    fn wasted(&self) -> f64 {
-        (self.path - self.net().abs()).max(0.0)
-    }
-    fn pct(&self) -> f64 {
-        if self.path > 1e-9 {
-            100.0 * self.wasted() / self.path
-        } else {
-            0.0
-        }
-    }
-    fn row(&self, name: &str, secs: f64) -> String {
-        format!(
-            "  {:<7} {:8.3} {:8.3} {:8.3}  {:5.1}%  {:6.2}",
-            name,
-            self.path,
-            self.net(),
-            self.wasted(),
-            self.pct(),
-            self.rev as f64 / secs
-        )
-    }
-}
-
-fn churn(frame: Frame, mut phys: Physics, course: Course, args: &[String]) {
-    use hexapod_core::sim::DT;
-    motor_flags(&mut phys, args);
-    let secs: f64 = flag(args, "--seconds")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20.0);
-    let eps: f64 = flag(args, "--eps")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0e-4);
-    let drill = args.iter().any(|a| a == "--drill");
-    // Zero command keeps the crawl in Pause forever: six feet down, nothing
-    // swinging, every joint setpoint frozen. A body that still moves here has
-    // no excuse — nothing is driving it.
-    let still = args.iter().any(|a| a == "--still");
-    let terrain = Terrain::new(course, 1);
-    let mut d = if drill {
-        OneLegDrill::spawn(frame, &phys, 1)
-    } else {
-        OneLegDrill::spawn_on(frame, &phys, &terrain, 1, true)
-    };
-    d.set_cmd(Cmd {
-        fwd: if still { 0.0 } else { 1.0 },
-        turn: 0.0,
-        cruise: 0.35,
-        nav: false,
-    });
-    let n = frame.legs();
-    let mut body = [Churn::default(); 6];
-    let mut by_phase = [0.0f64; 5];
-    let mut phase_ticks = [0u32; 5];
-    let mut prev_pos: Option<[f64; 3]> = None;
-    let (mut lag_sum, mut lag_max, mut lag_n) = (0.0f64, 0.0f64, 0u32);
-    let mut joints = vec![[Churn::default(); 3]; n];
-    let mut cmds = vec![[Churn::default(); 3]; n];
-    let mut feet = vec![[Churn::default(); 3]; n];
-
-    // After `--settle T`, stop asking for moves and keep measuring. If the
-    // sway is a transient response to each step it decays away here; if the
-    // machine is holding internal strain it will not.
-    let settle_at: f64 = flag(args, "--settle")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(f64::INFINITY);
-    let mut quiesced = false;
-    for tick in 0..(secs / DT) as usize {
-        if !quiesced && tick as f64 * DT >= settle_at {
-            quiesced = true;
-            d.set_cmd(Cmd {
-                fwd: 0.0,
-                turn: 0.0,
-                cruise: 0.35,
-                nav: false,
-            });
-            // Restart the accumulators so only the quiet tail is scored.
-            body = [Churn::default(); 6];
-            joints = vec![[Churn::default(); 3]; n];
-            cmds = vec![[Churn::default(); 3]; n];
-            feet = vec![[Churn::default(); 3]; n];
-            by_phase = [0.0; 5];
-            phase_ticks = [0; 5];
-            lag_sum = 0.0;
-            lag_max = 0.0;
-            lag_n = 0;
-        }
-        d.step(DT);
-        let s = d.sample();
-        let cmd_q = d.cmd_q();
-        // Which phase the body actually moves in. A kick concentrated on one
-        // boundary is a step in the controller, not compliance under load.
-        if let Some(p) = prev_pos {
-            let dx = s.pos[0] - p[0];
-            let dy = s.pos[1] - p[1];
-            let dz = s.pos[2] - p[2];
-            by_phase[s.phase.as_u32() as usize] += (dx * dx + dy * dy + dz * dz).sqrt();
-            phase_ticks[s.phase.as_u32() as usize] += 1;
-        }
-        prev_pos = Some(s.pos);
-        // The crawl propels itself by holding the commanded body frame ahead
-        // of the real chassis; the legs push against that lead. A lead that
-        // does not go to zero when the command does is stored strain.
-        let dxl = d.ik_pos[0] - s.pos[0];
-        let dzl = d.ik_pos[2] - s.pos[2];
-        let l = (dxl * dxl + dzl * dzl).sqrt();
-        lag_sum += l;
-        lag_max = lag_max.max(l);
-        lag_n += 1;
-        for (k, v) in [s.pos[0], s.pos[1], s.pos[2], s.yaw, s.pitch, s.roll]
-            .into_iter()
-            .enumerate()
-        {
-            body[k].push(v, eps);
-        }
-        for i in 0..n {
-            // The commanded leg is meant to be moving. Everything else is not.
-            if i == s.moving {
-                continue;
-            }
-            let q = d.plant.leg_q(i);
-            let c = cmd_q[i];
-            for j in 0..3 {
-                joints[i][j].push(q[j], eps);
-                cmds[i][j].push(c[j], eps);
-            }
-            let f = d.plant.leg_joints_world(i)[3];
-            for j in 0..3 {
-                feet[i][j].push(f[j], eps);
-            }
-        }
-    }
-
-    println!(
-        "{n} legs, {secs:.0}s, {}{}  (leg under command excluded)",
-        if drill { "empty-field drill" } else { "crawl" },
-        if drill {
-            String::new()
-        } else {
-            format!(", course {course:?}")
-        }
-    );
-    println!("\nchassis        path      net   wasted  wasted%   rev/s");
-    for (k, name) in ["x", "y", "z", "yaw", "pitch", "roll"].into_iter().enumerate() {
-        println!("{}", body[k].row(name, secs));
-    }
-
-    println!("\nstance joints  path      net   wasted  wasted%   rev/s");
-    for (j, name) in ["coxa", "femur", "tibia"].into_iter().enumerate() {
-        let mut agg = Churn::default();
-        for i in 0..n {
-            agg.path += joints[i][j].path;
-            agg.rev += joints[i][j].rev;
-            agg.first += joints[i][j].first;
-            agg.last += joints[i][j].last;
-        }
-        println!("{}", agg.row(name, secs));
-    }
-
-    println!("\ncommanded      path      net   wasted  wasted%   rev/s");
-    for (j, name) in ["coxa", "femur", "tibia"].into_iter().enumerate() {
-        let mut agg = Churn::default();
-        for i in 0..n {
-            agg.path += cmds[i][j].path;
-            agg.rev += cmds[i][j].rev;
-            agg.first += cmds[i][j].first;
-            agg.last += cmds[i][j].last;
-        }
-        println!("{}", agg.row(name, secs));
-    }
-
-    println!("\nstance feet    path      net   wasted  wasted%   rev/s");
-    for (j, name) in ["x", "y", "z"].into_iter().enumerate() {
-        let mut agg = Churn::default();
-        for i in 0..n {
-            agg.path += feet[i][j].path;
-            agg.rev += feet[i][j].rev;
-            agg.first += feet[i][j].first;
-            agg.last += feet[i][j].last;
-        }
-        println!("{}", agg.row(name, secs));
-    }
-
-    println!(
-        "\ncommanded-body lead over the real chassis: mean {:.4}  peak {:.4}",
-        lag_sum / lag_n.max(1) as f64,
-        lag_max
-    );
-    println!("\nchassis motion by phase   path    ticks   per-tick");
-    for (k, name) in ["settle", "lift", "shift", "place", "pause"]
-        .into_iter()
-        .enumerate()
-    {
-        println!(
-            "  {:<8} {:16.4} {:7} {:10.6}",
-            name,
-            by_phase[k],
-            phase_ticks[k],
-            by_phase[k] / phase_ticks[k].max(1) as f64
-        );
-    }
-
-    let jp: f64 = joints.iter().flatten().map(|c| c.path).sum();
-    let jw: f64 = joints.iter().flatten().map(|c| c.wasted()).sum();
-    let bp: f64 = body.iter().map(|c| c.path).sum();
-    let bw: f64 = body.iter().map(|c| c.wasted()).sum();
-    println!(
-        "\nwasted: {:.0}% of stance joint rotation ({jw:.2} of {jp:.2} rad), \
-         {:.0}% of chassis motion ({bw:.2} of {bp:.2})",
-        100.0 * jw / jp.max(1e-9),
-        100.0 * bw / bp.max(1e-9)
-    );
-}
-
-// --------------------------------------------------------------- crawl-train
-
-/// Train the crawl controller on the articulated plant.
-///
-///   hexapod crawl-train [--iters 40] [--dirs 8] [--secs 25] [--seed 1]
-///
-/// Prints the seeded (hand-written) score first so every later number has
-/// something to be better than.
-fn crawl_train(frame: Frame, mut phys: Physics, args: &[String]) {
-    use hexapod_core::crawl_rl::{score, train, CrawlPolicy, TrainCfg};
-    motor_flags(&mut phys, args);
-    let iters: usize = flag(args, "--iters").and_then(|v| v.parse().ok()).unwrap_or(40);
-    let seed: u64 = flag(args, "--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
-    let mut cfg = TrainCfg::default();
-    if let Some(v) = flag(args, "--dirs").and_then(|v| v.parse().ok()) {
-        cfg.n_dirs = v;
-        cfg.n_top = (v / 2).max(1);
-    }
-    if let Some(v) = flag(args, "--secs").and_then(|v| v.parse().ok()) {
-        cfg.secs = v;
-    }
-
-    let seeded = CrawlPolicy::seeded();
-    let report = |tag: &str, p: &CrawlPolicy| {
-        for c in [Course::Flat, Course::Rubble, Course::Steps] {
-            let s = score(p, frame, &phys, c, seed, cfg.secs);
-            println!(
-                "  {tag:<8} {c:<8?} progress {:7.3}  wasted {:7.3}  slip {:8.2}  sag {:6.3}  {}  reward {:7.3}",
-                s.progress,
-                s.wasted,
-                s.slip,
-                s.sag,
-                if s.fell { "FELL" } else { "ok  " },
-                s.reward()
-            );
-        }
-    };
-
-    println!("hand-written crawl (the policy seed reproduces it):");
-    report("seed", &seeded);
-
-    let t0 = Instant::now();
-    println!("\ntraining: {iters} iters x {} dirs x 2 rollouts x {} courses of {:.0}s",
-        cfg.n_dirs, cfg.courses.len(), cfg.secs);
-    let learned = train(frame, &phys, &cfg, iters, seed, |it, r, _| {
-        println!("  iter {it:3}  reward {r:8.3}   [{:5.0}s]", t0.elapsed().as_secs_f64());
-    });
-
-    println!("\nlearned:");
-    report("learned", &learned);
-    println!("\ntheta = {:?}", learned.theta.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>());
 }
 
 #[cfg(test)]

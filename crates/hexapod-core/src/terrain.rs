@@ -1022,6 +1022,162 @@ impl Terrain {
     }
 }
 
+/// Two surface coordinates closer than this are the same lane.
+const EDGE_EPS: f64 = 1.0e-6;
+/// Surfaces closer together than this count as one flat face.
+const FLAT_EPS: f64 = 1.0e-4;
+
+/// One box of the decomposed walkable surface: a footprint, the height of its
+/// top face, and the friction of that face.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceBox {
+    pub x0: f64,
+    pub x1: f64,
+    pub z0: f64,
+    pub z1: f64,
+    /// Height of the top face above base ground. Negative inside a pit.
+    pub top: f64,
+    pub grip: f64,
+}
+
+impl SurfaceBox {
+    /// True for a face at or below base ground: the walkable plane and the
+    /// floor of a trench. A raised block is not one, and neither is a plank.
+    #[inline]
+    pub fn is_ground(&self) -> bool {
+        self.top <= 0.0
+    }
+}
+
+/// Distinct coordinates in `lo..=hi`, sorted, near-duplicates collapsed.
+fn surface_edges(mut v: Vec<f64>, lo: f64, hi: f64) -> Vec<f64> {
+    v.retain(|c| *c > lo + EDGE_EPS && *c < hi - EDGE_EPS);
+    v.push(lo);
+    v.push(hi);
+    v.sort_by(|a, b| a.total_cmp(b));
+    v.dedup_by(|a, b| (*a - *b).abs() < EDGE_EPS);
+    v
+}
+
+/// Decompose the course's effective walkable surface into axis-aligned boxes.
+///
+/// Every feature is a rectangle and [`Terrain::height`] resolves overlaps by a
+/// fixed rule, so the surface is piecewise-constant on the grid formed by the
+/// features' own edges. One sample per cell of that grid is therefore exact:
+/// no quantisation, and a trench keeps the sharp lip a jump has to leave from.
+/// Layering comes out right for free, so BEAM's plank over a void decomposes
+/// into plank boxes at `+0.14` flanked by pit-floor boxes at `-0.90`.
+///
+/// Runs of equal height and grip are merged along x and then along z, so a
+/// flat course still comes out as a single slab rather than a grid of them.
+pub fn surface_boxes(terrain: &Terrain) -> Vec<SurfaceBox> {
+    let mut xs = Vec::new();
+    let mut zs = Vec::new();
+    for ob in &terrain.obstacles {
+        xs.push(ob.x0);
+        xs.push(ob.x1);
+        zs.push(ob.z0);
+        zs.push(ob.z1);
+    }
+    let xs = surface_edges(xs, -CORRIDOR_HALF, CORRIDOR_HALF);
+    let zs = surface_edges(zs, Z_MIN, Z_MAX);
+
+    let mut out: Vec<SurfaceBox> = Vec::new();
+    let mut row: Vec<SurfaceBox> = Vec::new();
+    let mut prev: Vec<SurfaceBox> = Vec::new();
+    let mut prev_start = 0usize;
+    for zi in 0..zs.len().saturating_sub(1) {
+        let (za, zb) = (zs[zi], zs[zi + 1]);
+        let zc = 0.5 * (za + zb);
+        row.clear();
+        for xi in 0..xs.len().saturating_sub(1) {
+            let (xa, xb) = (xs[xi], xs[xi + 1]);
+            let xc = 0.5 * (xa + xb);
+            let top = terrain.height(xc, zc);
+            let grip = terrain.grip(xc, zc);
+            match row.last_mut() {
+                Some(r)
+                    if (r.top - top).abs() < FLAT_EPS
+                        && (r.grip - grip).abs() < FLAT_EPS
+                        && (r.x1 - xa).abs() < EDGE_EPS =>
+                {
+                    r.x1 = xb;
+                }
+                _ => row.push(SurfaceBox {
+                    x0: xa,
+                    x1: xb,
+                    z0: za,
+                    z1: zb,
+                    top,
+                    grip,
+                }),
+            }
+        }
+        // Identical run structure to the band just emitted: stretch it
+        // downfield instead of laying a second course of boxes against it.
+        let same = prev.len() == row.len()
+            && prev.iter().zip(row.iter()).all(|(a, b)| {
+                (a.x0 - b.x0).abs() < EDGE_EPS
+                    && (a.x1 - b.x1).abs() < EDGE_EPS
+                    && (a.top - b.top).abs() < FLAT_EPS
+                    && (a.grip - b.grip).abs() < FLAT_EPS
+            });
+        if same {
+            for r in out[prev_start..].iter_mut() {
+                r.z1 = zb;
+            }
+        } else {
+            prev_start = out.len();
+            out.extend_from_slice(&row);
+            prev.clear();
+            prev.extend_from_slice(&row);
+        }
+    }
+    out
+}
+
+/// Which boxes have a vertical face that a leg link could pass through.
+///
+/// The flat walkable plane deliberately does not collide with leg links —
+/// tibia capsules resting on a plane skate, and the gait is not built for it.
+/// A trench wall is the same geometry seen edge-on, and there a link passing
+/// through is a leg inside solid ground. So the distinction is per box, not
+/// per course: a ground box that borders something lower gets solid faces, and
+/// the open plane keeps the cheap contact it always had.
+///
+/// Two boxes border each other when their footprints touch along an edge
+/// without overlapping, which is exactly what the decomposition produces.
+pub fn boxes_beside_a_drop(boxes: &[SurfaceBox]) -> Vec<bool> {
+    let mut out = vec![false; boxes.len()];
+    for (i, b) in boxes.iter().enumerate() {
+        for c in boxes.iter() {
+            if c.top >= b.top - FLAT_EPS {
+                continue;
+            }
+            let x_span = b.x0 < c.x1 - EDGE_EPS && c.x0 < b.x1 - EDGE_EPS;
+            let z_span = b.z0 < c.z1 - EDGE_EPS && c.z0 < b.z1 - EDGE_EPS;
+            let x_touch = (b.x1 - c.x0).abs() < EDGE_EPS || (c.x1 - b.x0).abs() < EDGE_EPS;
+            let z_touch = (b.z1 - c.z0).abs() < EDGE_EPS || (c.z1 - b.z0).abs() < EDGE_EPS;
+            if (x_touch && z_span) || (z_touch && x_span) {
+                out[i] = true;
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Deepest pit floor on the course, or zero if it has none. A plant box has to
+/// reach below this for a trench wall to be solid all the way down.
+pub fn deepest_pit(terrain: &Terrain) -> f64 {
+    terrain
+        .obstacles
+        .iter()
+        .map(|ob| ob.top)
+        .filter(|t| *t < 0.0)
+        .fold(0.0f64, f64::min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1440,6 +1596,139 @@ mod tests {
             0.62,
         );
         assert!(!clear, "open ground in front of the wall is blocked");
+    }
+
+    /// The decomposition is only useful if it reproduces `height` exactly.
+    /// Sampling on a fine grid across every course is the direct check.
+    #[test]
+    fn surface_boxes_reproduce_the_height_field() {
+        for course in COURSES {
+            for seed in [1u64, 7, 23] {
+                let t = Terrain::new(course, seed);
+                let boxes = surface_boxes(&t);
+                let mut z = Z_MIN + 0.013;
+                while z < Z_MAX {
+                    let mut x = -CORRIDOR_HALF + 0.017;
+                    while x < CORRIDOR_HALF {
+                        let want = t.height(x, z);
+                        let got = boxes
+                            .iter()
+                            .find(|b| x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1)
+                            .map(|b| b.top);
+                        assert_eq!(
+                            got.map(|g| (g * 1e4).round()),
+                            Some((want * 1e4).round()),
+                            "{} seed {seed} at ({x:.3}, {z:.3})",
+                            course.name()
+                        );
+                        x += 0.11;
+                    }
+                    z += 0.13;
+                }
+            }
+        }
+    }
+
+    /// Boxes may not overlap: two solids sharing a footprint is a double
+    /// contact, which is what launched the chassis the last time the plant
+    /// tried to represent this course with more than one collider.
+    #[test]
+    fn surface_boxes_do_not_overlap() {
+        for course in COURSES {
+            let t = Terrain::new(course, 5);
+            let b = surface_boxes(&t);
+            for i in 0..b.len() {
+                for j in (i + 1)..b.len() {
+                    let (a, c) = (&b[i], &b[j]);
+                    let over_x = a.x0 < c.x1 - EDGE_EPS && c.x0 < a.x1 - EDGE_EPS;
+                    let over_z = a.z0 < c.z1 - EDGE_EPS && c.z0 < a.z1 - EDGE_EPS;
+                    assert!(
+                        !(over_x && over_z),
+                        "{} boxes {i} and {j} overlap: {a:?} vs {c:?}",
+                        course.name()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A parkour trench has to survive as a hole with a sharp lip, otherwise
+    /// there is nothing in the plant to jump over.
+    #[test]
+    fn a_parkour_trench_becomes_a_hole_in_the_floor() {
+        let t = Terrain::new(Course::Jump, 7);
+        let boxes = surface_boxes(&t);
+        let pit = t
+            .obstacles
+            .iter()
+            .find(|ob| ob.top < -0.5)
+            .expect("parkour has trenches");
+        let mid = 0.5 * (pit.z0 + pit.z1);
+
+        let inside = boxes
+            .iter()
+            .find(|b| 0.0 >= b.x0 && 0.0 <= b.x1 && mid >= b.z0 && mid <= b.z1)
+            .expect("the trench floor is a box");
+        assert!(
+            inside.top < -0.5,
+            "trench floor came out at {:.3}",
+            inside.top
+        );
+        assert!(inside.is_ground(), "a trench floor is walkable ground");
+
+        // The lip: solid ground immediately before the near edge.
+        let lip = boxes
+            .iter()
+            .find(|b| 0.0 >= b.x0 && 0.0 <= b.x1 && pit.z0 - 0.05 >= b.z0 && pit.z0 - 0.05 <= b.z1)
+            .expect("ground before the trench");
+        assert!(lip.top >= 0.0, "ground before the lip is a pit");
+        assert!(
+            (lip.z1 - pit.z0).abs() < 1.0e-6,
+            "lip at {:.4} does not meet the trench at {:.4}",
+            lip.z1,
+            pit.z0
+        );
+    }
+
+    /// BEAM lays a plank over a void. The plank has to stay walkable and the
+    /// ground either side of it has to stay a hole.
+    #[test]
+    fn a_beam_plank_survives_over_its_void() {
+        let t = Terrain::new(Course::Beam, 3);
+        let boxes = surface_boxes(&t);
+        let plank = t
+            .obstacles
+            .iter()
+            .find(|ob| ob.top > 0.0 && ob.x1 - ob.x0 < 2.0 * CORRIDOR_HALF - 1.0)
+            .expect("beam has a plank");
+        let cx = 0.5 * (plank.x0 + plank.x1);
+        let cz = 0.5 * (plank.z0 + plank.z1);
+        let on = boxes
+            .iter()
+            .find(|b| cx >= b.x0 && cx <= b.x1 && cz >= b.z0 && cz <= b.z1)
+            .expect("plank is a box");
+        assert!(on.top > 0.0, "plank came out at {:.3}", on.top);
+
+        let off_x = plank.x0 - 0.30;
+        if off_x > -CORRIDOR_HALF {
+            let beside = boxes
+                .iter()
+                .find(|b| off_x >= b.x0 && off_x <= b.x1 && cz >= b.z0 && cz <= b.z1)
+                .expect("beside the plank is a box");
+            assert!(
+                beside.top < 0.0,
+                "the void beside the plank came out at {:.3}",
+                beside.top
+            );
+        }
+    }
+
+    /// Flat ground must not explode into a grid of slabs.
+    #[test]
+    fn flat_ground_merges_into_one_slab() {
+        let t = Terrain::new(Course::Flat, 1);
+        let n = surface_boxes(&t).len();
+        assert!(n <= 2, "flat course decomposed into {n} boxes");
     }
 
     #[test]

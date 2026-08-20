@@ -115,16 +115,8 @@ async function bootAndStatic(h) {
     return seen.size;
   });
   check("3-D stage renders content", canvasPainted > 6, `${canvasPainted} distinct sampled colours`);
-  const drill = await page.evaluate(() => window.__hxOneleg());
-  check(
-    "the page boots on the one-leg drill",
-    drill.on && /ONE/.test(drill.policy),
-    JSON.stringify({ on: drill.on, policy: drill.policy, phase: drill.phaseName })
-  );
-  check(
-    "the one-leg callout is on the stage",
-    await page.$eval("#drillCallout", (el) => !el.hidden)
-  );
+  const booted = await page.textContent("#hPolicy");
+  check("the page boots on the baseline gait", /BASELINE/.test(booted), booted);
 
   await page.click("#btnCamTop");
   check("top camera toggle", (await page.textContent("#hudCam")).includes("TOP"));
@@ -182,10 +174,9 @@ const clickWalk = async (page) => {
 
 async function speedAndPhysics(h) {
   const { page, check, setRange, stepSamples } = h;
-  // Speed tracking is a gait property, and the hand-tuned walk view is the
-  // one-foot-at-a-time crawl, which holds about 0.2 m/s whatever it is asked
-  // for. Load a trained policy: it is the thing in the page that answers a
-  // speed command at all.
+  // Speed tracking is a gait property, and the baseline gait does not answer a
+  // speed command well. Load a trained policy: it is the thing in the page that
+  // answers one at all.
   await page.click("#btnCkLoad");
   await clickWalk(page);
   await page.click("#btnPause");
@@ -234,8 +225,6 @@ async function playbackScheduler(h) {
   const { page, check, setRange, waitFor } = h;
   await clickWalk(page);
   await waitFor(() => window.__hxPlayback?.().worker === true, null, 5000);
-  const workerWalk = await waitFor(() => window.__hxOneleg?.().on === false, null, 2000);
-  check("Walk switches the worker out of the drill", Boolean(workerWalk));
 
   const sample = async (requested, durationMs = 750) => {
     await setRange("rRate", requested);
@@ -347,13 +336,17 @@ async function frameState(h, legs) {
     speed = parseFloat(await page.textContent("#mSpeed"));
   }
   await nextFrame();
+  // Read defensively. `#presetNote` and `#presetBtns` are referenced by
+  // app.js but present in no markup, so the preset warning has nowhere to go
+  // and this used to throw here — taking the scenario's other three checks
+  // down with it, and only when the page booted fast enough to reach the line.
   return page.evaluate(() => ({
-      model: document.getElementById("hModel").textContent,
-      legs: document.getElementById("hudLegs").textContent,
-      dof: document.getElementById("hudDof").textContent,
+      model: document.getElementById("hModel")?.textContent ?? null,
+      legs: document.getElementById("hudLegs")?.textContent ?? null,
+      dof: document.getElementById("hudDof")?.textContent ?? null,
       bars: document.querySelectorAll("#loadBars .bar").length,
-      note: document.getElementById("presetNote").textContent,
-      speed: document.getElementById("mSpeed").textContent,
+      note: document.getElementById("presetNote")?.textContent ?? null,
+      speed: document.getElementById("mSpeed")?.textContent ?? null,
     }));
 }
 
@@ -511,74 +504,6 @@ async function courses(h) {
   check("the autopilot can be switched off", manual === "MANUAL", manual);
 }
 
-async function onelegDrill(h) {
-  const { page, check, stepSamples, screenshot } = h;
-  await page.click("#btnPause");
-  check("one-leg button is in the page", await page.$("#btnOneleg") !== null);
-  await page.click("#btnOneleg");
-  const header = await page.textContent("#hPolicy");
-  check("policy chip says ONE LEG", /ONE/.test(header), header);
-  check("one-leg button latches", (await page.getAttribute("#btnOneleg", "data-on")) === "true");
-  check("walk button unlatches", (await page.getAttribute("#btnWalk", "data-on")) !== "true");
-
-  let maxClear = 0;
-  let sawOneSwing = false;
-  let extraSwing = false;
-  let destWander = 0;
-  let dest0 = null;
-  let on = false;
-  for (let i = 0; i < 10; i++) {
-    await stepSamples(18);
-    const s = await page.evaluate(() => window.__hxOneleg());
-    on = s.on;
-    maxClear = Math.max(maxClear, s.clear);
-    const swinging = s.stance.filter((v) => !v).length;
-    if (s.phase >= 1 && s.phase <= 3) {
-      if (swinging === 1 && s.moving === 0) sawOneSwing = true;
-      if (swinging > 1) extraSwing = true;
-      if (dest0) {
-        destWander = Math.max(
-          destWander,
-          Math.hypot(s.dest[0] - dest0[0], s.dest[1] - dest0[1], s.dest[2] - dest0[2])
-        );
-      } else {
-        dest0 = s.dest;
-      }
-    } else {
-      dest0 = null;
-    }
-  }
-  check("telemetry says the drill is on", on);
-  check("only L1 drops its stance flag", sawOneSwing && !extraSwing, `clear ${maxClear.toFixed(3)}`);
-  check("the free foot leaves the floor", maxClear > 0.10, `${maxClear.toFixed(3)} m clearance`);
-  check("the landing mark stays put during the swing", destWander < 0.02, `${destWander.toFixed(4)} m`);
-  const hud = await page.evaluate(() => ({
-    gait: document.getElementById("hudGait").textContent,
-    drill: document.getElementById("hudDrill").hidden,
-    walk: document.getElementById("hudWalk").hidden,
-    course: document.getElementById("hCourse").textContent,
-    cam: document.getElementById("hudCam").textContent,
-  }));
-  check("HUD switches to the drill readout", hud.walk === true && hud.drill === false, JSON.stringify(hud));
-  check("the empty field is FLAT", /FLAT/.test(hud.course), hud.course);
-  check(
-    "the one-leg callout is on the stage",
-    await page.$eval("#drillCallout", (el) => !el.hidden)
-  );
-  await screenshot("16-oneleg.png");
-
-  await page.click("#btnWalk");
-  check("walk restores the gait", (await page.getAttribute("#btnWalk", "data-on")) === "true");
-  check("one-leg turns off", (await page.getAttribute("#btnOneleg", "data-on")) !== "true");
-  await page.click("#btnPause");
-  const walkTelemetry = await page.evaluate(() => window.__hxOneleg());
-  check("Walk leaves the drill in engine telemetry", !walkTelemetry.on, walkTelemetry.phaseName);
-  check(
-    "inactive one-leg button is not the orange primary action",
-    !(await page.$eval("#btnOneleg", (button) => button.classList.contains("primary")))
-  );
-}
-
 async function trainedPolicy(h) {
   const { page, check, waitFor, screenshot, setRange, stepSamples, nextFrame } = h;
   const inlined = await page.evaluate(() => (window.HX_POLICIES || []).map((p) => p.name));
@@ -615,10 +540,7 @@ async function trainedPolicy(h) {
     !/—/.test(await page.$eval("#tblGait tbody tr", (row) => row.textContent))
   );
 
-  // The drill owns the plant in the other modes and no policy can drive it.
   await page.click('[data-tab="kinematics"]');
-  const walking = await page.evaluate(() => window.__hxOneleg());
-  check("the crawl drill has handed the machine over", !walking.on, JSON.stringify(walking.on));
   // Let the real-time loop draw it: the camera follows the body one frame at a
   // time, so a screenshot straight after a headless burst is of empty corridor.
   await waitFor(() => window.__hxFalls.t.length > 8, null, 6000);
@@ -710,18 +632,10 @@ async function trainedPolicy(h) {
     mode: document.getElementById("hPolicy").textContent,
   }));
   check(
-    "Hand-tuned puts the crawl back",
-    /hand-tuned/i.test(cleared.status) && /CRAWL/.test(cleared.mode),
+    "Hand-tuned puts the baseline back",
+    /hand-tuned/i.test(cleared.status) && /BASELINE/.test(cleared.mode),
     JSON.stringify(cleared)
   );
-  // The crawl is the drill's plant walking one foot at a time, so its readout
-  // comes back on the stage.
-  const backToCrawl = await waitFor(
-    () => !document.getElementById("hudDrill").hidden && !window.__hxOneleg().on,
-    null,
-    4000
-  );
-  check("and the crawl drill owns the machine again", backToCrawl !== null);
 }
 
 const scenarios = [
@@ -736,7 +650,6 @@ const scenarios = [
     await quadruped(harness);
   }],
   ["gait + navigation", gaitAndNavigation],
-  ["one leg", onelegDrill],
   ["trained policy", trainedPolicy],
 ];
 const scenarioNeedle = (process.env.SMOKE_SCENARIO || "").trim().toLowerCase();
