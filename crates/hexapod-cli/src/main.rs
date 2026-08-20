@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! hexapod train  [--course mixed] [--iters 200] [--seed 1] [--preset tripod]
-//! hexapod joint-train [--iters 400] [--out policy.txt] [--seed 1]
+//! hexapod joint-train [--backend nexus-gpu] [--batch-envs 128] [--iters 400]
+//! hexapod joint-eval --policy policy.txt [--backend nexus-gpu] [--stage mixed]
 //! hexapod bench  [--course mixed]
 //! hexapod sweep  [--iters 150]
 //! hexapod train-all [--iters 200] [--train-seeds 1] [--eval-seeds 2]
@@ -14,11 +15,11 @@
 //! ```
 //!
 //! `joint-train` is the joint-level trainer: the policy commands all eighteen
-//! motors directly against the Rapier plant, with no gait and no IK, working up
-//! a curriculum from standing to parkour. It writes a `hexapod-joint-v1`
+//! motors directly against batched Nexus/Rapier worlds, with no gait and no IK,
+//! working up a curriculum from standing to parkour. It writes a `hexapod-joint-v1`
 //! checkpoint, which is a different format from the gait policies above
-//! because it drives a different thing. Native only — a rollout costs a Rapier
-//! step per tick, which is why this is not in the page.
+//! because it drives a different thing. Native only; `--backend rapier` keeps a
+//! portable CPU reference path.
 //!
 //! `--course` takes any of `flat steps rubble gaps mixed ramps slalom slick
 //! gauntlet jump`, matched case-insensitively against the names the simulator
@@ -37,13 +38,13 @@
 use std::time::Instant;
 
 use hexapod_core::ars::ArsConfig;
-use hexapod_core::hardware::{shortlist, Build, Provenance, TorqueMeter, PRICES_CHECKED, SERVOS};
-use hexapod_core::sim::Sim;
-use hexapod_core::power::{parts_of, solve, Kind, Sizing, TorqueTrace};
+use hexapod_core::hardware::{Build, PRICES_CHECKED, Provenance, SERVOS, TorqueMeter, shortlist};
 use hexapod_core::policy::Preset;
+use hexapod_core::power::{Kind, Sizing, TorqueTrace, parts_of, solve};
+use hexapod_core::sim::Sim;
 use hexapod_core::sim::{
-    evaluate, rollout, Cmd, CRUISE_MAX, CRUISE_MIN, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN,
-    JUMP_EVAL_SPEEDS,
+    CRUISE_MAX, CRUISE_MIN, Cmd, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN, JUMP_EVAL_SPEEDS, evaluate,
+    rollout,
 };
 use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
 
@@ -132,6 +133,7 @@ fn main() {
         "bom" => bom(frame, course, seed, iters, cfg, phys, build),
         "sweep" => sweep(frame, iters, cfg, phys, seed),
         "joint-train" => joint_train(frame, phys, &args),
+        "joint-eval" => joint_eval(course, phys, &args),
         "train-all" | "all-terrain" => all_terrain(frame, seed, iters, cfg, phys, &args),
         "eval-all" => eval_all(seed, cfg, phys, &args),
         "speed" => speed(frame, course, seed, iters, cfg, phys),
@@ -146,11 +148,7 @@ fn main() {
 }
 
 fn servo_names() -> String {
-    SERVOS
-        .iter()
-        .map(|s| s.part)
-        .collect::<Vec<_>>()
-        .join(", ")
+    SERVOS.iter().map(|s| s.part).collect::<Vec<_>>().join(", ")
 }
 
 fn build_from(args: &[String]) -> Build {
@@ -306,19 +304,19 @@ fn train(
     println!("\n{}", sparkline(&t.curve));
 
     println!("\n--- speed tracking ---");
-    speed_table(&terrain, &Policy::seeded(preset, frame), &best, &phys, cfg.horizon);
+    speed_table(
+        &terrain,
+        &Policy::seeded(preset, frame),
+        &best,
+        &phys,
+        cfg.horizon,
+    );
 }
 
 /// Commanded speed against achieved speed, for the baseline and the learned
 /// policy. This is the whole point of the reward: the hand-tuned gait has one
 /// speed it can walk at, and the learned one has a range.
-fn speed_table(
-    terrain: &Terrain,
-    base: &Policy,
-    learned: &Policy,
-    phys: &Physics,
-    horizon: f64,
-) {
+fn speed_table(terrain: &Terrain, base: &Policy, learned: &Policy, phys: &Physics, horizon: f64) {
     println!(
         "{:>10} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>7}",
         "commanded", "base m/s", "base err", "got m/s", "err", "cycle", "stride", "duty"
@@ -372,7 +370,12 @@ fn bench(frame: Frame, course: Course, seed: u64, phys: Physics) {
 /// range and bearing to the next waypoint.
 fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
     let train_terrain = Terrain::new(Course::Mixed, seed);
-    let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+    let mut t = Trainer::new(
+        Policy::seeded(Preset::default_for(frame), frame),
+        cfg,
+        phys,
+        seed ^ 0xA5A5,
+    );
     t.record_baseline(&train_terrain);
     for _ in 0..iters {
         t.iterate(&train_terrain);
@@ -384,7 +387,14 @@ fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
     println!("trained {iters} iterations on MIXED seed {seed}\n");
     println!(
         "{:<10} {:>10} {:>10} {:>11} {:>11} {:>9} {:>7} {:>9}",
-        "course", "base rwd", "learn rwd", "base dist", "learn dist", "waypoints", "fell", "verdict"
+        "course",
+        "base rwd",
+        "learn rwd",
+        "base dist",
+        "learn dist",
+        "waypoints",
+        "fell",
+        "verdict"
     );
 
     let mut plan: Vec<(Course, u64)> = hexapod_core::terrain::COURSES
@@ -414,7 +424,11 @@ fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
                 (false, true) => "learned",
                 _ => "",
             },
-            if b.reward > a.reward { "better" } else { "worse" }
+            if b.reward > a.reward {
+                "better"
+            } else {
+                "worse"
+            }
         );
     }
     println!("\n* = course seed the policy never trained on");
@@ -474,13 +488,8 @@ fn all_terrain(
     };
     let frame = starting.frame;
     let baseline = Policy::seeded(Preset::default_for(frame), frame);
-    let mut train_suite = difficulty_weighted_suite(
-        &unique_suite,
-        &starting,
-        &phys,
-        cfg.horizon,
-        hard_repeat,
-    );
+    let mut train_suite =
+        difficulty_weighted_suite(&unique_suite, &starting, &phys, cfg.horizon, hard_repeat);
     if let Some(name) = flag(args, "--focus") {
         let Some(course) = hexapod_core::terrain::COURSES
             .iter()
@@ -728,14 +737,8 @@ fn eval_all(seed: u64, mut cfg: ArsConfig, phys: Physics, args: &[String]) {
         );
         return;
     }
-    let (mean, worst) = print_heldout_matrix(
-        &baseline,
-        &learned,
-        &phys,
-        cfg.horizon,
-        seed,
-        eval_seeds,
-    );
+    let (mean, worst) =
+        print_heldout_matrix(&baseline, &learned, &phys, cfg.horizon, seed, eval_seeds);
     println!(
         "\ncompletion: mean {:.1}%, worst course {:.1}%",
         mean * 100.0,
@@ -762,14 +765,7 @@ fn print_course_detail(
         let terrain = Terrain::new(course, scenario_seed);
         for (label, policy) in [("base", baseline), ("learn", learned)] {
             for &speed in speeds {
-                let result = rollout(
-                    &terrain,
-                    policy,
-                    phys,
-                    horizon,
-                    Cmd::at(speed),
-                    None,
-                );
+                let result = rollout(&terrain, policy, phys, horizon, Cmd::at(speed), None);
                 let state = if result.completed {
                     "FINISH"
                 } else if result.broken {
@@ -799,11 +795,24 @@ fn print_course_detail(
 
 /// Size the servos for a build, comparing the hand-tuned gait against a
 /// trained one on the same machine.
-fn bom(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics, build: Build) {
+fn bom(
+    frame: Frame,
+    course: Course,
+    seed: u64,
+    iters: usize,
+    cfg: ArsConfig,
+    phys: Physics,
+    build: Build,
+) {
     let terrain = Terrain::new(course, seed);
     let base = Policy::seeded(Preset::default_for(frame), frame);
 
-    let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+    let mut t = Trainer::new(
+        Policy::seeded(Preset::default_for(frame), frame),
+        cfg,
+        phys,
+        seed ^ 0xA5A5,
+    );
     t.record_baseline(&terrain);
     for _ in 0..iters {
         t.iterate(&terrain);
@@ -927,7 +936,12 @@ fn bom(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, ph
 fn speed(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
     let terrain = Terrain::new(course, seed);
     let base = Policy::seeded(Preset::default_for(frame), frame);
-    let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+    let mut t = Trainer::new(
+        Policy::seeded(Preset::default_for(frame), frame),
+        cfg,
+        phys,
+        seed ^ 0xA5A5,
+    );
     t.record_baseline(&terrain);
     for _ in 0..iters {
         t.iterate(&terrain);
@@ -1009,7 +1023,14 @@ fn jump(frame: Frame, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
 ///
 /// The servo is not a post-hoc sizing decision any more: its torque-speed line
 /// drives the joints, so it changes what the optimiser converges to.
-fn servo_shootout(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, build: Build) {
+fn servo_shootout(
+    frame: Frame,
+    course: Course,
+    seed: u64,
+    iters: usize,
+    cfg: ArsConfig,
+    build: Build,
+) {
     let terrain = Terrain::new(course, seed);
     println!(
         "{} seed {}, {iters} iterations per servo, {:.2} kg at scale {:.3}\n",
@@ -1025,7 +1046,12 @@ fn servo_shootout(frame: Frame, course: Course, seed: u64, iters: usize, cfg: Ar
 
     for servo in SERVOS.iter() {
         let phys = build.physics(Some(servo));
-        let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+        let mut t = Trainer::new(
+            Policy::seeded(Preset::default_for(frame), frame),
+            cfg,
+            phys,
+            seed ^ 0xA5A5,
+        );
         t.record_baseline(&terrain);
         for _ in 0..iters {
             t.iterate(&terrain);
@@ -1113,7 +1139,12 @@ fn system(
     let mut policy = Policy::seeded(Preset::default_for(frame), frame);
     let mut label = "hand-tuned";
     if iters > 0 {
-        let mut t = Trainer::new(Policy::seeded(Preset::default_for(frame), frame), cfg, phys, seed ^ 0xA5A5);
+        let mut t = Trainer::new(
+            Policy::seeded(Preset::default_for(frame), frame),
+            cfg,
+            phys,
+            seed ^ 0xA5A5,
+        );
         t.record_baseline(&terrain);
         for _ in 0..iters {
             t.iterate(&terrain);
@@ -1171,11 +1202,17 @@ fn system(
         println!("\nno servo in the catalogue can build this machine.");
         return;
     };
-    let servo = hexapod_core::SERVOS.iter().find(|s| s.part == pick).unwrap();
+    let servo = hexapod_core::SERVOS
+        .iter()
+        .find(|s| s.part == pick)
+        .unwrap();
     let s = solve(&trace, servo, &sizing);
 
     println!("\n=== cheapest viable build: {} ===\n", servo.part);
-    println!("converged in {} iterations of the mass/current loop", s.iterations);
+    println!(
+        "converged in {} iterations of the mass/current loop",
+        s.iterations
+    );
     println!("  chassis      {:>6.2} kg", s.chassis_kg);
     println!("  18x servo    {:>6.2} kg", s.servo_kg);
     println!("  battery      {:>6.2} kg", s.battery_kg);
@@ -1230,7 +1267,13 @@ fn system(
     }
     let n = s.sensing;
     if let Some(r) = parts_of(Kind::Ranger).next() {
-        line("RANGEFINDER", r.name, n.rangers, r.unit_price(), "one per leg");
+        line(
+            "RANGEFINDER",
+            r.name,
+            n.rangers,
+            r.unit_price(),
+            "one per leg",
+        );
     }
     if let Some(m) = parts_of(Kind::Support).next() {
         line("SUPPORT", m.name, 1, m.unit_price(), m.note);
@@ -1326,16 +1369,18 @@ fn sparkline(v: &[f32]) -> String {
 
 /// Train a joint-level policy through the curriculum and write a checkpoint.
 ///
-///   hexapod joint-train [--iters 400] [--dirs 16] [--top 6] [--alpha 0.02]
-///                       [--sigma 0.03] [--scenarios 2] [--seed 1]
+///   hexapod joint-train [--iters 400] [--dirs 16] [--top 6] [--alpha 0.002]
+///                       [--sigma 0.02] [--scenarios 2] [--seed 1]
+///                       [--backend nexus-gpu] [--batch-envs 128]
+///                       [--resume policy.txt] [--stage mixed]
 ///                       [--out checkpoints/joint-v1.txt]
 fn joint_train(frame: Frame, mut phys: Physics, args: &[String]) {
-    use hexapod_core::joint_rl::{to_text, train_curriculum, JointCfg, Stage};
+    use hexapod_core::joint_rl::{
+        JointBackend, JointCfg, JointPolicy, Stage, from_text, to_text, train_curriculum_from,
+    };
 
     motor_flags(&mut phys, args);
-    let num = |k: &str, d: f64| -> f64 {
-        flag(args, k).and_then(|v| v.parse().ok()).unwrap_or(d)
-    };
+    let num = |k: &str, d: f64| -> f64 { flag(args, k).and_then(|v| v.parse().ok()).unwrap_or(d) };
     let iters = num("--iters", 400.0) as usize;
     let seed = num("--seed", 1.0) as u64;
     let out = flag(args, "--out").unwrap_or_else(|| "checkpoints/joint-v1.txt".into());
@@ -1343,6 +1388,9 @@ fn joint_train(frame: Frame, mut phys: Physics, args: &[String]) {
     // size is one place to forget, and the last time these drifted apart a
     // tuning run silently used the value it was supposed to be replacing.
     let d = JointCfg::default();
+    let backend = flag(args, "--backend")
+        .map(|value| parse_joint_backend(&value))
+        .unwrap_or(JointBackend::Rapier);
     let cfg = JointCfg {
         dirs: num("--dirs", d.dirs as f64) as usize,
         top: num("--top", d.top as f64) as usize,
@@ -1350,6 +1398,9 @@ fn joint_train(frame: Frame, mut phys: Physics, args: &[String]) {
         sigma: num("--sigma", d.sigma),
         scenarios: num("--scenarios", d.scenarios as f64) as usize,
         workers: num("--workers", d.workers as f64) as usize,
+        backend,
+        batch_envs: num("--batch-envs", d.batch_envs as f64) as usize,
+        device: num("--device", d.device as f64) as usize,
     };
 
     println!(
@@ -1362,14 +1413,57 @@ fn joint_train(frame: Frame, mut phys: Physics, args: &[String]) {
         "# {} dirs x {} scenarios x 2 sides, alpha {:.3}, sigma {:.3}, budget {iters}",
         cfg.dirs, cfg.scenarios, cfg.alpha, cfg.sigma
     );
-    println!("# curriculum: {}", 
-        hexapod_core::joint_rl::STAGES.iter().map(|s| s.name()).collect::<Vec<_>>().join(" -> "));
+    println!(
+        "# backend {} · batch {} · device {}",
+        cfg.backend.name(),
+        cfg.batch_envs.max(1),
+        cfg.device,
+    );
+    println!(
+        "# curriculum: {}",
+        hexapod_core::joint_rl::STAGES
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    );
     println!();
     println!("  iter  stage       score  target   dist    secs  feet   air  ");
 
     let t0 = Instant::now();
     let mut last_stage: Option<Stage> = None;
-    let policy = train_curriculum(frame, &phys, &cfg, iters, seed, |p, _| {
+    let resume = flag(args, "--resume");
+    let start_stage = flag(args, "--stage")
+        .map(|s| parse_joint_stage(&s))
+        .unwrap_or(if resume.is_some() {
+            Stage::Mixed
+        } else {
+            Stage::Stand
+        });
+    let initial = match resume.as_deref() {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("could not read joint checkpoint {path}: {e}");
+                std::process::exit(1)
+            });
+            let policy = from_text(&text).unwrap_or_else(|e| {
+                eprintln!("could not load joint checkpoint {path}: {e}");
+                std::process::exit(2)
+            });
+            if policy.frame != frame {
+                eprintln!(
+                    "checkpoint has {} legs but --legs selected {}",
+                    policy.frame.legs(),
+                    frame.legs()
+                );
+                std::process::exit(2)
+            }
+            println!("# resuming {path} from {}", start_stage.name());
+            policy
+        }
+        None => JointPolicy::seeded(frame, seed),
+    };
+    let policy = train_curriculum_from(initial, &phys, &cfg, iters, seed, start_stage, |p, _| {
         // One line per stage check. A promotion is the interesting event, so
         // it is marked rather than left to be inferred from the score.
         let mark = if p.promoted { "  <- cleared" } else { "" };
@@ -1401,6 +1495,188 @@ fn joint_train(frame: Frame, mut phys: Physics, args: &[String]) {
             std::process::exit(1);
         }
     }
+    let metadata = format!(
+        concat!(
+            "hexapod-joint-run-v1\n",
+            "hexapod_version={}\n",
+            "nexus3d_version=0.5.0\n",
+            "backend={}\n",
+            "device={}\n",
+            "batch_envs={}\n",
+            "legs={}\n",
+            "seed={}\n",
+            "start_stage={}\n",
+            "budget={}\n",
+            "dirs={}\n",
+            "top={}\n",
+            "scenarios={}\n",
+            "alpha={:.17e}\n",
+            "sigma={:.17e}\n",
+            "motor_stiff={:.17e}\n",
+            "motor_damp={:.17e}\n",
+            "motor_max={:.17e}\n",
+            "substeps={}\n",
+            "solver_iters={}\n",
+        ),
+        env!("CARGO_PKG_VERSION"),
+        cfg.backend.name(),
+        cfg.device,
+        cfg.batch_envs.max(1),
+        frame.legs(),
+        seed,
+        start_stage.name(),
+        iters,
+        cfg.dirs,
+        cfg.top,
+        cfg.scenarios,
+        cfg.alpha,
+        cfg.sigma,
+        phys.motor_stiff,
+        phys.motor_damp,
+        phys.motor_max,
+        phys.substeps,
+        phys.solver_iters,
+    );
+    let metadata_path = format!("{out}.meta");
+    if let Err(error) = std::fs::write(&metadata_path, metadata) {
+        eprintln!("could not write run metadata {metadata_path}: {error}");
+        std::process::exit(1);
+    }
+    println!("wrote {metadata_path}");
+}
+
+fn parse_joint_stage(value: &str) -> hexapod_core::joint_rl::Stage {
+    use hexapod_core::joint_rl::Stage;
+    match value.to_ascii_lowercase().replace('_', "-").as_str() {
+        "stand" => Stage::Stand,
+        "walk" | "walk-flat" => Stage::WalkFlat,
+        "run" | "run-flat" => Stage::RunFlat,
+        "rough" => Stage::Rough,
+        "gaps" => Stage::Gaps,
+        "jump" => Stage::Jump,
+        "mixed" | "all" => Stage::Mixed,
+        other => {
+            eprintln!(
+                "unknown joint curriculum stage {other:?}; try stand, walk-flat, run-flat, rough, gaps, jump, or mixed"
+            );
+            std::process::exit(2)
+        }
+    }
+}
+
+fn parse_joint_backend(value: &str) -> hexapod_core::joint_rl::JointBackend {
+    use hexapod_core::joint_rl::JointBackend;
+    match value.to_ascii_lowercase().replace('_', "-").as_str() {
+        "nexus" | "nexus-gpu" | "nexus-webgpu" => JointBackend::NexusGpu,
+        "rapier" | "cpu" => JointBackend::Rapier,
+        other => {
+            eprintln!("unknown joint backend {other:?}; try nexus-gpu or rapier");
+            std::process::exit(2)
+        }
+    }
+}
+
+/// Evaluate a saved motor-level policy with the same rollout and route
+/// contract used during training. With no `--course`, the selected stage's
+/// whole course set is reported; `mixed` therefore means all fifteen.
+fn joint_eval(course: Course, mut phys: Physics, args: &[String]) {
+    use hexapod_core::joint_rl::{
+        JointBackend, JointCfg, Stage, evaluate_on_courses_backend, from_text,
+    };
+
+    motor_flags(&mut phys, args);
+    let Some(path) = flag(args, "--policy") else {
+        eprintln!("joint-eval requires --policy PATH");
+        std::process::exit(2)
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        eprintln!("could not read joint checkpoint {path}: {e}");
+        std::process::exit(1)
+    });
+    let policy = from_text(&text).unwrap_or_else(|e| {
+        eprintln!("could not load joint checkpoint {path}: {e}");
+        std::process::exit(2)
+    });
+    let stage = flag(args, "--stage")
+        .map(|s| parse_joint_stage(&s))
+        .unwrap_or(Stage::Mixed);
+    let count = flag(args, "--eval-seeds")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .max(1);
+    let base = flag(args, "--seed")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(100_001);
+    let seeds: Vec<u64> = (0..count).map(|i| base + i as u64 * 101).collect();
+    let selected: Vec<Course> = if args.iter().any(|a| a == "--course") {
+        vec![course]
+    } else {
+        stage.courses().to_vec()
+    };
+    let defaults = JointCfg::default();
+    let cfg = JointCfg {
+        backend: flag(args, "--backend")
+            .map(|value| parse_joint_backend(&value))
+            .unwrap_or(JointBackend::Rapier),
+        batch_envs: flag(args, "--batch-envs")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.batch_envs),
+        device: flag(args, "--device")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.device),
+        ..defaults
+    };
+
+    println!(
+        "# joint-eval {path} · {} legs · {} · {} · {} held-out seed(s)",
+        policy.frame.legs(),
+        stage.name(),
+        cfg.backend.name(),
+        seeds.len()
+    );
+    println!("course        score    dist   wp %  finish %  time   feet  fell");
+    let results: Vec<_> = selected
+        .iter()
+        .map(|&c| {
+            let result = evaluate_on_courses_backend(&policy, &phys, stage, &[c], &seeds, &cfg)
+                .unwrap_or_else(|error| {
+                    eprintln!("joint evaluation failed on {}: {error}", c.name());
+                    std::process::exit(1)
+                });
+            (c, result)
+        })
+        .collect();
+    for (c, r) in &results {
+        println!(
+            "{:<11} {:>7.3} {:>7.2} {:>6.1} {:>9.1} {:>6.2} {:>6.2} {:>5}",
+            c.name(),
+            r.score,
+            r.distance,
+            100.0 * r.waypoint_fraction,
+            100.0 * r.completion_rate,
+            r.finish_time,
+            r.support,
+            if r.fell { "yes" } else { "no" },
+        );
+    }
+    let n = results.len().max(1) as f64;
+    let mean = |f: fn(&hexapod_core::joint_rl::JointRollout) -> f64| {
+        results.iter().map(|(_, r)| f(r)).sum::<f64>() / n
+    };
+    println!(
+        "mean        {:>7.3} {:>7.2} {:>6.1} {:>9.1} {:>6.2} {:>6.2} {:>5}",
+        mean(|r| r.score),
+        mean(|r| r.distance),
+        100.0 * mean(|r| r.waypoint_fraction),
+        100.0 * mean(|r| r.completion_rate),
+        mean(|r| r.finish_time),
+        mean(|r| r.support),
+        if results.iter().any(|(_, r)| r.fell) {
+            "yes"
+        } else {
+            "no"
+        },
+    );
 }
 
 fn motor_flags(phys: &mut Physics, args: &[String]) {
@@ -1425,7 +1701,6 @@ fn motor_flags(phys: &mut Physics, args: &[String]) {
     if let Some(v) = flag(args, "--footmu").and_then(|v| v.parse().ok()) {
         phys.foot_mu = v;
     }
-
 }
 
 #[cfg(test)]
@@ -1446,20 +1721,8 @@ mod tests {
         let suite = terrain_suite(3, 1);
         let frame = Frame::default();
         let baseline = Policy::seeded(Preset::default_for(frame), frame);
-        let uniform = difficulty_weighted_suite(
-            &suite,
-            &baseline,
-            &Physics::default(),
-            0.0,
-            0,
-        );
-        let weighted = difficulty_weighted_suite(
-            &suite,
-            &baseline,
-            &Physics::default(),
-            0.0,
-            3,
-        );
+        let uniform = difficulty_weighted_suite(&suite, &baseline, &Physics::default(), 0.0, 0);
+        let weighted = difficulty_weighted_suite(&suite, &baseline, &Physics::default(), 0.0, 3);
         assert_eq!(uniform.len(), suite.len());
         assert_eq!(weighted.len(), suite.len() * 4);
         for course in hexapod_core::terrain::COURSES {

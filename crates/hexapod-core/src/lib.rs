@@ -39,6 +39,8 @@ pub mod walker;
 // The joint-level policy drives the articulated plant's motors directly.
 #[cfg(feature = "rapier")]
 pub mod joint_rl;
+#[cfg(feature = "nexus-gpu")]
+pub mod nexus_plant;
 
 pub use ars::{ArsConfig, Trainer};
 pub use dynamics::{Actuator, LegMass, Physics};

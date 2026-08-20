@@ -11,13 +11,21 @@ name = "hexapod_core"
 path = "src/lib.rs"
 
 [dependencies]
-rapier3d = { version = "0.32", optional = true }
+rapier3d = { version = "0.35.2", optional = true }
+nexus3d = { version = "0.5.0", optional = true, default-features = false, features = ["dim3", "f32", "rbd", "mpm", "webgpu"] }
+khal = { version = "0.3.0", optional = true, default-features = false, features = ["webgpu"] }
+futures = { version = "0.3", optional = true, default-features = false, features = ["executor"] }
 
 [features]
 default = []
-# Rapier 0.32 plant: 3 revolute joints per leg plus ground friction. The
+# Rapier 0.35 plant: 3 revolute joints per leg plus ground friction. The
 # centroidal model stays the default so ARS can still train in the page.
 rapier = ["dep:rapier3d"]
+# Native WebGPU/Vulkan batch backend for the motor-level trainer. Nexus 0.5
+# builds its robot scenes from Rapier 0.35 types, so this includes `rapier`.
+# `mpm` is enabled because the 0.5 umbrella crate imports that module from its
+# shared state/pipeline even though this backend only instantiates RBD worlds.
+nexus-gpu = ["rapier", "dep:nexus3d", "dep:khal", "dep:futures"]
 
 [lints]
 workspace = true

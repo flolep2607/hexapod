@@ -13,12 +13,13 @@
 //!
 //! What the policy is given is its own state and where it is trying to get to:
 //! joint angles and rates, body attitude and velocity, which feet are down,
-//! and the range and bearing to the next waypoint. Plus a free-running clock,
-//! which is an *input* and not a trajectory: nothing tells the policy what to
-//! do at a given phase, it only gets to know that time is periodic. Without it
-//! a feedback-only controller has to build its own oscillator out of contact
-//! transitions before it can take a second step, and that is a much harder
-//! search than it needs to be.
+//! the range and bearing to the next waypoint, whether this task requires a
+//! jump, the next trench's near/far lip distances, and forward terrain heights.
+//! Plus a free-running clock, which is an *input* and not a trajectory: nothing
+//! tells the policy what to do at a given phase, it only gets to know that time
+//! is periodic. Without it a feedback-only controller has to build its own
+//! oscillator out of contact transitions before it can take a second step,
+//! and that is a much harder search than it needs to be.
 //!
 //! Actions are offsets from the standing pose rather than absolute angles, so
 //! the all-zero policy stands still instead of collapsing. That matters for
@@ -26,12 +27,14 @@
 //! it *stay* there rather than discovering the floor from scratch.
 
 use crate::dynamics::Physics;
-use crate::math::{clamp, hypot2, inv_rot_y, Rng};
+use crate::math::{Rng, clamp, hypot2, inv_rot_y, rot_y};
+#[cfg(feature = "nexus-gpu")]
+use crate::nexus_plant::NexusPlantBatch;
 use crate::plant::ArticulatedPlant;
 use crate::policy::{Policy, Preset};
 use crate::robot::{Frame, MAX_LEGS, Q_LIMIT};
 use crate::sim::DT;
-use crate::terrain::{Course, Terrain};
+use crate::terrain::{COURSES, Course, Terrain, WAYPOINT_R};
 
 /// Widest joint travel, radians, the policy may ask for in one direction away
 /// from the standing pose. The mechanical limits still clamp on top of this;
@@ -69,13 +72,23 @@ pub const DECIMATION: usize = 2;
 
 /// Hidden units in the policy network. Kept small on purpose: ARS estimates
 /// its gradient from a handful of random directions, and the variance of that
-/// estimate grows with the number of parameters — 48 units meant 3666 weights
-/// probed by 16 directions, which is not an estimate so much as a guess.
+/// estimate grows with the number of parameters. With the terrain scan a
+/// 48-unit shape would carry 4866 weights probed by only 16 directions, which
+/// is not an estimate so much as a guess.
 pub const N_HIDDEN: usize = 24;
 
+/// Forward height samples supplied to the policy. Five ranges across three
+/// lanes are enough to distinguish a step, a narrow gap and a long trench
+/// before a foot reaches it. They are observations only: no gait or jump is
+/// scheduled from them.
+pub const N_TERRAIN_SCAN: usize = 15;
+
+const SCAN_RANGES: [f64; 5] = [0.5, 1.0, 1.5, 2.2, 3.2];
+const SCAN_LANES: [f64; 3] = [-1.0, 0.0, 1.0];
+
 /// Return spread below which an iteration is treated as carrying no gradient.
-/// Scores are per-second and bounded by roughly 1.0, so this is a fraction of
-/// a percent of the range.
+/// Per-tick shaping is bounded by roughly 1.0 and the route terms are bounded,
+/// so this remains a fraction of a percent of the useful return range.
 const SPREAD_FLOOR: f64 = 1.0e-4;
 
 /// Observation width for a six-legged machine. Recomputed per frame by
@@ -89,6 +102,9 @@ pub const MAX_JOINT_OBS: usize = 3 * MAX_LEGS  // joint angles
     + 1                                       // ride height above support
     + 2                                       // range, bearing to waypoint
     + 1                                       // commanded speed
+    + 1                                       // course requires jumping
+    + 2                                       // next trench near/far lips
+    + N_TERRAIN_SCAN                          // forward terrain heights
     + 2 * MAX_LEGS                            // per-leg clock sin, cos
     + 1; // bias
 
@@ -98,7 +114,7 @@ pub const MAX_JOINT_ACT: usize = 3 * MAX_LEGS;
 pub fn n_obs(frame: Frame) -> usize {
     let n = frame.legs();
     // 3n angles + 3n rates + n contacts + 2n phase, then the body block.
-    9 * n + 3 + 3 + 2 + 1 + 2 + 1 + 1
+    9 * n + 3 + 3 + 2 + 1 + 2 + 1 + 1 + 2 + N_TERRAIN_SCAN + 1
 }
 
 /// Action width for `frame`.
@@ -217,6 +233,22 @@ impl ObsNorm {
             *x = clamp((*x - self.mean[i]) / sd, -8.0, 8.0);
         }
     }
+
+    fn merge(&mut self, other: &ObsNorm) {
+        if self.frozen || other.n < 1.0 {
+            return;
+        }
+        if self.mean.len() != other.mean.len() {
+            return;
+        }
+        let total = self.n + other.n;
+        for i in 0..self.mean.len() {
+            let delta = other.mean[i] - self.mean[i];
+            self.mean[i] += delta * other.n / total;
+            self.m2[i] += other.m2[i] + delta * delta * self.n * other.n / total;
+        }
+        self.n = total;
+    }
 }
 
 /// Curriculum stages, in the order they are trained.
@@ -275,14 +307,7 @@ impl Stage {
             Stage::Rough => &[Course::Steps, Course::Rubble],
             Stage::Gaps => &[Course::Gaps],
             Stage::Jump => &[Course::Jump, Course::Chasm],
-            Stage::Mixed => &[
-                Course::Flat,
-                Course::Steps,
-                Course::Rubble,
-                Course::Gaps,
-                Course::Mixed,
-                Course::Jump,
-            ],
+            Stage::Mixed => &COURSES,
         }
     }
 
@@ -301,21 +326,35 @@ impl Stage {
         }
     }
 
+    /// Command for one course. The final stage samples every course, but the
+    /// parkour pair still needs its run-up rather than an impossible 2.5 m/s
+    /// walking command.
+    pub fn speed_for(self, course: Course) -> f64 {
+        if self == Stage::Mixed && course.is_jump() {
+            Stage::Jump.speed()
+        } else {
+            self.speed()
+        }
+    }
+
     /// Rollout length, seconds.
     pub fn horizon(self) -> f64 {
         match self {
             Stage::Stand => 2.0,
             Stage::WalkFlat | Stage::RunFlat => 4.0,
+            Stage::Mixed => 30.0,
             _ => 8.0,
         }
     }
 
-    /// Mean score over the stage's courses at which the next stage opens.
-    /// These are per-second rates, so they do not move when the horizon does.
+    /// Mean score over the stage's courses at which the next stage opens. The
+    /// shaping component is normalized by horizon; ordered route terms have
+    /// the same fixed scale on every stage.
     pub fn promote_at(self) -> f64 {
         match self {
-            // Standing still scores ~0.16 under the gated reward, so these
-            // are thresholds a policy has to actually move to reach.
+            // Standing still has some per-tick shaping but the episode-level
+            // progress gate makes its locomotion score zero. These thresholds
+            // therefore require actual movement.
             Stage::Stand => 0.80,
             Stage::WalkFlat => 0.45,
             Stage::RunFlat => 0.40,
@@ -330,7 +369,7 @@ impl Stage {
 /// What one rollout produced.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JointRollout {
-    /// Reward per simulated second, so horizons stay comparable.
+    /// Episode fitness: per-second shaping plus ordered-route and finish terms.
     pub score: f64,
     /// Ground covered along the course, metres.
     pub distance: f64,
@@ -341,6 +380,15 @@ pub struct JointRollout {
     pub support: f64,
     /// Peak height the chassis reached above its standing height.
     pub air: f64,
+    /// Ordered route state. `finished` means the terminal waypoint was
+    /// entered; `completed` additionally requires every earlier waypoint.
+    pub reached: usize,
+    pub finished: bool,
+    pub completed: bool,
+    pub waypoint_fraction: f64,
+    pub completion_rate: f64,
+    /// Time to the finish, with a failure charged the full stage horizon.
+    pub finish_time: f64,
 }
 
 /// The standing joint pose: what an all-zero action commands.
@@ -352,13 +400,149 @@ pub fn stand_pose(frame: Frame, phys: &Physics, terrain: &Terrain) -> [[f64; 3];
     plant.leg_q_all()
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RouteState {
+    wp: usize,
+    reached: usize,
+    finished: bool,
+    range: f64,
+    bearing: f64,
+}
+
+impl RouteState {
+    /// Advance an ordered route without crediting waypoints merely passed at
+    /// a distance. This mirrors the centroidal simulator's finish semantics,
+    /// so the two trainers agree on what solving a course means.
+    fn update(&mut self, terrain: &Terrain, pos: [f64; 3], yaw: f64) {
+        if self.finished {
+            return;
+        }
+        if terrain.waypoints.is_empty() {
+            self.finished = true;
+            self.range = 0.0;
+            self.bearing = 0.0;
+            return;
+        }
+        let last = terrain.waypoints.len() - 1;
+        loop {
+            let w = terrain.waypoint(self.wp);
+            let (dx, dz) = (w[0] - pos[0], w[1] - pos[2]);
+            let range = hypot2(dx, dz);
+            if range < WAYPOINT_R {
+                self.reached += 1;
+                if self.wp == last {
+                    self.finished = true;
+                    self.range = range;
+                    self.bearing = 0.0;
+                    return;
+                }
+                self.wp += 1;
+                continue;
+            }
+            if self.wp < last && w[1] < pos[2] - 1.5 {
+                self.wp += 1;
+                continue;
+            }
+            self.range = range;
+            let body = inv_rot_y([dx, 0.0, dz], yaw);
+            self.bearing = body[0].atan2(body[2]);
+            return;
+        }
+    }
+}
+
+fn terrain_scan(terrain: &Terrain, pos: [f64; 3], yaw: f64, floor: f64, out: &mut [f64]) {
+    debug_assert!(out.len() >= N_TERRAIN_SCAN);
+    let mut k = 0;
+    for distance in SCAN_RANGES {
+        for lateral in SCAN_LANES {
+            let d = rot_y([lateral, 0.0, distance], yaw);
+            // Relative height makes the same step look the same after the
+            // machine has climbed onto a platform. The clamp is the sensor's
+            // finite useful range and keeps a deep trench from dominating the
+            // network merely because it has a larger number.
+            out[k] = clamp(
+                terrain.probe(pos[0] + d[0], pos[2] + d[2]) - floor,
+                -2.0,
+                2.0,
+            );
+            k += 1;
+        }
+    }
+}
+
+#[inline]
+fn jump_required(course: Course) -> f64 {
+    f64::from(u8::from(course.is_jump()))
+}
+
+/// Signed metres from the chassis to the next parkour trench's near and far
+/// lips. A continuous range lets a policy time crouch and lift-off from speed;
+/// fixed height probes alone only say that some sample happens to be void.
+fn jump_lip_distances(terrain: &Terrain, z: f64) -> [f64; 2] {
+    if !terrain.course.is_jump() {
+        return [0.0, 0.0];
+    }
+    terrain
+        .obstacles
+        .iter()
+        .filter(|obstacle| obstacle.top < -0.1 && obstacle.z1 >= z - 0.2)
+        .min_by(|a, b| a.z0.total_cmp(&b.z0))
+        .map(|pit| [pit.z0 - z, pit.z1 - z])
+        // A positive sentinel is distinct from being on a lip. The normalizer
+        // handles scale; clamping keeps the last clear straight finite.
+        .unwrap_or([8.0, 8.0])
+        .map(|distance| clamp(distance, -2.0, 8.0))
+}
+
+/// Warmed initial state for one Rapier course. Cloning this is a cheap reset:
+/// all rigid bodies, contacts, joints and broad-phase state return to the same
+/// deterministic tick without rebuilding the authored robot and terrain.
+#[derive(Clone)]
+struct RapierEnv {
+    plant: ArticulatedPlant,
+    neutral: [[f64; 3]; MAX_LEGS],
+    start: [f64; 3],
+    stand_y: f64,
+}
+
+impl RapierEnv {
+    fn new(frame: Frame, phys: &Physics, terrain: &Terrain) -> Self {
+        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+        let mut plant = ArticulatedPlant::standing(frame, &gait, phys, terrain);
+        let neutral = plant.leg_q_all();
+        // Build the broad-phase once. Every reset cloned from this point has
+        // the same initialized contact state as the scalar reference rollout.
+        plant.step(DT);
+        let (start, _, _, _) = plant.chassis_pose();
+        Self {
+            plant,
+            neutral,
+            start,
+            stand_y: start[1],
+        }
+    }
+}
+
 /// Run one episode and score it.
 pub fn rollout(
     policy: &JointPolicy,
     phys: &Physics,
     terrain: &Terrain,
     stage: Stage,
+    norm_sink: Option<&mut ObsNorm>,
+) -> JointRollout {
+    let env = RapierEnv::new(policy.frame, phys, terrain);
+    rollout_in_env(policy, phys, terrain, stage, norm_sink, env)
+}
+
+fn rollout_in_env(
+    policy: &JointPolicy,
+    phys: &Physics,
+    terrain: &Terrain,
+    stage: Stage,
     mut norm_sink: Option<&mut ObsNorm>,
+    env: RapierEnv,
 ) -> JointRollout {
     let frame = policy.frame;
     let n = frame.legs();
@@ -369,15 +553,12 @@ pub fn rollout(
     // Phase reference only — the same split the hand-written tripod uses for
     // *which* legs swing together, with nothing about what they should do.
     let phase_off = gait.offsets;
-    let mut plant = ArticulatedPlant::standing(frame, &gait, phys, terrain);
-    let neutral = plant.leg_q_all();
+    let mut plant = env.plant;
+    let neutral = env.neutral;
     let substeps = plant.substeps.max(1);
-    // One step so the broad-phase BVH exists before anything queries it.
-    plant.step(DT);
-
-    let (start, _, _, _) = plant.chassis_pose();
-    let stand_y = start[1];
-    let cmd = stage.speed();
+    let start = env.start;
+    let stand_y = env.stand_y;
+    let cmd = stage.speed_for(terrain.course);
 
     let mut obs = vec![0.0; no];
     let mut act = vec![0.0; na];
@@ -391,6 +572,9 @@ pub fn rollout(
     let mut steps = 0usize;
     let mut fell = false;
     let mut clock = 0.0f64;
+    let mut route = RouteState::default();
+    route.update(terrain, start, 0.0);
+    let mut finish_time = stage.horizon();
     // Contact averaged over a window, not read off one tick. See `reward`.
     let mut duty = frame.legs() as f64;
     let ticks = (stage.horizon() / DT) as usize;
@@ -409,10 +593,20 @@ pub fn rollout(
             break;
         }
 
-        let support = plant.support_under(pos[0], pos[2], pos[1] + 4.0).unwrap_or(0.0);
+        let support = plant
+            .support_under(pos[0], pos[2], pos[1] + 4.0)
+            .unwrap_or(0.0);
         let ride = pos[1] - support;
         let body_v = inv_rot_y([vel[0], vel[1], vel[2]], yaw);
-        let (range, bearing) = waypoint(terrain, pos, yaw);
+        let was_finished = route.finished;
+        route.update(terrain, pos, yaw);
+        if !was_finished && route.finished {
+            finish_time = tick as f64 * DT;
+        }
+        if route.finished {
+            break;
+        }
+        let (range, bearing) = (route.range, route.bearing);
 
         let mut w = 0usize;
         for i in 0..n {
@@ -443,12 +637,30 @@ pub fn rollout(
         obs[w + 9] = range;
         obs[w + 10] = bearing;
         obs[w + 11] = cmd;
+        // A narrow GAPS trench and the near edge of a JUMP trench can produce
+        // the same local height samples. The task bit removes that alias: the
+        // controller may step the former but must prepare a ballistic crossing
+        // for the latter.
+        obs[w + 12] = jump_required(terrain.course);
+        let lips = jump_lip_distances(terrain, pos[2]);
+        obs[w + 13] = lips[0];
+        obs[w + 14] = lips[1];
+        let scan = w + 15;
+        terrain_scan(
+            terrain,
+            pos,
+            yaw,
+            support,
+            &mut obs[scan..scan + N_TERRAIN_SCAN],
+        );
+        let phase = scan + N_TERRAIN_SCAN;
         for i in 0..n {
             let ph = (clock + phase_off[i]) * std::f64::consts::TAU;
-            obs[w + 12 + i * 2] = ph.sin();
-            obs[w + 13 + i * 2] = ph.cos();
+            obs[phase + i * 2] = ph.sin();
+            obs[phase + i * 2 + 1] = ph.cos();
         }
-        obs[w + 12 + n * 2] = 1.0;
+        obs[phase + n * 2] = 1.0;
+        debug_assert_eq!(phase + n * 2 + 1, no);
 
         if tick % DECIMATION == 0 {
             if let Some(sink) = norm_sink.as_deref_mut() {
@@ -483,7 +695,9 @@ pub fn rollout(
         duty += (down as f64 - duty) * (DT / 0.30);
         support_sum += down as f64;
         air = air.max(pos[1] - stand_y);
-        let tick = reward(stage, cmd, &body_v, pitch, roll, ride, stand_y, down, duty, n, bearing);
+        let tick = reward(
+            stage, cmd, &body_v, pitch, roll, ride, stand_y, down, duty, n, bearing,
+        );
         // Normalised by the most the command could have moved this tick, so
         // the cost does not change meaning when the slew limit or leg count
         // does.
@@ -497,44 +711,368 @@ pub fn rollout(
         }
     }
 
-    let (end, _, _, _) = plant.chassis_pose();
+    let (end, end_yaw, _, _) = plant.chassis_pose();
+    let was_finished = route.finished;
+    route.update(terrain, end, end_yaw);
+    if !was_finished && route.finished {
+        finish_time = steps as f64 * DT;
+    }
     let secs = steps as f64 * DT;
     // A fall is scored on the time it survived, not averaged over it: falling
     // at one second and standing for three must not come out the same.
     let denom = stage.horizon().max(1e-6);
+    let route_len = terrain.waypoints.len();
+    let waypoint_fraction = if route_len == 0 {
+        1.0
+    } else {
+        route.reached as f64 / route_len as f64
+    };
+    let completed = route.finished && route.reached == route_len;
+    let base_score = total * DT / denom;
+    let mean_support = if steps == 0 {
+        0.0
+    } else {
+        support_sum / steps as f64
+    };
+    // Route completion is lexicographically stronger than tick quality: even
+    // a perfect unfinished rollout cannot outscore a completed one. Ordered
+    // waypoint credit supplies intermediate landmarks on the way there.
+    let score = episode_score(
+        stage,
+        base_score,
+        end[2] - start[2],
+        cmd,
+        mean_support,
+        n,
+        waypoint_fraction,
+        completed,
+    );
     JointRollout {
-        score: total * DT / denom,
+        score,
         distance: end[2] - start[2],
         secs,
         fell,
-        support: if steps == 0 {
-            0.0
-        } else {
-            support_sum / steps as f64
-        },
+        support: mean_support,
         air,
+        reached: route.reached,
+        finished: route.finished,
+        completed,
+        waypoint_fraction,
+        completion_rate: f64::from(u8::from(completed)),
+        finish_time,
     }
 }
 
-/// Range and bearing to the next waypoint ahead, in the body frame.
-fn waypoint(terrain: &Terrain, pos: [f64; 3], yaw: f64) -> (f64, f64) {
-    let next = terrain
-        .waypoints
-        .iter()
-        .find(|w| w[1] > pos[2] + 0.2)
-        .copied();
-    match next {
-        Some(w) => {
-            let d = [w[0] - pos[0], 0.0, w[1] - pos[2]];
-            let b = inv_rot_y(d, yaw);
-            (hypot2(d[0], d[2]).min(30.0) * 0.1, b[0].atan2(b[2].max(1e-6)))
-        }
-        // No route: straight down the corridor is the goal.
-        None => {
-            let b = inv_rot_y([-pos[0], 0.0, 4.0], yaw);
-            (0.4, b[0].atan2(b[2].max(1e-6)))
-        }
+#[cfg(feature = "nexus-gpu")]
+#[derive(Clone, Debug)]
+struct NexusBatchRollout {
+    rollout: JointRollout,
+    norm: ObsNorm,
+}
+
+#[cfg(feature = "nexus-gpu")]
+struct NexusEpisode {
+    neutral: [[f64; 3]; MAX_LEGS],
+    obs: Vec<f64>,
+    act: Vec<f64>,
+    last_q: [[f64; 3]; MAX_LEGS],
+    q_cmd: [[f64; 3]; MAX_LEGS],
+    norm: ObsNorm,
+    start: [f64; 3],
+    stand_y: f64,
+    cmd: f64,
+    total: f64,
+    support_sum: f64,
+    air: f64,
+    steps: usize,
+    fell: bool,
+    clock: f64,
+    route: RouteState,
+    finish_time: f64,
+    duty: f64,
+    active: bool,
+}
+
+/// Lockstep Nexus rollout. Policy inference and scoring remain identical to
+/// [`rollout`]; only the articulated physics step is batched on the GPU.
+#[cfg(feature = "nexus-gpu")]
+fn rollout_nexus_batch(
+    policies: &[JointPolicy],
+    phys: &Physics,
+    terrains: &[Terrain],
+    stage: Stage,
+    collect_norm: bool,
+    device: usize,
+) -> Result<Vec<NexusBatchRollout>, String> {
+    if policies.len() != terrains.len() || policies.is_empty() {
+        return Err(
+            "Nexus rollout policies and terrains must have the same non-zero length".into(),
+        );
     }
+    let frame = policies[0].frame;
+    if policies.iter().any(|p| p.frame != frame) {
+        return Err("one Nexus batch cannot mix robot frames".into());
+    }
+    let n = frame.legs();
+    let no = n_obs(frame);
+    let na = n_act(frame);
+    let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+    let phase_off = gait.offsets;
+    let mut plant = NexusPlantBatch::new(frame, &gait, phys, terrains, device)?;
+    debug_assert_eq!(plant.len(), policies.len());
+
+    // Match the scalar plant's broad-phase warm-up step.
+    plant.step()?;
+    let initial = plant.snapshots()?;
+    let mut episodes = Vec::with_capacity(policies.len());
+    for (env, (snapshot, terrain)) in initial.iter().zip(terrains).enumerate() {
+        let neutral = plant.neutral(env);
+        let mut route = RouteState::default();
+        route.update(terrain, snapshot.pos, snapshot.yaw);
+        episodes.push(NexusEpisode {
+            neutral,
+            obs: vec![0.0; no],
+            act: vec![0.0; na],
+            last_q: snapshot.q,
+            q_cmd: neutral,
+            norm: ObsNorm::new(no),
+            start: snapshot.pos,
+            stand_y: snapshot.pos[1],
+            cmd: stage.speed_for(terrain.course),
+            total: 0.0,
+            support_sum: 0.0,
+            air: 0.0,
+            steps: 0,
+            fell: false,
+            clock: 0.0,
+            route,
+            finish_time: stage.horizon(),
+            duty: n as f64,
+            active: true,
+        });
+    }
+
+    let ticks = (stage.horizon() / DT) as usize;
+    let mut snapshots = initial;
+    for tick in 0..ticks {
+        let mut commands = episodes.iter().map(|e| e.q_cmd).collect::<Vec<_>>();
+        let mut any_active = false;
+        for env in 0..episodes.len() {
+            let ep = &mut episodes[env];
+            if !ep.active {
+                continue;
+            }
+            any_active = true;
+            let state = snapshots[env];
+            let terrain = &terrains[env];
+            if state.pitch.abs() > 1.0 || state.roll.abs() > 1.0 || state.chassis_contact {
+                ep.fell = true;
+                ep.active = false;
+                continue;
+            }
+
+            let support = terrain.probe(state.pos[0], state.pos[2]);
+            let ride = state.pos[1] - support;
+            let body_v = inv_rot_y(state.vel, state.yaw);
+            let was_finished = ep.route.finished;
+            ep.route.update(terrain, state.pos, state.yaw);
+            if !was_finished && ep.route.finished {
+                ep.finish_time = tick as f64 * DT;
+            }
+            if ep.route.finished {
+                ep.active = false;
+                continue;
+            }
+            let (range, bearing) = (ep.route.range, ep.route.bearing);
+
+            let mut w = 0usize;
+            for i in 0..n {
+                for c in 0..3 {
+                    ep.obs[w] = state.q[i][c] - ep.neutral[i][c];
+                    w += 1;
+                }
+            }
+            for i in 0..n {
+                for c in 0..3 {
+                    ep.obs[w] = (state.q[i][c] - ep.last_q[i][c]) / DT * 0.05;
+                    w += 1;
+                }
+            }
+            for i in 0..n {
+                ep.obs[w] = f64::from(u8::from(state.contacts[i]));
+                w += 1;
+            }
+            ep.obs[w] = body_v[0];
+            ep.obs[w + 1] = body_v[1];
+            ep.obs[w + 2] = body_v[2];
+            ep.obs[w + 3] = state.angvel[0];
+            ep.obs[w + 4] = state.angvel[1];
+            ep.obs[w + 5] = state.angvel[2];
+            ep.obs[w + 6] = state.pitch;
+            ep.obs[w + 7] = state.roll;
+            ep.obs[w + 8] = ride - ep.stand_y;
+            ep.obs[w + 9] = range;
+            ep.obs[w + 10] = bearing;
+            ep.obs[w + 11] = ep.cmd;
+            ep.obs[w + 12] = jump_required(terrain.course);
+            let lips = jump_lip_distances(terrain, state.pos[2]);
+            ep.obs[w + 13] = lips[0];
+            ep.obs[w + 14] = lips[1];
+            let scan = w + 15;
+            terrain_scan(
+                terrain,
+                state.pos,
+                state.yaw,
+                support,
+                &mut ep.obs[scan..scan + N_TERRAIN_SCAN],
+            );
+            let phase = scan + N_TERRAIN_SCAN;
+            for i in 0..n {
+                let ph = (ep.clock + phase_off[i]) * std::f64::consts::TAU;
+                ep.obs[phase + i * 2] = ph.sin();
+                ep.obs[phase + i * 2 + 1] = ph.cos();
+            }
+            ep.obs[phase + n * 2] = 1.0;
+
+            if tick % DECIMATION == 0 {
+                if collect_norm {
+                    ep.norm.observe(&ep.obs);
+                }
+                policies[env].norm.apply(&mut ep.obs);
+                policies[env].act(&ep.obs, &mut ep.act);
+            }
+
+            let mut jerk = 0.0;
+            for i in 0..n {
+                for c in 0..3 {
+                    let (lo, hi) = Q_LIMIT[c];
+                    let want = clamp(ep.neutral[i][c] + ep.act[i * 3 + c], lo, hi);
+                    let slew = MAX_JOINT_RATE * DT;
+                    let moved = clamp(want - ep.q_cmd[i][c], -slew, slew);
+                    jerk += moved.abs();
+                    ep.q_cmd[i][c] += moved;
+                }
+            }
+            commands[env] = ep.q_cmd;
+            ep.last_q = state.q;
+
+            let down = state.contacts.iter().take(n).filter(|c| **c).count();
+            ep.duty += (down as f64 - ep.duty) * (DT / 0.30);
+            ep.support_sum += down as f64;
+            ep.air = ep.air.max(state.pos[1] - ep.stand_y);
+            let shaped = reward(
+                stage,
+                ep.cmd,
+                &body_v,
+                state.pitch,
+                state.roll,
+                ride,
+                ep.stand_y,
+                down,
+                ep.duty,
+                n,
+                bearing,
+            );
+            let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
+            ep.total += (shaped - SMOOTH_COST * churn).max(0.0);
+            ep.steps += 1;
+            ep.clock += DT / 0.5;
+            if terrain.waypoints.is_empty() && state.pos[2] > crate::terrain::Z_MAX - 2.0 {
+                ep.active = false;
+            }
+        }
+        if !any_active {
+            break;
+        }
+        plant.drive(&commands, phys)?;
+        plant.step()?;
+        snapshots = plant.snapshots()?;
+    }
+
+    let final_state = snapshots;
+    let mut out = Vec::with_capacity(episodes.len());
+    for (env, mut ep) in episodes.into_iter().enumerate() {
+        let end = final_state[env];
+        let was_finished = ep.route.finished;
+        ep.route.update(&terrains[env], end.pos, end.yaw);
+        if !was_finished && ep.route.finished {
+            ep.finish_time = ep.steps as f64 * DT;
+        }
+        let secs = ep.steps as f64 * DT;
+        let route_len = terrains[env].waypoints.len();
+        let waypoint_fraction = if route_len == 0 {
+            1.0
+        } else {
+            ep.route.reached as f64 / route_len as f64
+        };
+        let completed = ep.route.finished && ep.route.reached == route_len;
+        let mean_support = if ep.steps == 0 {
+            0.0
+        } else {
+            ep.support_sum / ep.steps as f64
+        };
+        let distance = end.pos[2] - ep.start[2];
+        let base_score = ep.total * DT / stage.horizon().max(1e-6);
+        let score = episode_score(
+            stage,
+            base_score,
+            distance,
+            ep.cmd,
+            mean_support,
+            n,
+            waypoint_fraction,
+            completed,
+        );
+        out.push(NexusBatchRollout {
+            rollout: JointRollout {
+                score,
+                distance,
+                secs,
+                fell: ep.fell,
+                support: mean_support,
+                air: ep.air,
+                reached: ep.route.reached,
+                finished: ep.route.finished,
+                completed,
+                waypoint_fraction,
+                completion_rate: f64::from(u8::from(completed)),
+                finish_time: ep.finish_time,
+            },
+            norm: ep.norm,
+        });
+    }
+    Ok(out)
+}
+
+fn episode_score(
+    stage: Stage,
+    base_score: f64,
+    distance: f64,
+    cmd: f64,
+    support: f64,
+    legs: usize,
+    waypoint_fraction: f64,
+    completed: bool,
+) -> f64 {
+    if stage == Stage::Stand {
+        return base_score;
+    }
+    // Tick reward alone can still be gamed by oscillating forward during
+    // rewarded instants and drifting farther backward between them. Keep it
+    // only in proportion to net progress along the course. A quarter of
+    // commanded progress opens the full shaping reward; no or negative
+    // progress earns none.
+    let expected = (cmd.abs() * stage.horizon()).max(1e-6);
+    let progress_gate = clamp(distance / (0.25 * expected), 0.0, 1.0);
+    // A one-foot hopper can have forward instants and respectable net travel,
+    // but it is not a usable hexapod gait. Penalise the whole episode by mean
+    // contact, reaching full credit at roughly two feet on a hexapod. Squaring
+    // keeps a brief flight phase affordable and makes sustained hopping steep.
+    let support_target = (0.35 * legs as f64).max(1.0);
+    let support_gate = clamp(support / support_target, 0.0, 1.0).powi(2);
+    base_score * progress_gate * support_gate
+        + 0.35 * waypoint_fraction
+        + f64::from(u8::from(completed))
 }
 
 /// Per-tick reward. Bounded above by roughly 1.0 so a stage's score is
@@ -577,8 +1115,12 @@ fn reward(
         return 0.0;
     }
 
-    // Speed along the heading. Deliberately *not* the gait-level trainer's
-    // Gaussian: that is a scoring function, and this has to be a guide.
+    // Speed toward the ordered waypoint. Using speed along the body's heading
+    // lets a policy turn around and improve its score while its world progress
+    // becomes negative. Projecting velocity onto the target direction makes
+    // that exploit score zero and still gives a smooth guide while turning.
+    // Deliberately *not* the gait-level trainer's Gaussian: that is a scoring
+    // function, and this has to be a guide.
     //
     // A Gaussian centred on the command is flat where training starts. At rest
     // against a 0.8 m/s command it reads exp(-(0.8/0.37)^2) = 0.009, and its
@@ -587,7 +1129,7 @@ fn reward(
     // and covering no ground. Rising linearly to the command gives a constant
     // gradient from a standstill; above the command it falls off, so this is
     // still speed *tracking* and not a prize for going as fast as possible.
-    let along = body_v[2];
+    let along = body_v[0] * bearing.sin() + body_v[2] * bearing.cos();
     let width = 0.25 + 0.15 * cmd.abs();
     let track = if along <= 0.0 {
         0.0
@@ -615,8 +1157,9 @@ fn reward(
     // so the search had to cross a valley to start walking and mostly did not.
     //
     // As a multiplier, holding attitude is worth nothing on its own and losing
-    // it forfeits everything. Standing still now scores about 0.16, walking
-    // well still approaches 1.0, and the path between them runs downhill.
+    // it forfeits everything. Standing still now has about 0.16 of per-tick
+    // shaping (and zero episode fitness after the progress gate), walking well
+    // still approaches 1.0, and the path between them runs downhill.
     //
     // Support is part of the gate too, not a bonus. As a 0.10 term the machine
     // kept trading it away: mean support fell to 1.3 feet of six, because
@@ -626,6 +1169,25 @@ fn reward(
     let enough_feet = ((duty - 0.35) / 1.4).clamp(0.0, 1.0);
     let posture = level * height * enough_feet;
     (0.75 * track + 0.15 * aim + 0.10 * gait) * posture
+}
+
+/// ARS configuration for the joint-level trainer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JointBackend {
+    /// Reusable paired Rapier worlds on CPU. This is the reference path.
+    #[default]
+    Rapier,
+    /// Independent Rapier-compatible worlds batched by Nexus on a native GPU.
+    NexusGpu,
+}
+
+impl JointBackend {
+    pub const fn name(self) -> &'static str {
+        match self {
+            JointBackend::Rapier => "rapier",
+            JointBackend::NexusGpu => "nexus-gpu",
+        }
+    }
 }
 
 /// ARS configuration for the joint-level trainer.
@@ -639,6 +1201,12 @@ pub struct JointCfg {
     /// direction from winning on a lucky seed.
     pub scenarios: usize,
     pub workers: usize,
+    pub backend: JointBackend,
+    /// Maximum environments kept in flight at once. On Rapier this caps CPU
+    /// rollout workers; on Nexus it is the number finalized in one GPU batch.
+    pub batch_envs: usize,
+    /// Native GPU adapter index. Nexus WebGPU currently supports adapter zero.
+    pub device: usize,
 }
 
 impl Default for JointCfg {
@@ -646,37 +1214,49 @@ impl Default for JointCfg {
         JointCfg {
             dirs: 16,
             top: 6,
-            // Small. The network's input weights are scaled 1/sqrt(inputs),
-            // about 0.14, and ARS divides its step by the spread of the
-            // returns — which is small precisely when the top directions
-            // agree. At alpha 0.02 that combination moved weights by ~30% of
-            // their own scale per iteration and walking diverged from 0.454 to
-            // 0.033 in twelve.
-            // Swept, 10 iterations each on WALK-FLAT. 0.0005 and 0.001 climb
-            // steadily to ~0.16 with all six feet planted and no ground
-            // covered — refining the stand rather than leaving it. 0.002
-            // reaches 0.208. 0.005 escapes the standing basin by iteration 4
-            // (support 6.00 -> 2.87) and reaches 0.342 while actually
-            // travelling; 0.010 jumps out immediately and then comes apart.
-            alpha: 0.005,
-            // Measured, not guessed. Exploration noise has to be big enough to
-            // produce visible leg motion and small enough that the machine
-            // does not simply fall over — past 0.05 the mean feet-on-ground
-            // drops from 0.76 to 0.36, every perturbation scores about zero,
-            // and the spread of returns that ARS steers by collapses from
-            // 0.113 to 0.024. Past 0.30 the output tanh saturates at ~23
-            // degrees of joint travel and more noise buys nothing at all.
-            sigma: 0.05,
+            // Small. ARS divides its step by return spread, which is smallest
+            // precisely when the top directions agree. With the elitist
+            // validation centre, 0.005 made ten consecutive rejected steps;
+            // 0.002 improved the same checkpoint 0.221 -> 0.252 -> 0.281 in
+            // five updates while raising mean support to 1.81 feet.
+            alpha: 0.002,
+            // Exploration noise has to produce visible leg motion without
+            // immediately throwing away support. On the support-gated reward,
+            // 0.02 reached 0.93 m with 1.76 mean feet down in seven updates;
+            // 0.05 reached a similar distance with only 1.11 feet and rescored
+            // at less than a third as much. Larger perturbations mostly throw
+            // the plant and collapse the informative spread.
+            sigma: 0.02,
             scenarios: 2,
             workers: 0,
+            backend: JointBackend::Rapier,
+            batch_envs: 128,
+            device: 0,
         }
     }
 }
 
 /// Mean score of `policy` on `stage`, over a fixed set of seeds.
 pub fn evaluate(policy: &JointPolicy, phys: &Physics, stage: Stage, seeds: &[u64]) -> JointRollout {
-    let courses = stage.courses();
-    let mut acc = JointRollout::default();
+    evaluate_on_courses(policy, phys, stage, stage.courses(), seeds)
+}
+
+/// Mean result over an explicit course slice. This is also the primitive the
+/// CLI uses for per-course held-out reporting; training and evaluation then
+/// cannot quietly disagree about rollout semantics.
+pub fn evaluate_on_courses(
+    policy: &JointPolicy,
+    phys: &Physics,
+    stage: Stage,
+    courses: &[Course],
+    seeds: &[u64],
+) -> JointRollout {
+    let mut acc = JointRollout {
+        finished: true,
+        completed: true,
+        reached: usize::MAX,
+        ..JointRollout::default()
+    };
     let mut n = 0.0;
     for &seed in seeds {
         for &course in courses {
@@ -688,6 +1268,12 @@ pub fn evaluate(policy: &JointPolicy, phys: &Physics, stage: Stage, seeds: &[u64
             acc.support += r.support;
             acc.air = acc.air.max(r.air);
             acc.fell |= r.fell;
+            acc.reached = acc.reached.min(r.reached);
+            acc.finished &= r.finished;
+            acc.completed &= r.completed;
+            acc.waypoint_fraction += r.waypoint_fraction;
+            acc.completion_rate += r.completion_rate;
+            acc.finish_time += r.finish_time;
             n += 1.0;
         }
     }
@@ -696,8 +1282,381 @@ pub fn evaluate(policy: &JointPolicy, phys: &Physics, stage: Stage, seeds: &[u64
         acc.distance /= n;
         acc.secs /= n;
         acc.support /= n;
+        acc.waypoint_fraction /= n;
+        acc.completion_rate /= n;
+        acc.finish_time /= n;
+    } else {
+        acc.reached = 0;
+        acc.finished = false;
+        acc.completed = false;
     }
     acc
+}
+
+/// Evaluate with the rollout backend selected by `cfg`.
+///
+/// The CPU function above remains the stable reference primitive. This
+/// fallible entry point is used by training and the CLI so GPU initialization
+/// or simulation failures are reported instead of silently switching physics.
+pub fn evaluate_on_courses_backend(
+    policy: &JointPolicy,
+    phys: &Physics,
+    stage: Stage,
+    courses: &[Course],
+    seeds: &[u64],
+    cfg: &JointCfg,
+) -> Result<JointRollout, String> {
+    if cfg.backend == JointBackend::Rapier {
+        let mut terrains = Vec::with_capacity(courses.len() * seeds.len());
+        for &seed in seeds {
+            for &course in courses {
+                terrains.push(Terrain::new(course, seed));
+            }
+        }
+        return Ok(mean_rollouts(&parallel_rapier_rollouts(
+            policy, phys, stage, &terrains, cfg,
+        )));
+    }
+
+    #[cfg(not(feature = "nexus-gpu"))]
+    {
+        let _ = (policy, phys, stage, courses, seeds);
+        return Err(
+            "the Nexus backend requires building hexapod-core with feature `nexus-gpu`".into(),
+        );
+    }
+
+    #[cfg(feature = "nexus-gpu")]
+    {
+        let mut terrains = Vec::with_capacity(courses.len() * seeds.len());
+        for &seed in seeds {
+            for &course in courses {
+                terrains.push(Terrain::new(course, seed));
+            }
+        }
+        let batch_envs = cfg.batch_envs.max(1);
+        let mut rollouts = Vec::with_capacity(terrains.len());
+        for chunk in terrains.chunks(batch_envs) {
+            let policies = vec![policy.clone(); chunk.len()];
+            rollouts.extend(
+                rollout_nexus_batch(&policies, phys, chunk, stage, false, cfg.device)?
+                    .into_iter()
+                    .map(|r| r.rollout),
+            );
+        }
+        Ok(mean_rollouts(&rollouts))
+    }
+}
+
+fn parallel_rapier_rollouts(
+    policy: &JointPolicy,
+    phys: &Physics,
+    stage: Stage,
+    terrains: &[Terrain],
+    cfg: &JointCfg,
+) -> Vec<JointRollout> {
+    if terrains.is_empty() {
+        return Vec::new();
+    }
+    let requested_workers = if cfg.workers == 0 {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    } else {
+        cfg.workers
+    };
+    let workers = requested_workers
+        .max(1)
+        .min(cfg.batch_envs.max(1))
+        .min(terrains.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut indexed = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let next = &next;
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(terrain) = terrains.get(index) else {
+                        break;
+                    };
+                    out.push((index, rollout(policy, phys, terrain, stage, None)));
+                }
+                out
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("joint-RL evaluation worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    indexed.sort_by_key(|(index, _)| *index);
+    indexed.into_iter().map(|(_, rollout)| rollout).collect()
+}
+
+#[derive(Debug)]
+struct RapierRunResult {
+    job: usize,
+    side: usize,
+    score: f64,
+    norm: ObsNorm,
+}
+
+/// Evaluate paired ARS perturbations on reusable, warmed Rapier snapshots.
+///
+/// A direction/scenario pair shares exactly the same authored world and
+/// initial contact state between its positive and negative side. Each sign is
+/// scheduled independently, exposing `2 * directions * scenarios` work units
+/// to the CPU and balancing early falls against longer surviving episodes.
+fn rapier_ars_results(
+    base_policy: &JointPolicy,
+    phys: &Physics,
+    stage: Stage,
+    cfg: &JointCfg,
+    deltas: &[f64],
+    plan: &[Vec<Terrain>],
+    n_theta: usize,
+) -> Vec<(usize, f64, f64, ObsNorm)> {
+    let dirs = plan.len();
+    if dirs == 0 {
+        return Vec::new();
+    }
+
+    let mut plus_policies = Vec::with_capacity(dirs);
+    let mut minus_policies = Vec::with_capacity(dirs);
+    for direction in 0..dirs {
+        let mut plus = base_policy.clone();
+        let mut minus = base_policy.clone();
+        for j in 0..n_theta {
+            let shift = cfg.sigma * deltas[direction * n_theta + j];
+            plus.theta[j] += shift;
+            minus.theta[j] -= shift;
+        }
+        plus_policies.push(plus);
+        minus_policies.push(minus);
+    }
+
+    let jobs = plan.iter().map(Vec::len).sum::<usize>();
+    if jobs == 0 {
+        return (0..dirs)
+            .map(|direction| (direction, 0.0, 0.0, ObsNorm::new(n_obs(base_policy.frame))))
+            .collect();
+    }
+    let mut metadata = Vec::with_capacity(jobs);
+    for (direction, scenarios) in plan.iter().enumerate() {
+        for scenario in 0..scenarios.len() {
+            metadata.push((direction, scenario));
+        }
+    }
+
+    // Author each course once, then clone that warmed snapshot independently
+    // for both perturbation signs. Keeping signs as separate scheduler jobs is
+    // important: direction-level scheduling caps concurrency at the direction
+    // count and makes one long-lived sign hold up its whole paired job.
+    let templates = metadata
+        .iter()
+        .map(|&(direction, scenario)| {
+            RapierEnv::new(base_policy.frame, phys, &plan[direction][scenario])
+        })
+        .collect::<Vec<_>>();
+    let runs = jobs * 2;
+    let requested_workers = if cfg.workers == 0 {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    } else {
+        cfg.workers
+    };
+    let workers = requested_workers
+        .max(1)
+        .min(cfg.batch_envs.max(1))
+        .min(runs);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut pairs = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| {
+                let mut out = Vec::new();
+                loop {
+                    let run = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if run >= runs {
+                        break;
+                    }
+                    let side = run / jobs;
+                    let job = run % jobs;
+                    let (direction, scenario) = metadata[job];
+                    let terrain = &plan[direction][scenario];
+                    let mut norm = ObsNorm::new(n_obs(base_policy.frame));
+                    let collect_norm = !base_policy.norm.frozen;
+                    let selected = if side == 0 {
+                        &plus_policies[direction]
+                    } else {
+                        &minus_policies[direction]
+                    };
+                    let score = rollout_in_env(
+                        selected,
+                        phys,
+                        terrain,
+                        stage,
+                        collect_norm.then_some(&mut norm),
+                        templates[job].clone(),
+                    )
+                    .score;
+                    out.push(RapierRunResult {
+                        job,
+                        side,
+                        score,
+                        norm,
+                    });
+                }
+                out
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("joint-RL Rapier worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    pairs.sort_by_key(|result| (result.side, result.job));
+
+    let mut sums = vec![[0.0; 2]; dirs];
+    let mut counts = vec![0usize; dirs];
+    let mut norms = (0..dirs)
+        .map(|_| ObsNorm::new(n_obs(base_policy.frame)))
+        .collect::<Vec<_>>();
+    for result in &pairs {
+        let direction = metadata[result.job].0;
+        sums[direction][result.side] += result.score;
+        if result.side == 0 {
+            counts[direction] += 1;
+        }
+        // Sorting by sign then scenario matches the scalar implementation's
+        // observation order: all positive scenarios, then all negative ones.
+        norms[direction].merge(&result.norm);
+    }
+
+    (0..dirs)
+        .map(|direction| {
+            let count = counts[direction].max(1) as f64;
+            (
+                direction,
+                sums[direction][0] / count,
+                sums[direction][1] / count,
+                norms[direction].clone(),
+            )
+        })
+        .collect()
+}
+
+fn mean_rollouts(rollouts: &[JointRollout]) -> JointRollout {
+    if rollouts.is_empty() {
+        return JointRollout::default();
+    }
+    let mut acc = JointRollout {
+        finished: true,
+        completed: true,
+        reached: usize::MAX,
+        ..JointRollout::default()
+    };
+    for r in rollouts {
+        acc.score += r.score;
+        acc.distance += r.distance;
+        acc.secs += r.secs;
+        acc.support += r.support;
+        acc.air = acc.air.max(r.air);
+        acc.fell |= r.fell;
+        acc.reached = acc.reached.min(r.reached);
+        acc.finished &= r.finished;
+        acc.completed &= r.completed;
+        acc.waypoint_fraction += r.waypoint_fraction;
+        acc.completion_rate += r.completion_rate;
+        acc.finish_time += r.finish_time;
+    }
+    let n = rollouts.len() as f64;
+    acc.score /= n;
+    acc.distance /= n;
+    acc.secs /= n;
+    acc.support /= n;
+    acc.waypoint_fraction /= n;
+    acc.completion_rate /= n;
+    acc.finish_time /= n;
+    acc
+}
+
+#[cfg(feature = "nexus-gpu")]
+fn nexus_ars_results(
+    base_policy: &JointPolicy,
+    phys: &Physics,
+    stage: Stage,
+    cfg: &JointCfg,
+    deltas: &[f64],
+    plan: &[Vec<Terrain>],
+    n_theta: usize,
+) -> Result<Vec<(usize, f64, f64, ObsNorm)>, String> {
+    let dirs = plan.len();
+    let jobs = dirs * 2 * plan.first().map_or(0, Vec::len);
+    let mut policies = Vec::with_capacity(jobs);
+    let mut terrains = Vec::with_capacity(jobs);
+    let mut metadata = Vec::with_capacity(jobs);
+    for (direction, scenarios) in plan.iter().enumerate() {
+        for (side, sign) in [(0usize, 1.0), (1usize, -1.0)] {
+            let mut perturbed = base_policy.clone();
+            for (j, weight) in perturbed.theta.iter_mut().enumerate() {
+                *weight += sign * cfg.sigma * deltas[direction * n_theta + j];
+            }
+            for terrain in scenarios {
+                policies.push(perturbed.clone());
+                terrains.push(terrain.clone());
+                metadata.push((direction, side));
+            }
+        }
+    }
+
+    let mut sums = vec![[0.0; 2]; dirs];
+    let mut counts = vec![[0usize; 2]; dirs];
+    let mut norms = (0..dirs)
+        .map(|_| ObsNorm::new(n_obs(base_policy.frame)))
+        .collect::<Vec<_>>();
+    let batch_envs = cfg.batch_envs.max(1);
+    for start in (0..policies.len()).step_by(batch_envs) {
+        let end = (start + batch_envs).min(policies.len());
+        let batch = rollout_nexus_batch(
+            &policies[start..end],
+            phys,
+            &terrains[start..end],
+            stage,
+            !base_policy.norm.frozen,
+            cfg.device,
+        )?;
+        for (offset, result) in batch.into_iter().enumerate() {
+            let (direction, side) = metadata[start + offset];
+            sums[direction][side] += result.rollout.score;
+            counts[direction][side] += 1;
+            norms[direction].merge(&result.norm);
+        }
+    }
+
+    Ok((0..dirs)
+        .map(|direction| {
+            let plus = sums[direction][0] / counts[direction][0].max(1) as f64;
+            let minus = sums[direction][1] / counts[direction][1].max(1) as f64;
+            (direction, plus, minus, norms[direction].clone())
+        })
+        .collect())
+}
+
+#[cfg(not(feature = "nexus-gpu"))]
+fn nexus_ars_results(
+    _base_policy: &JointPolicy,
+    _phys: &Physics,
+    _stage: Stage,
+    _cfg: &JointCfg,
+    _deltas: &[f64],
+    _plan: &[Vec<Terrain>],
+    _n_theta: usize,
+) -> Result<Vec<(usize, f64, f64, ObsNorm)>, String> {
+    Err("the Nexus backend requires building hexapod-core with feature `nexus-gpu`".into())
 }
 
 /// One ARS iteration on `stage`. Returns the mean score of the perturbed
@@ -736,66 +1695,21 @@ pub fn iterate(
         })
         .collect();
 
-    let workers = if cfg.workers == 0 {
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-    } else {
-        cfg.workers
-    }
-    .max(1)
-    .min(dirs);
-
     // (direction, plus score, minus score, pooled observation stats)
-    let mut results: Vec<(usize, f64, f64, ObsNorm)> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for worker in 0..workers {
-            let deltas = &deltas;
-            let plan = &plan;
-            let base_policy = &*policy;
-            handles.push(scope.spawn(move || {
-                let mut out = Vec::new();
-                for k in (worker..dirs).step_by(workers) {
-                    let mut norm = ObsNorm::new(n_obs(base_policy.frame));
-                    let mut side = |sign: f64| {
-                        let mut p = base_policy.clone();
-                        for (j, w) in p.theta.iter_mut().enumerate() {
-                            *w += sign * cfg.sigma * deltas[k * n + j];
-                        }
-                        let mut acc = 0.0;
-                        for terrain in &plan[k] {
-                            acc += rollout(&p, phys, terrain, stage, Some(&mut norm)).score;
-                        }
-                        acc / plan[k].len() as f64
-                    };
-                    let plus = side(1.0);
-                    let minus = side(-1.0);
-                    out.push((k, plus, minus, norm));
-                }
-                out
-            }));
-        }
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("joint-RL rollout worker panicked"))
-            .collect()
-    });
+    let mut results: Vec<(usize, f64, f64, ObsNorm)> = match cfg.backend {
+        JointBackend::Rapier => rapier_ars_results(policy, phys, stage, cfg, &deltas, &plan, n),
+        JointBackend::NexusGpu => nexus_ars_results(policy, phys, stage, cfg, &deltas, &plan, n)
+            .unwrap_or_else(|e| panic!("Nexus ARS rollout failed: {e}")),
+    };
 
     // Fold the pooled observation statistics back in before the weight step,
     // so the next iteration normalises with what this one actually saw. Skipped
     // once the scaling is frozen — see `train_curriculum`, which fixes it up
     // front precisely so the gradient and the evaluation agree.
-    for (_, _, _, norm) in results.iter().filter(|_| !policy.norm.frozen) {
-        if norm.n < 1.0 {
-            continue;
+    if !policy.norm.frozen {
+        for (_, _, _, norm) in &results {
+            policy.norm.merge(norm);
         }
-        let total = policy.norm.n + norm.n;
-        for i in 0..policy.norm.mean.len() {
-            let d = norm.mean[i] - policy.norm.mean[i];
-            policy.norm.mean[i] += d * norm.n / total;
-            policy.norm.m2[i] += norm.m2[i] + d * d * policy.norm.n * norm.n / total;
-        }
-        policy.norm.n = total;
     }
 
     // ARS-V1t: rank directions by their better side, keep the top slice, and
@@ -842,6 +1756,80 @@ pub struct Progress {
     pub promoted: bool,
 }
 
+fn warm_normalizer(
+    policy: &JointPolicy,
+    phys: &Physics,
+    cfg: &JointCfg,
+    rng: &mut Rng,
+) -> Result<ObsNorm, String> {
+    // Include the sensor extremes as well as moving body state. Fitting on
+    // flat alone gives every height probe near-zero variance, so the first
+    // real step or trench saturates the normalised input and is barely
+    // distinguishable from every other obstacle.
+    let probes = [
+        (Stage::WalkFlat, Course::Flat),
+        (Stage::Rough, Course::Steps),
+        (Stage::Rough, Course::Rubble),
+        (Stage::Gaps, Course::Gaps),
+        (Stage::Jump, Course::Jump),
+        (Stage::Rough, Course::Slalom),
+        (Stage::Rough, Course::Slick),
+    ];
+    let mut jobs = Vec::with_capacity(probes.len());
+    for (stage, course) in probes {
+        let mut perturbed = policy.clone();
+        // Perturbed, so the statistics cover moving as well as standing — a
+        // normalizer fitted only to a motionless machine gives every
+        // joint-rate input near-zero variance and amplifies its noise.
+        for weight in &mut perturbed.theta {
+            *weight += 0.05 * rng.normal();
+        }
+        jobs.push((stage, Terrain::new(course, 1), perturbed));
+    }
+
+    let mut warm = ObsNorm::new(n_obs(policy.frame));
+    if cfg.backend == JointBackend::Rapier {
+        for (stage, terrain, perturbed) in jobs {
+            rollout(&perturbed, phys, &terrain, stage, Some(&mut warm));
+        }
+        return Ok(warm);
+    }
+
+    #[cfg(not(feature = "nexus-gpu"))]
+    {
+        let _ = jobs;
+        Err("the Nexus backend requires building hexapod-core with feature `nexus-gpu`".into())
+    }
+
+    #[cfg(feature = "nexus-gpu")]
+    {
+        // A Nexus simulation has one horizon/reward stage per batch. Group the
+        // warm-up courses by stage while preserving their deterministic order.
+        for &stage in &[Stage::WalkFlat, Stage::Rough, Stage::Gaps, Stage::Jump] {
+            let selected = jobs
+                .iter()
+                .filter(|(job_stage, _, _)| *job_stage == stage)
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            let policies = selected
+                .iter()
+                .map(|(_, _, policy)| policy.clone())
+                .collect::<Vec<_>>();
+            let terrains = selected
+                .iter()
+                .map(|(_, terrain, _)| terrain.clone())
+                .collect::<Vec<_>>();
+            for result in rollout_nexus_batch(&policies, phys, &terrains, stage, true, cfg.device)?
+            {
+                warm.merge(&result.norm);
+            }
+        }
+        Ok(warm)
+    }
+}
+
 /// Train through the curriculum, stopping when the budget runs out or every
 /// stage is cleared. `on_iter` is called after each iteration so a CLI can
 /// print a curve without this module knowing about stdout.
@@ -861,9 +1849,32 @@ pub fn train_curriculum(
     cfg: &JointCfg,
     budget: usize,
     seed: u64,
+    on_iter: impl FnMut(&Progress, &JointPolicy),
+) -> JointPolicy {
+    train_curriculum_from(
+        JointPolicy::seeded(frame, seed),
+        phys,
+        cfg,
+        budget,
+        seed,
+        Stage::Stand,
+        on_iter,
+    )
+}
+
+/// Continue a checkpoint from a chosen curriculum stage. Stage is explicit
+/// because the checkpoint contains controller state, not training history;
+/// guessing from its current scores can send a working locomotion policy back
+/// through STAND and optimize its movement away.
+pub fn train_curriculum_from(
+    mut policy: JointPolicy,
+    phys: &Physics,
+    cfg: &JointCfg,
+    budget: usize,
+    seed: u64,
+    start_stage: Stage,
     mut on_iter: impl FnMut(&Progress, &JointPolicy),
 ) -> JointPolicy {
-    let mut policy = JointPolicy::seeded(frame, seed);
     let mut rng = Rng::new(seed ^ 0x9e37_79b9_7f4a_7c15);
     let eval_seeds = [101u64, 202, 303];
     let mut iter = 0usize;
@@ -879,31 +1890,33 @@ pub fn train_curriculum(
     // *downhill* below the untrained policy while training thought it was
     // improving. A fixed scaling is slightly stale by the end of a stage and
     // consistent throughout, which is the better trade.
-    {
-        let mut warm = ObsNorm::new(n_obs(frame));
-        let probe = STAGES.get(1).copied().unwrap_or(Stage::WalkFlat);
-        for &course in probe.courses() {
-            for seed in [1u64, 2, 3] {
-                let terrain = Terrain::new(course, seed);
-                let mut p = policy.clone();
-                // Perturbed, so the statistics cover moving as well as
-                // standing — a normaliser fitted only to a motionless machine
-                // gives every joint-rate input a near-zero variance and then
-                // amplifies its noise.
-                for w in p.theta.iter_mut() {
-                    *w += 0.05 * rng.normal();
-                }
-                rollout(&p, phys, &terrain, probe, Some(&mut warm));
-            }
-        }
+    if policy.norm.n < 2.0 {
+        let mut warm = warm_normalizer(&policy, phys, cfg, &mut rng)
+            .unwrap_or_else(|e| panic!("could not fit joint observation normalizer: {e}"));
         warm.frozen = true;
         policy.norm = warm;
     }
 
-    for &stage in STAGES.iter() {
+    let first = STAGES.iter().position(|s| *s == start_stage).unwrap_or(0);
+    for &stage in STAGES[first..].iter() {
+        let mut stage_best = policy.clone();
+        let mut stage_best_score = f64::NEG_INFINITY;
         loop {
-            let eval = evaluate(&policy, phys, stage, &eval_seeds);
-            let promoted = eval.score >= stage.promote_at();
+            let eval = evaluate_on_courses_backend(
+                &policy,
+                phys,
+                stage,
+                stage.courses(),
+                &eval_seeds,
+                cfg,
+            )
+            .unwrap_or_else(|e| panic!("joint evaluation failed: {e}"));
+            let improved = eval.score > stage_best_score;
+            if improved {
+                stage_best_score = eval.score;
+                stage_best = policy.clone();
+            }
+            let promoted = stage_best_score >= stage.promote_at();
             on_iter(
                 &Progress {
                     stage,
@@ -915,7 +1928,18 @@ pub fn train_curriculum(
                 &policy,
             );
             if promoted || iter >= budget {
+                // ARS is not monotonic. A late noisy update must not be the
+                // checkpoint merely because it happened last; carry the best
+                // validation policy from this stage into the next one (or out
+                // of the run when the budget ended).
+                policy = stage_best;
                 break;
+            }
+            if !improved {
+                // The validation already paid to tell us this trial was
+                // harmful. Perturb the best known centre again instead of
+                // compounding a noisy downhill step for dozens of updates.
+                policy = stage_best.clone();
             }
             iterate(&mut policy, phys, stage, cfg, &mut rng, iter);
             iter += 1;
@@ -928,7 +1952,6 @@ pub fn train_curriculum(
     policy.norm.frozen = true;
     policy
 }
-
 
 /// Text format for a joint-level checkpoint.
 ///
@@ -985,7 +2008,10 @@ pub fn from_text(text: &str) -> Result<JointPolicy, String> {
     };
     let nums = |v: &str| -> Result<Vec<f64>, String> {
         v.split_whitespace()
-            .map(|t| t.parse::<f64>().map_err(|e| format!("bad number {t:?}: {e}")))
+            .map(|t| {
+                t.parse::<f64>()
+                    .map_err(|e| format!("bad number {t:?}: {e}"))
+            })
             .collect()
     };
 
@@ -1004,7 +2030,44 @@ pub fn from_text(text: &str) -> Result<JointPolicy, String> {
             "checkpoint has {hidden} hidden units, this build has {N_HIDDEN}"
         ));
     }
-    let theta = nums(&get("theta")?)?;
+    let norm_n = get("norm_n")?
+        .parse::<f64>()
+        .map_err(|e| format!("bad norm_n: {e}"))?;
+    let mut theta = nums(&get("theta")?)?;
+    let mut mean = nums(&get("norm_mean")?)?;
+    let mut m2 = nums(&get("norm_m2")?)?;
+
+    // Course-aware jump features were appended to v1 after terrain scans
+    // already existed. Preserve checkpoints from any intermediate width by
+    // inserting initially unused input columns; resumed training can learn
+    // their weights without changing the policy's pre-migration output.
+    let current_obs = n_obs(frame);
+    let old_obs = mean.len();
+    let added = current_obs.saturating_sub(old_obs);
+    let old_theta = old_obs * N_HIDDEN + N_HIDDEN + N_HIDDEN * n_act(frame) + n_act(frame);
+    if (1..=3).contains(&added)
+        && theta.len() == old_theta
+        && mean.len() == old_obs
+        && m2.len() == old_obs
+    {
+        let task_index = 7 * frame.legs() + 12;
+        let rest = theta.split_off(old_obs * N_HIDDEN);
+        let mut migrated = Vec::with_capacity(n_theta(frame));
+        for row in theta.chunks_exact(old_obs) {
+            migrated.extend_from_slice(&row[..task_index]);
+            migrated.extend(std::iter::repeat_n(0.0, added));
+            migrated.extend_from_slice(&row[task_index..]);
+        }
+        migrated.extend(rest);
+        theta = migrated;
+        for offset in 0..added {
+            mean.insert(task_index + offset, 0.0);
+            // Unit variance avoids saturating new features under a frozen
+            // legacy normalizer. Inserted network weights remain zero until
+            // retraining.
+            m2.insert(task_index + offset, norm_n.max(1.0));
+        }
+    }
     if theta.len() != n_theta(frame) {
         return Err(format!(
             "checkpoint has {} weights, a {legs}-leg policy needs {}",
@@ -1012,8 +2075,6 @@ pub fn from_text(text: &str) -> Result<JointPolicy, String> {
             n_theta(frame)
         ));
     }
-    let mean = nums(&get("norm_mean")?)?;
-    let m2 = nums(&get("norm_m2")?)?;
     if mean.len() != n_obs(frame) || m2.len() != n_obs(frame) {
         return Err(format!(
             "checkpoint normaliser is {} wide, this policy observes {}",
@@ -1025,7 +2086,7 @@ pub fn from_text(text: &str) -> Result<JointPolicy, String> {
         frame,
         theta,
         norm: ObsNorm {
-            n: get("norm_n")?.parse().map_err(|e| format!("bad norm_n: {e}"))?,
+            n: norm_n,
             mean,
             m2,
             frozen: true,
@@ -1036,6 +2097,105 @@ pub fn from_text(text: &str) -> Result<JointPolicy, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_direction_scheduled_rapier_results(
+        base_policy: &JointPolicy,
+        phys: &Physics,
+        stage: Stage,
+        cfg: &JointCfg,
+        deltas: &[f64],
+        plan: &[Vec<Terrain>],
+        width: usize,
+    ) -> Vec<(usize, f64, f64)> {
+        let dirs = plan.len();
+        let workers = cfg.workers.max(1).min(dirs);
+        let mut results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::new();
+                    for direction in (worker..dirs).step_by(workers) {
+                        let side = |sign: f64| {
+                            let mut policy = base_policy.clone();
+                            for (j, weight) in policy.theta.iter_mut().enumerate() {
+                                *weight += sign * cfg.sigma * deltas[direction * width + j];
+                            }
+                            plan[direction]
+                                .iter()
+                                .map(|terrain| rollout(&policy, phys, terrain, stage, None).score)
+                                .sum::<f64>()
+                                / plan[direction].len() as f64
+                        };
+                        out.push((direction, side(1.0), side(-1.0)));
+                    }
+                    out
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("legacy benchmark worker panicked"))
+                .collect::<Vec<_>>()
+        });
+        results.sort_by_key(|result| result.0);
+        results
+    }
+
+    #[cfg(feature = "nexus-gpu")]
+    #[test]
+    #[ignore = "requires a native GPU adapter"]
+    fn nexus_batch_runs_joint_policy_rollouts() {
+        let frame = Frame::new(6);
+        let policy = JointPolicy::seeded(frame, 1);
+        let policies = vec![policy; 2];
+        let terrains = vec![
+            Terrain::new(Course::Flat, 11),
+            Terrain::new(Course::Flat, 12),
+        ];
+        let results = rollout_nexus_batch(
+            &policies,
+            &Physics::default(),
+            &terrains,
+            Stage::Stand,
+            true,
+            0,
+        )
+        .expect("Nexus joint rollout");
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert!(result.rollout.score.is_finite());
+            assert!(result.rollout.secs > 0.0);
+            assert!(result.norm.n > 0.0);
+        }
+    }
+
+    #[cfg(feature = "nexus-gpu")]
+    #[test]
+    #[ignore = "Nexus 0.5 multibody motors do not yet match the Rapier standing reference"]
+    fn nexus_seeded_stand_matches_rapier_reference() {
+        let frame = Frame::new(6);
+        let policy = JointPolicy::seeded(frame, 1);
+        let terrain = Terrain::new(Course::Flat, 11);
+        let phys = Physics::default();
+        let rapier = rollout(&policy, &phys, &terrain, Stage::Stand, None);
+        let nexus = rollout_nexus_batch(
+            std::slice::from_ref(&policy),
+            &phys,
+            std::slice::from_ref(&terrain),
+            Stage::Stand,
+            false,
+            0,
+        )
+        .expect("Nexus standing rollout")[0]
+            .rollout;
+        assert!(
+            (nexus.score - rapier.score).abs() < 0.10 && nexus.fell == rapier.fell,
+            "standing parity failed: Rapier score={:.3} fell={}, Nexus score={:.3} fell={}",
+            rapier.score,
+            rapier.fell,
+            nexus.score,
+            nexus.fell,
+        );
+    }
 
     /// An all-zero action has to command exactly the pose the plant spawned
     /// standing in. If it does not, stage one starts from a machine that is
@@ -1096,12 +2256,191 @@ mod tests {
     fn the_observation_vector_is_the_width_it_claims() {
         for legs in [4usize, 6, 10] {
             let frame = Frame::new(legs);
-            let expect = 9 * legs + 12 + 1;
+            let expect = 9 * legs + 16 + N_TERRAIN_SCAN;
             assert_eq!(n_obs(frame), expect, "{legs} legs");
             assert_eq!(n_act(frame), 3 * legs);
             assert!(n_obs(frame) <= MAX_JOINT_OBS);
             assert!(n_act(frame) <= MAX_JOINT_ACT);
         }
+        assert_eq!(Stage::Mixed.courses(), &COURSES);
+        assert_eq!(Stage::Mixed.speed_for(Course::Jump), Stage::Jump.speed());
+        assert_eq!(Stage::Mixed.speed_for(Course::Flat), Stage::Mixed.speed());
+    }
+
+    #[test]
+    fn jump_required_signal_separates_parkour_from_stepable_gaps() {
+        assert_eq!(jump_required(Course::Gaps), 0.0);
+        assert_eq!(jump_required(Course::Flat), 0.0);
+        assert_eq!(jump_required(Course::Jump), 1.0);
+        assert_eq!(jump_required(Course::Chasm), 1.0);
+    }
+
+    #[test]
+    fn jump_lip_ranges_supply_takeoff_timing_and_advance_to_a_fresh_trench() {
+        let terrain = Terrain::new(Course::Jump, 9);
+        let mut pits = terrain
+            .obstacles
+            .iter()
+            .filter(|obstacle| obstacle.top < -0.1)
+            .collect::<Vec<_>>();
+        pits.sort_by(|a, b| a.z0.total_cmp(&b.z0));
+        let first = pits.first().expect("JUMP course has no trench");
+        let before = jump_lip_distances(&terrain, first.z0 - 1.0);
+        assert!((before[0] - 1.0).abs() < 1e-9);
+        assert!(before[1] > before[0]);
+        let over = jump_lip_distances(&terrain, 0.5 * (first.z0 + first.z1));
+        assert!(
+            over[0] < 0.0 && over[1] > 0.0,
+            "over-trench ranges {over:?}"
+        );
+        if let Some(second) = pits.get(1) {
+            let fresh = jump_lip_distances(&terrain, first.z1 + 0.3);
+            assert!((fresh[0] - (second.z0 - first.z1 - 0.3)).abs() < 1e-9);
+            assert!(
+                fresh[0] > 0.0,
+                "next trench was not freshly armed: {fresh:?}"
+            );
+        }
+        assert_eq!(
+            jump_lip_distances(&Terrain::new(Course::Gaps, 9), 0.0),
+            [0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn cloned_rapier_environment_is_an_exact_reset() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 17);
+        let policy = JointPolicy::seeded(frame, 5);
+        let env = RapierEnv::new(frame, &phys, &terrain);
+        let a = rollout_in_env(&policy, &phys, &terrain, Stage::Stand, None, env.clone());
+        let b = rollout_in_env(&policy, &phys, &terrain, Stage::Stand, None, env);
+        assert_eq!(a.score.to_bits(), b.score.to_bits());
+        assert_eq!(a.distance.to_bits(), b.distance.to_bits());
+        assert_eq!(a.secs.to_bits(), b.secs.to_bits());
+        assert_eq!(a.support.to_bits(), b.support.to_bits());
+        assert_eq!(a.air.to_bits(), b.air.to_bits());
+        assert_eq!(a.fell, b.fell);
+        assert_eq!(a.reached, b.reached);
+        assert_eq!(a.finished, b.finished);
+        assert_eq!(a.completed, b.completed);
+    }
+
+    #[test]
+    fn parallel_rapier_evaluation_matches_scalar_order_exactly() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let policy = JointPolicy::seeded(frame, 8);
+        let courses = [Course::Flat, Course::Gaps];
+        let seeds = [3, 4];
+        let scalar = evaluate_on_courses(&policy, &phys, Stage::Stand, &courses, &seeds);
+        let cfg = JointCfg {
+            workers: 4,
+            batch_envs: 4,
+            ..JointCfg::default()
+        };
+        let parallel =
+            evaluate_on_courses_backend(&policy, &phys, Stage::Stand, &courses, &seeds, &cfg)
+                .expect("parallel Rapier evaluation");
+        assert_eq!(scalar.score.to_bits(), parallel.score.to_bits());
+        assert_eq!(scalar.distance.to_bits(), parallel.distance.to_bits());
+        assert_eq!(scalar.secs.to_bits(), parallel.secs.to_bits());
+        assert_eq!(scalar.support.to_bits(), parallel.support.to_bits());
+        assert_eq!(scalar.air.to_bits(), parallel.air.to_bits());
+        assert_eq!(scalar.fell, parallel.fell);
+        assert_eq!(scalar.reached, parallel.reached);
+        assert_eq!(scalar.finished, parallel.finished);
+        assert_eq!(scalar.completed, parallel.completed);
+    }
+
+    #[test]
+    fn route_state_only_completes_after_ordered_waypoints() {
+        let terrain = Terrain::new(Course::Flat, 1);
+        let mut facing_away = RouteState::default();
+        facing_away.update(&terrain, [0.0, 1.0, 0.0], std::f64::consts::PI);
+        assert!(
+            facing_away.bearing.abs() > 3.0,
+            "a waypoint behind the body looked ahead: {:.3} rad",
+            facing_away.bearing
+        );
+
+        let mut route = RouteState::default();
+        for &w in &terrain.waypoints {
+            route.update(&terrain, [w[0], 1.0, w[1]], 0.0);
+        }
+        assert!(route.finished);
+        assert_eq!(route.reached, terrain.waypoints.len());
+
+        let first = terrain.waypoints[0];
+        let mut missed = RouteState::default();
+        missed.update(
+            &terrain,
+            [first[0] + WAYPOINT_R + 1.0, 1.0, first[1] + 2.0],
+            0.0,
+        );
+        assert_eq!(missed.reached, 0, "passing beside a waypoint earned credit");
+        assert_eq!(missed.wp, 1, "a missed waypoint should not trap the route");
+    }
+
+    #[test]
+    fn forward_scan_sees_a_trench_before_contact() {
+        let terrain = Terrain::new(Course::Gaps, 3);
+        let pit = terrain
+            .obstacles
+            .iter()
+            .find(|o| o.top < 0.0)
+            .expect("GAPS course has no trench");
+        let pos = [0.0, 1.0, pit.z0 - 1.0];
+        let mut scan = [0.0; N_TERRAIN_SCAN];
+        terrain_scan(&terrain, pos, 0.0, 0.0, &mut scan);
+        assert!(
+            scan.iter().any(|h| *h < -0.1),
+            "the trench was invisible in the forward scan: {scan:?}"
+        );
+    }
+
+    #[test]
+    fn speed_away_from_the_waypoint_cannot_improve_tracking_reward() {
+        let body_v = [0.0, 0.0, 0.8];
+        let toward = reward(
+            Stage::WalkFlat,
+            0.8,
+            &body_v,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            3,
+            3.0,
+            6,
+            0.0,
+        );
+        let away = reward(
+            Stage::WalkFlat,
+            0.8,
+            &body_v,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            3,
+            3.0,
+            6,
+            std::f64::consts::PI,
+        );
+        assert!(toward > away + 0.5, "toward {toward:.3}, away {away:.3}");
+        assert_eq!(
+            episode_score(Stage::WalkFlat, 0.9, -0.5, 0.8, 3.0, 6, 0.0, false),
+            0.0,
+            "an episode that moved backward kept shaping reward"
+        );
+        let stable = episode_score(Stage::WalkFlat, 0.9, 1.0, 0.8, 2.1, 6, 0.0, false);
+        let hopping = episode_score(Stage::WalkFlat, 0.9, 1.0, 0.8, 0.7, 6, 0.0, false);
+        assert!(
+            stable > hopping * 5.0,
+            "sustained hopping was not penalised: stable {stable:.3}, hopping {hopping:.3}"
+        );
     }
 
     /// With motors this strong, standing is free: the seeded policy already
@@ -1119,7 +2458,12 @@ mod tests {
             scenarios: 1,
             ..JointCfg::default()
         };
-        let seeded = JointPolicy::seeded(frame, 7);
+        let mut seeded = JointPolicy::seeded(frame, 7);
+        // This test is about promotion, not fitting observation statistics.
+        // A frozen identity-like normaliser keeps a full multi-terrain Rapier
+        // warmup out of the ordinary unit suite.
+        seeded.norm.n = 2.0;
+        seeded.norm.frozen = true;
         let before = evaluate(&seeded, &phys, Stage::Stand, &[101]).score;
         assert!(
             before >= Stage::Stand.promote_at(),
@@ -1130,7 +2474,7 @@ mod tests {
         // to get anywhere on the stage after it. Record the weights at every
         // stage check, so we can see whether passing through STAND cost any.
         let mut seen: Vec<(Stage, bool, Vec<f64>)> = Vec::new();
-        train_curriculum(frame, &phys, &cfg, 1, 7, |p, pol| {
+        train_curriculum_from(seeded.clone(), &phys, &cfg, 1, 7, Stage::Stand, |p, pol| {
             seen.push((p.stage, p.promoted, pol.theta.clone()));
         });
 
@@ -1185,6 +2529,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rapier_ars_is_deterministic_across_worker_counts() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let mut serial = JointPolicy::seeded(frame, 23);
+        let mut parallel = serial.clone();
+        serial.norm.n = 2.0;
+        serial.norm.frozen = true;
+        parallel.norm = serial.norm.clone();
+        let mut serial_rng = Rng::new(29);
+        let mut parallel_rng = Rng::new(29);
+        let serial_cfg = JointCfg {
+            dirs: 2,
+            top: 1,
+            scenarios: 2,
+            workers: 1,
+            batch_envs: 1,
+            ..JointCfg::default()
+        };
+        let parallel_cfg = JointCfg {
+            workers: 4,
+            batch_envs: 4,
+            ..serial_cfg
+        };
+        let serial_score = iterate(
+            &mut serial,
+            &phys,
+            Stage::WalkFlat,
+            &serial_cfg,
+            &mut serial_rng,
+            0,
+        );
+        let parallel_score = iterate(
+            &mut parallel,
+            &phys,
+            Stage::WalkFlat,
+            &parallel_cfg,
+            &mut parallel_rng,
+            0,
+        );
+        assert_eq!(serial_score.to_bits(), parallel_score.to_bits());
+        assert_eq!(serial.theta, parallel.theta);
+    }
+
     /// A checkpoint that does not reproduce its evaluation is not a
     /// checkpoint, so the round trip has to be exact rather than close.
     #[test]
@@ -1215,6 +2603,38 @@ mod tests {
         assert_eq!(a.score.to_bits(), b.score.to_bits(), "replay diverged");
     }
 
+    #[test]
+    fn checkpoint_without_course_aware_jump_features_is_migrated_losslessly() {
+        let frame = Frame::new(6);
+        let mut expected = JointPolicy::seeded(frame, 12);
+        expected.norm.n = 25.0;
+        let task_index = 7 * frame.legs() + 12;
+        for row in expected.theta[..n_obs(frame) * N_HIDDEN].chunks_exact_mut(n_obs(frame)) {
+            row[task_index..task_index + 3].fill(0.0);
+        }
+
+        let mut legacy = expected.clone();
+        let rest = legacy.theta.split_off(n_obs(frame) * N_HIDDEN);
+        let mut old_theta = Vec::with_capacity(legacy.theta.len() - N_HIDDEN + rest.len());
+        for row in legacy.theta.chunks_exact(n_obs(frame)) {
+            old_theta.extend_from_slice(&row[..task_index]);
+            old_theta.extend_from_slice(&row[task_index + 3..]);
+        }
+        old_theta.extend(rest);
+        legacy.theta = old_theta;
+        legacy.norm.mean.drain(task_index..task_index + 3);
+        legacy.norm.m2.drain(task_index..task_index + 3);
+
+        let migrated = from_text(&to_text(&legacy)).expect("migrate task-bit checkpoint");
+        assert_eq!(migrated.theta, expected.theta);
+        assert_eq!(migrated.norm.mean.len(), n_obs(frame));
+        assert_eq!(&migrated.norm.mean[task_index..task_index + 3], &[0.0; 3]);
+        assert_eq!(
+            &migrated.norm.m2[task_index..task_index + 3],
+            &[legacy.norm.n; 3]
+        );
+    }
+
     /// A gait-level checkpoint must not load as a joint-level one. They drive
     /// different things and the failure would be silent.
     #[test]
@@ -1229,6 +2649,7 @@ mod tests {
     /// Where the wall-clock actually goes. Not an assertion — a measurement,
     /// printed so a tuning decision is made on numbers.
     #[test]
+    #[ignore = "manual performance measurement; not a correctness test"]
     fn bench_where_the_time_goes() {
         let frame = Frame::new(6);
         let phys = Physics::default();
@@ -1255,15 +2676,27 @@ mod tests {
 
         let horizon = Stage::WalkFlat.horizon();
         println!("  plant setup      {:>8.1} ms", setup * 1e3);
-        println!("  rollout ({horizon}s sim) {:>8.1} ms  -> {:.1}x realtime", roll * 1e3, horizon / roll);
+        println!(
+            "  rollout ({horizon}s sim) {:>8.1} ms  -> {:.1}x realtime",
+            roll * 1e3,
+            horizon / roll
+        );
         println!("  setup share      {:>8.1} %", 100.0 * setup / roll);
 
         // One iteration's worth, serial, for comparison against the observed
         // wall time of the real (threaded) loop.
-        let cfg = JointCfg { dirs: 16, top: 5, scenarios: 1, ..JointCfg::default() };
+        let cfg = JointCfg {
+            dirs: 16,
+            top: 5,
+            scenarios: 1,
+            ..JointCfg::default()
+        };
         let serial = roll * (cfg.dirs * 2 * cfg.scenarios) as f64;
         println!("  16 dirs serial   {:>8.2} s", serial);
-        println!("  cores            {:>8?}", std::thread::available_parallelism());
+        println!(
+            "  cores            {:>8?}",
+            std::thread::available_parallelism()
+        );
 
         let mut p2 = JointPolicy::seeded(frame, 1);
         let mut rng = Rng::new(1);
@@ -1276,11 +2709,73 @@ mod tests {
         println!("  evaluate() 3 sds {:>8.2} s", t3.elapsed().as_secs_f64());
     }
 
+    #[test]
+    #[ignore = "manual release-mode throughput comparison"]
+    fn bench_reusable_parallel_rapier_batch() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let mut policy = JointPolicy::seeded(frame, 41);
+        policy.norm.n = 2.0;
+        policy.norm.frozen = true;
+        let cfg = JointCfg {
+            dirs: 16,
+            top: 3,
+            scenarios: 2,
+            workers: 12,
+            batch_envs: 16,
+            ..JointCfg::default()
+        };
+        let width = n_theta(frame);
+        let mut rng = Rng::new(43);
+        let deltas = (0..cfg.dirs * width)
+            .map(|_| rng.normal())
+            .collect::<Vec<_>>();
+        let plan = (0..cfg.dirs)
+            .map(|direction| {
+                (0..cfg.scenarios)
+                    .map(|scenario| {
+                        Terrain::new(
+                            Course::Flat,
+                            1 + (direction * cfg.scenarios + scenario) as u64,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let t0 = std::time::Instant::now();
+        let legacy = legacy_direction_scheduled_rapier_results(
+            &policy,
+            &phys,
+            Stage::Stand,
+            &cfg,
+            &deltas,
+            &plan,
+            width,
+        );
+        let legacy_secs = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let batched = rapier_ars_results(&policy, &phys, Stage::Stand, &cfg, &deltas, &plan, width);
+        let batched_secs = t1.elapsed().as_secs_f64();
+        for (old, new) in legacy.iter().zip(&batched) {
+            assert_eq!(old.0, new.0);
+            assert_eq!(old.1.to_bits(), new.1.to_bits());
+            assert_eq!(old.2.to_bits(), new.2.to_bits());
+        }
+        println!("legacy direction scheduler  {legacy_secs:.3} s");
+        println!("reusable scenario batch     {batched_secs:.3} s");
+        println!(
+            "speedup                     {:.2}x",
+            legacy_secs / batched_secs
+        );
+    }
+
     /// How big an action does a sigma-sized weight perturbation actually
     /// produce? With the output layer seeded to zero the answer can be "a
     /// degree and a half", which is not exploration — it is a policy that
     /// cannot discover locomotion because it never tries any.
     #[test]
+    #[ignore = "manual exploration sweep; not a correctness test"]
     fn bench_exploration_scale() {
         let frame = Frame::new(6);
         let phys = Physics::default();

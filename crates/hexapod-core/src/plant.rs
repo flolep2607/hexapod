@@ -24,7 +24,6 @@ use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 /// spring this stiff conditioned well enough to run at a cheap solver budget.
 /// A force-based spring of equivalent authority needs 8 substeps and 64 solver
 /// passes per tick to stay up; this one holds at 2 and 4.
-
 const FOOT_R: f32 = FOOT_R_M as f32;
 /// Collider `user_data`: the walkable plane. Any chassis contact is fatal.
 const HIT_FLOOR: u128 = 1;
@@ -124,6 +123,7 @@ struct Hinge {
     set: f32,
 }
 
+#[derive(Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct LegBodies {
     _coxa: RigidBodyHandle,
@@ -131,6 +131,25 @@ struct LegBodies {
     tibia: RigidBodyHandle,
     foot: ColliderHandle,
     hinges: [Hinge; 3],
+}
+
+/// Authored robot/course world handed to Nexus before it builds GPU buffers.
+/// Handles remain valid in the Rapier world stored by `NexusState`, while the
+/// collider slots make contact readback independent of arena internals.
+#[cfg(feature = "nexus-gpu")]
+pub(crate) struct NexusScene {
+    pub world: PhysicsWorld,
+    pub n: usize,
+    pub chassis: RigidBodyHandle,
+    pub chassis_collider_slot: u32,
+    pub foot_collider_slots: [u32; MAX_LEGS],
+    pub joint_link_slots: [[u32; 3]; MAX_LEGS],
+    pub joint_parents: [[RigidBodyHandle; 3]; MAX_LEGS],
+    pub joint_children: [[RigidBodyHandle; 3]; MAX_LEGS],
+    /// Joint-frame rotations as `[x, y, z, w]` quaternions.
+    pub joint_frame1: [[[f32; 4]; 3]; MAX_LEGS],
+    pub joint_frame2: [[[f32; 4]; 3]; MAX_LEGS],
+    pub neutral: [[f64; 3]; MAX_LEGS],
 }
 
 /// Rapier world for one robot on one course.
@@ -153,6 +172,33 @@ pub struct ArticulatedPlant {
     ccd: CCDSolver,
     integration: IntegrationParameters,
     gravity: Vector,
+}
+
+impl Clone for ArticulatedPlant {
+    fn clone(&self) -> Self {
+        Self {
+            scale: self.scale,
+            n: self.n,
+            chassis: self.chassis,
+            chassis_col: self.chassis_col,
+            legs: self.legs.clone(),
+            bodies: self.bodies.clone(),
+            colliders: self.colliders.clone(),
+            impulse_joints: self.impulse_joints.clone(),
+            multibody_joints: self.multibody_joints.clone(),
+            substeps: self.substeps,
+            // PhysicsPipeline has no state of its own, but deliberately does
+            // not implement Clone. The world state that makes a snapshot
+            // reusable lives in the sets/managers copied around it.
+            pipeline: PhysicsPipeline::new(),
+            islands: self.islands.clone(),
+            broad_phase: self.broad_phase.clone(),
+            narrow_phase: self.narrow_phase.clone(),
+            ccd: self.ccd.clone(),
+            integration: self.integration,
+            gravity: self.gravity,
+        }
+    }
 }
 
 impl ArticulatedPlant {
@@ -511,6 +557,105 @@ impl ArticulatedPlant {
             integration,
             gravity: Vector::new(0.0, -9.81, 0.0),
         }
+    }
+
+    /// Consume the CPU plant and turn its independent leg chains into one
+    /// branched Rapier multibody. Nexus 0.5 can retarget multibody motors at
+    /// runtime; its impulse-joint GPU set is read-only after finalization.
+    #[cfg(feature = "nexus-gpu")]
+    pub(crate) fn into_nexus_scene(self) -> Result<NexusScene, String> {
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut foot_collider_slots = [u32::MAX; MAX_LEGS];
+        let mut joint_parents = [[RigidBodyHandle::invalid(); 3]; MAX_LEGS];
+        let mut joint_children = [[RigidBodyHandle::invalid(); 3]; MAX_LEGS];
+        let mut joint_frame1 = [[[0.0; 4]; 3]; MAX_LEGS];
+        let mut joint_frame2 = [[[0.0; 4]; 3]; MAX_LEGS];
+        let mut neutral = [[0.0; 3]; MAX_LEGS];
+
+        let chassis_collider_slot = self
+            .colliders
+            .iter()
+            .position(|(handle, _)| handle == self.chassis_col)
+            .ok_or_else(|| "Nexus scene lost the chassis collider".to_string())?
+            as u32;
+
+        for i in 0..self.n {
+            let leg = self.legs[i]
+                .as_ref()
+                .ok_or_else(|| format!("Nexus scene lost leg {i}"))?;
+            foot_collider_slots[i] = self
+                .colliders
+                .iter()
+                .position(|(handle, _)| handle == leg.foot)
+                .ok_or_else(|| format!("Nexus scene lost foot collider {i}"))?
+                as u32;
+            for j in 0..3 {
+                let hinge = leg.hinges[j];
+                let source = self
+                    .impulse_joints
+                    .get(hinge.joint)
+                    .ok_or_else(|| format!("Nexus scene lost hinge {i}:{j}"))?;
+                multibody_joints
+                    .insert(hinge.parent, hinge.child, source.data, true)
+                    .ok_or_else(|| format!("could not build Nexus multibody hinge {i}:{j}"))?;
+                joint_parents[i][j] = hinge.parent;
+                joint_children[i][j] = hinge.child;
+                joint_frame1[i][j] = source.data.local_frame1.rotation.to_array();
+                joint_frame2[i][j] = source.data.local_frame2.rotation.to_array();
+                neutral[i][j] = hinge.q0 as f64;
+            }
+        }
+
+        let world = PhysicsWorld {
+            gravity: self.gravity,
+            integration_parameters: self.integration,
+            physics_pipeline: self.pipeline,
+            islands: self.islands,
+            broad_phase: self.broad_phase,
+            narrow_phase: self.narrow_phase,
+            bodies: self.bodies,
+            colliders: self.colliders,
+            impulse_joints: ImpulseJointSet::new(),
+            multibody_joints,
+            ccd_solver: self.ccd,
+        };
+
+        // Nexus packs multibody links in Rapier traversal order rather than
+        // rigid-body arena order. Capture the link index for live motor writes.
+        let mut packed = std::collections::HashMap::new();
+        let mut first_link = 0u32;
+        for multibody in world.multibody_joints.multibodies() {
+            for (link_index, link) in multibody.links().enumerate() {
+                packed.insert(
+                    link.rigid_body_handle(),
+                    first_link + link_index as u32,
+                );
+            }
+            first_link += multibody.num_links() as u32;
+        }
+        let mut joint_link_slots = [[u32::MAX; 3]; MAX_LEGS];
+        for i in 0..self.n {
+            for j in 0..3 {
+                joint_link_slots[i][j] = packed
+                    .get(&joint_children[i][j])
+                    .copied()
+                    .ok_or_else(|| format!("Nexus scene did not pack hinge {i}:{j}"))?;
+            }
+        }
+
+        Ok(NexusScene {
+            world,
+            n: self.n,
+            chassis: self.chassis,
+            chassis_collider_slot,
+            foot_collider_slots,
+            joint_link_slots,
+            joint_parents,
+            joint_children,
+            joint_frame1,
+            joint_frame2,
+            neutral,
+        })
     }
 
     /// Drive every hinge toward `q_cmd` with the servo's stall torque as the cap.
