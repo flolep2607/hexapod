@@ -132,10 +132,11 @@ never trained merely because a fixed iteration budget expired. The best actor
 is saved as safetensors with a `.meta` file containing its stage, exact
 observation normalizer, and run configuration.
 
-For `RUN-FLAT`, `--start-speed 0.8 --speed-ramp-steps N` raises the training
-command linearly to 2.0 m/s while evaluation always uses the full stage target.
-Replay, and observation statistics for fresh runs, therefore cover the command
-range instead of starting from an out-of-distribution constant-speed input.
+For `RUN-FLAT`, `--start-speed 0.8 --speed-ramp-steps N` raises the command
+ceiling linearly to 2.0 m/s while parallel environments are deterministically
+stratified from the starting speed through that ceiling. Evaluation always uses
+the full stage target. Replay, and observation statistics for fresh runs,
+therefore cover the command range instead of a single constant-speed input.
 
 `--init` starts a new off-policy fine-tuning run from a saved actor. It freezes
 the checkpoint's observation normalizer, gathers the initial replay with that

@@ -222,7 +222,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         device
     );
     println!(
-        " steps   replay updates   cmd  score   dist  feet    alpha entropy   q      losses (critic/actor)  wall"
+        " steps   replay updates  cmd≤  score   dist  feet    alpha entropy   q      losses (critic/actor)  wall"
     );
 
     if config.init.is_some() {
@@ -258,13 +258,20 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     }
 
     while transitions < config.steps {
-        let training_command = curriculum_speed(
+        let command_ceiling = curriculum_speed(
             stage,
             config.start_speed,
             config.speed_ramp_steps,
             transitions,
         );
-        for (environment, state) in environments.iter_mut().zip(&mut states) {
+        let environment_count = environments.len();
+        for (index, (environment, state)) in environments.iter_mut().zip(&mut states).enumerate() {
+            let training_command = stratified_speed(
+                config.start_speed,
+                command_ceiling,
+                index,
+                environment_count,
+            );
             let observation = environment.set_command(training_command)?;
             state.copy_from_slice(observation);
         }
@@ -370,7 +377,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             println!(
                 "{transitions:>7} {replay_len:>8} {updates:>7} {command:>5.2} {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
                 replay_len = replay.len(),
-                command = training_command,
+                command = command_ceiling,
                 score = evaluation.score,
                 distance = evaluation.distance,
                 support = evaluation.support,
@@ -666,6 +673,14 @@ fn curriculum_speed(stage: Stage, start: f64, ramp_steps: usize, transitions: us
     start + progress * (stage.speed() - start)
 }
 
+fn stratified_speed(start: f64, ceiling: f64, index: usize, count: usize) -> f64 {
+    if count <= 1 {
+        return ceiling;
+    }
+    let fraction = index.min(count - 1) as f64 / (count - 1) as f64;
+    start + fraction * (ceiling - start)
+}
+
 fn print_help() {
     println!(
         "hexapod-sac — native off-policy motor learner\n\n\
@@ -715,5 +730,8 @@ mod tests {
         assert!((curriculum_speed(Stage::RunFlat, 0.8, 100, 50) - 1.4).abs() < 1e-12);
         assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 100), 2.0);
         assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 200), 2.0);
+        assert_eq!(stratified_speed(0.8, 2.0, 0, 16), 0.8);
+        assert_eq!(stratified_speed(0.8, 2.0, 15, 16), 2.0);
+        assert_eq!(stratified_speed(0.8, 2.0, 0, 1), 2.0);
     }
 }
