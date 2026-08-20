@@ -260,6 +260,7 @@ impl SacAgent {
         batch: &JointReplayBatch,
         normalizer: &ObsNorm,
         rng: &mut Rng,
+        update_policy: bool,
     ) -> Result<UpdateStats> {
         let batch_size = batch.rewards.len();
         if batch_size == 0
@@ -322,31 +323,40 @@ impl SacAgent {
         let critic_loss_value = critic_loss.to_vec0::<f32>()?;
         self.critic_optim.backward_step(&critic_loss)?;
 
-        let actor_epsilon = epsilon_tensor(batch_size, self.actions, rng, &self.device)?;
-        let (policy_actions, log_probability) = self.actor.sample(&observations, &actor_epsilon)?;
-        let (policy_q1, policy_q2) = self.critic.forward(&observations, &policy_actions)?;
-        let policy_q = policy_q1.minimum(&policy_q2)?;
-        let actor_loss = log_probability
-            .broadcast_mul(&alpha.detach())?
-            .sub(&policy_q)?
-            .mean_all()?;
-        let actor_loss_value = actor_loss.to_vec0::<f32>()?;
-        self.actor_optim.backward_step(&actor_loss)?;
+        let (actor_loss_value, alpha_loss_value, mean_q) = if update_policy {
+            let actor_epsilon = epsilon_tensor(batch_size, self.actions, rng, &self.device)?;
+            let (policy_actions, log_probability) =
+                self.actor.sample(&observations, &actor_epsilon)?;
+            let (policy_q1, policy_q2) = self.critic.forward(&observations, &policy_actions)?;
+            let policy_q = policy_q1.minimum(&policy_q2)?;
+            let actor_loss = log_probability
+                .broadcast_mul(&alpha.detach())?
+                .sub(&policy_q)?
+                .mean_all()?;
+            let actor_loss_value = actor_loss.to_vec0::<f32>()?;
+            self.actor_optim.backward_step(&actor_loss)?;
 
-        let entropy_error = log_probability
-            .detach()
-            .affine(1.0, -(self.actions as f64))?;
-        let alpha_loss = self
-            .log_alpha
-            .as_tensor()
-            .broadcast_mul(&entropy_error)?
-            .affine(-1.0, 0.0)?
-            .mean_all()?;
-        let alpha_loss_value = alpha_loss.to_vec0::<f32>()?;
-        self.alpha_optim.backward_step(&alpha_loss)?;
+            let entropy_error = log_probability
+                .detach()
+                .affine(1.0, -(self.actions as f64))?;
+            let alpha_loss = self
+                .log_alpha
+                .as_tensor()
+                .broadcast_mul(&entropy_error)?
+                .affine(-1.0, 0.0)?
+                .mean_all()?;
+            let alpha_loss_value = alpha_loss.to_vec0::<f32>()?;
+            self.alpha_optim.backward_step(&alpha_loss)?;
+            (
+                actor_loss_value,
+                alpha_loss_value,
+                policy_q.mean_all()?.to_vec0::<f32>()?,
+            )
+        } else {
+            (0.0, 0.0, q1.minimum(&q2)?.mean_all()?.to_vec0::<f32>()?)
+        };
 
         copy_parameters(&self.critic_vars, &self.target_vars, self.config.tau)?;
-        let mean_q = policy_q.mean_all()?.to_vec0::<f32>()?;
         Ok(UpdateStats {
             critic_loss: critic_loss_value,
             actor_loss: actor_loss_value,
@@ -527,6 +537,52 @@ mod tests {
     }
 
     #[test]
+    fn critic_bootstrap_does_not_move_actor_or_temperature() {
+        let norm = ObsNorm::new(3);
+        let mut rng = Rng::new(6);
+        let mut agent = SacAgent::new(
+            3,
+            2,
+            &Device::Cpu,
+            SacConfig {
+                hidden: 16,
+                ..SacConfig::default()
+            },
+            9,
+        )
+        .expect("agent");
+        let before = agent
+            .action(&[0.3, -0.2, 0.8], &norm, false, &mut rng)
+            .expect("action before");
+        let alpha_before = agent.alpha().expect("alpha before");
+        let mut replay = JointReplay::new(32, 3, 2).expect("replay");
+        for i in 0..32 {
+            let value = i as f64 / 31.0;
+            replay
+                .push(
+                    &[value, -value, 0.5],
+                    &[0.1, -0.1],
+                    -value,
+                    &[value, -value, 0.5],
+                    false,
+                    false,
+                )
+                .expect("transition");
+        }
+        for _ in 0..8 {
+            let batch = replay.sample(16, &mut rng).expect("batch");
+            agent
+                .update(&batch, &norm, &mut rng, false)
+                .expect("critic update");
+        }
+        let after = agent
+            .action(&[0.3, -0.2, 0.8], &norm, false, &mut rng)
+            .expect("action after");
+        assert_eq!(after, before);
+        assert_eq!(agent.alpha().expect("alpha after"), alpha_before);
+    }
+
+    #[test]
     fn sac_update_is_finite_and_changes_the_policy_on_a_toy_continuous_task() {
         let observations = 3;
         let actions = 2;
@@ -561,7 +617,7 @@ mod tests {
         let mut last = None;
         for _ in 0..80 {
             let batch = replay.sample(128, &mut rng).expect("batch");
-            let stats = agent.update(&batch, &norm, &mut rng).expect("update");
+            let stats = agent.update(&batch, &norm, &mut rng, true).expect("update");
             assert!(stats.critic_loss.is_finite());
             assert!(stats.actor_loss.is_finite());
             assert!(stats.alpha.is_finite() && stats.alpha > 0.0);

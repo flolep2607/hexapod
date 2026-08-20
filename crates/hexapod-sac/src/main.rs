@@ -23,6 +23,7 @@ struct TrainConfig {
     warmup_action_std: f64,
     batch_size: usize,
     updates_per_step: f64,
+    policy_warmup_updates: usize,
     eval_interval: usize,
     eval_episodes: usize,
     seed: u64,
@@ -47,6 +48,7 @@ impl TrainConfig {
             warmup_action_std: parse(&args, "--warmup-action-std", 0.05)?,
             batch_size: parse(&args, "--batch", 256)?,
             updates_per_step: parse(&args, "--utd", 1.0)?,
+            policy_warmup_updates: parse(&args, "--policy-warmup-updates", 1_000)?,
             eval_interval: parse(&args, "--eval-interval", 10_000)?,
             eval_episodes: parse(&args, "--eval-episodes", 8)?,
             seed: parse(&args, "--seed", 1)?,
@@ -207,7 +209,12 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             update_budget += config.updates_per_step * take as f64;
             while update_budget >= 1.0 {
                 let batch = replay.sample(config.batch_size, &mut rng)?;
-                last_stats = Some(agent.update(&batch, &normalizer, &mut rng)?);
+                last_stats = Some(agent.update(
+                    &batch,
+                    &normalizer,
+                    &mut rng,
+                    updates >= config.policy_warmup_updates,
+                )?);
                 updates += 1;
                 update_budget -= 1.0;
             }
@@ -381,7 +388,7 @@ fn save_checkpoint(
     }
     agent.save_actor(&config.out)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nwarmup_action_std={:.17}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage=WALK-FLAT\nscore={:.17}\ndistance={:.17}\nseed={}\nobservations={}\nactions={}\nhidden={}\nwarmup_action_std={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
         evaluation.score,
         evaluation.distance,
         config.seed,
@@ -389,6 +396,7 @@ fn save_checkpoint(
         n_act(Frame::new(6)),
         config.hidden,
         config.warmup_action_std,
+        config.policy_warmup_updates,
         normalizer.n,
         join_f64(&normalizer.mean),
         join_f64(&normalizer.m2),
@@ -475,6 +483,7 @@ fn print_help() {
          --warmup-action-std X Gaussian warm-up scale in unit actions (default 0.05)\n\
          --batch N            replay minibatch (default 256)\n\
          --utd X              gradient updates per transition (default 1.0)\n\
+         --policy-warmup-updates N critic-only updates before actor training (default 1000)\n\
          --eval-interval N    held-out evaluation cadence (default 10000)\n\
          --eval-episodes N    held-out episodes (default 8)\n\
          --hidden N           units in each actor/critic layer (default 256)\n\
