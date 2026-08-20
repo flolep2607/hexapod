@@ -524,6 +524,582 @@ impl RapierEnv {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TickState {
+    pos: [f64; 3],
+    yaw: f64,
+    pitch: f64,
+    roll: f64,
+    vel: [f64; 3],
+    avel: [f64; 3],
+    body_v: [f64; 3],
+    q: [[f64; 3]; MAX_LEGS],
+    contact: [bool; MAX_LEGS],
+    support: f64,
+    ride: f64,
+}
+
+/// Result of one motor-policy decision.
+///
+/// A decision advances [`DECIMATION`] physics ticks unless the episode ends
+/// first. `reward` is the change in the episode score, so summing transition
+/// rewards reproduces [`JointRollout::score`] exactly. That keeps replay
+/// targets on a small, stable scale and preserves the ordered-waypoint and
+/// finish bonuses instead of teaching from a different objective than the one
+/// used for evaluation.
+#[derive(Clone, Debug)]
+pub struct JointStep {
+    pub observation: Vec<f64>,
+    pub reward: f64,
+    pub terminated: bool,
+    pub truncated: bool,
+}
+
+/// Contiguous replay sample, stored row-major as `batch × width`.
+#[derive(Clone, Debug)]
+pub struct JointReplayBatch {
+    pub observations: Vec<f32>,
+    pub actions: Vec<f32>,
+    pub rewards: Vec<f32>,
+    pub next_observations: Vec<f32>,
+    /// True MDP termination: falls and completed routes. A value target must
+    /// not bootstrap through this transition.
+    pub terminated: Vec<bool>,
+    /// Time or authored-world limit. Value targets may bootstrap through this
+    /// transition even though collection resets the environment.
+    pub truncated: Vec<bool>,
+    pub observation_width: usize,
+    pub action_width: usize,
+}
+
+/// Deterministic, gradually allocated circular replay buffer.
+///
+/// Storage is structure-of-arrays and contiguous so a sampled batch can move
+/// directly to a tensor backend. Capacity is not allocated up front: choosing
+/// a million-transition replay therefore does not reserve hundreds of
+/// megabytes before the warm-up collector has produced any experience.
+#[derive(Clone, Debug)]
+pub struct JointReplay {
+    capacity: usize,
+    observation_width: usize,
+    action_width: usize,
+    len: usize,
+    write_head: usize,
+    observations: Vec<f32>,
+    actions: Vec<f32>,
+    rewards: Vec<f32>,
+    next_observations: Vec<f32>,
+    terminated: Vec<bool>,
+    truncated: Vec<bool>,
+}
+
+impl JointReplay {
+    pub fn new(
+        capacity: usize,
+        observation_width: usize,
+        action_width: usize,
+    ) -> Result<Self, String> {
+        if capacity == 0 || observation_width == 0 || action_width == 0 {
+            return Err("replay capacity and widths must all be non-zero".into());
+        }
+        Ok(Self {
+            capacity,
+            observation_width,
+            action_width,
+            len: 0,
+            write_head: 0,
+            observations: Vec::new(),
+            actions: Vec::new(),
+            rewards: Vec::new(),
+            next_observations: Vec::new(),
+            terminated: Vec::new(),
+            truncated: Vec::new(),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes currently occupied by transition payloads (not allocator slack).
+    pub fn payload_bytes(&self) -> usize {
+        let floats = self.observations.len()
+            + self.actions.len()
+            + self.rewards.len()
+            + self.next_observations.len();
+        floats * size_of::<f32>()
+            + (self.terminated.len() + self.truncated.len()) * size_of::<bool>()
+    }
+
+    pub fn push(
+        &mut self,
+        observation: &[f64],
+        action: &[f64],
+        reward: f64,
+        next_observation: &[f64],
+        terminated: bool,
+        truncated: bool,
+    ) -> Result<(), String> {
+        if observation.len() != self.observation_width
+            || next_observation.len() != self.observation_width
+            || action.len() != self.action_width
+        {
+            return Err(format!(
+                "replay transition widths state={}/{} action={}/{}, expected state={} action={}",
+                observation.len(),
+                next_observation.len(),
+                action.len(),
+                self.action_width,
+                self.observation_width,
+                self.action_width,
+            ));
+        }
+        if !reward.is_finite()
+            || observation.iter().any(|value| !value.is_finite())
+            || next_observation.iter().any(|value| !value.is_finite())
+            || action.iter().any(|value| !value.is_finite())
+        {
+            return Err("replay transition contains NaN or infinity".into());
+        }
+
+        let slot = self.write_head;
+        if self.len < self.capacity {
+            self.observations
+                .extend(observation.iter().map(|value| *value as f32));
+            self.actions
+                .extend(action.iter().map(|value| *value as f32));
+            self.rewards.push(reward as f32);
+            self.next_observations
+                .extend(next_observation.iter().map(|value| *value as f32));
+            self.terminated.push(terminated);
+            self.truncated.push(truncated);
+            self.len += 1;
+        } else {
+            let obs = slot * self.observation_width;
+            let act = slot * self.action_width;
+            for (target, value) in self.observations[obs..obs + self.observation_width]
+                .iter_mut()
+                .zip(observation)
+            {
+                *target = *value as f32;
+            }
+            for (target, value) in self.next_observations[obs..obs + self.observation_width]
+                .iter_mut()
+                .zip(next_observation)
+            {
+                *target = *value as f32;
+            }
+            for (target, value) in self.actions[act..act + self.action_width]
+                .iter_mut()
+                .zip(action)
+            {
+                *target = *value as f32;
+            }
+            self.rewards[slot] = reward as f32;
+            self.terminated[slot] = terminated;
+            self.truncated[slot] = truncated;
+        }
+        self.write_head = (self.write_head + 1) % self.capacity;
+        Ok(())
+    }
+
+    /// Sample with replacement using the project's seeded, platform-stable
+    /// generator. Sampling is reproducible across worker counts and machines.
+    pub fn sample(&self, batch_size: usize, rng: &mut Rng) -> Result<JointReplayBatch, String> {
+        if batch_size == 0 {
+            return Err("replay batch size must be non-zero".into());
+        }
+        if self.is_empty() {
+            return Err("cannot sample an empty replay buffer".into());
+        }
+        let mut batch = JointReplayBatch {
+            observations: Vec::with_capacity(batch_size * self.observation_width),
+            actions: Vec::with_capacity(batch_size * self.action_width),
+            rewards: Vec::with_capacity(batch_size),
+            next_observations: Vec::with_capacity(batch_size * self.observation_width),
+            terminated: Vec::with_capacity(batch_size),
+            truncated: Vec::with_capacity(batch_size),
+            observation_width: self.observation_width,
+            action_width: self.action_width,
+        };
+        for _ in 0..batch_size {
+            let slot = (rng.next_u64() % self.len as u64) as usize;
+            let obs = slot * self.observation_width;
+            let act = slot * self.action_width;
+            batch
+                .observations
+                .extend_from_slice(&self.observations[obs..obs + self.observation_width]);
+            batch
+                .actions
+                .extend_from_slice(&self.actions[act..act + self.action_width]);
+            batch.rewards.push(self.rewards[slot]);
+            batch
+                .next_observations
+                .extend_from_slice(&self.next_observations[obs..obs + self.observation_width]);
+            batch.terminated.push(self.terminated[slot]);
+            batch.truncated.push(self.truncated[slot]);
+        }
+        Ok(batch)
+    }
+}
+
+/// Reusable step-wise Rapier environment for replay-based RL.
+///
+/// Observations returned here are raw. A learner should update its observation
+/// statistics only from collected training transitions and apply the frozen
+/// transform for evaluation. [`rollout`] does exactly that with [`ObsNorm`].
+/// Actions are joint offsets in radians and are clamped to the same safe range
+/// as the joint policy.
+pub struct JointEnv {
+    frame: Frame,
+    phys: Physics,
+    terrain: Terrain,
+    stage: Stage,
+    initial: RapierEnv,
+    plant: ArticulatedPlant,
+    neutral: [[f64; 3]; MAX_LEGS],
+    start: [f64; 3],
+    stand_y: f64,
+    phase_off: [f64; MAX_LEGS],
+    substeps: usize,
+    cmd: f64,
+    last_q: [[f64; 3]; MAX_LEGS],
+    q_cmd: [[f64; 3]; MAX_LEGS],
+    total: f64,
+    support_sum: f64,
+    air: f64,
+    steps: usize,
+    fell: bool,
+    clock: f64,
+    route: RouteState,
+    finish_time: f64,
+    duty: f64,
+    max_ticks: usize,
+    boundary: bool,
+    observation: Vec<f64>,
+}
+
+impl JointEnv {
+    pub fn new(frame: Frame, phys: &Physics, terrain: Terrain, stage: Stage) -> Self {
+        let initial = RapierEnv::new(frame, phys, &terrain);
+        Self::from_initial(frame, *phys, terrain, stage, initial)
+    }
+
+    fn from_initial(
+        frame: Frame,
+        phys: Physics,
+        terrain: Terrain,
+        stage: Stage,
+        initial: RapierEnv,
+    ) -> Self {
+        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+        let plant = initial.plant.clone();
+        let neutral = initial.neutral;
+        let start = initial.start;
+        let stand_y = initial.stand_y;
+        let mut env = Self {
+            frame,
+            phys,
+            cmd: stage.speed_for(terrain.course),
+            max_ticks: (stage.horizon() / DT) as usize,
+            terrain,
+            stage,
+            initial,
+            substeps: plant.substeps.max(1),
+            last_q: plant.leg_q_all(),
+            plant,
+            neutral,
+            start,
+            stand_y,
+            phase_off: gait.offsets,
+            q_cmd: neutral,
+            total: 0.0,
+            support_sum: 0.0,
+            air: 0.0,
+            steps: 0,
+            fell: false,
+            clock: 0.0,
+            route: RouteState::default(),
+            finish_time: stage.horizon(),
+            duty: frame.legs() as f64,
+            boundary: false,
+            observation: vec![0.0; n_obs(frame)],
+        };
+        env.refresh_observation();
+        env
+    }
+
+    /// Restore the exact warmed initial physics state.
+    pub fn reset(&mut self) -> &[f64] {
+        self.plant = self.initial.plant.clone();
+        self.neutral = self.initial.neutral;
+        self.start = self.initial.start;
+        self.stand_y = self.initial.stand_y;
+        self.substeps = self.plant.substeps.max(1);
+        self.last_q = self.plant.leg_q_all();
+        self.q_cmd = self.neutral;
+        self.total = 0.0;
+        self.support_sum = 0.0;
+        self.air = 0.0;
+        self.steps = 0;
+        self.fell = false;
+        self.clock = 0.0;
+        self.route = RouteState::default();
+        self.finish_time = self.stage.horizon();
+        self.duty = self.frame.legs() as f64;
+        self.boundary = false;
+        self.refresh_observation();
+        &self.observation
+    }
+
+    pub fn state(&self) -> &[f64] {
+        &self.observation
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.terminated() || self.truncated()
+    }
+
+    fn terminated(&self) -> bool {
+        self.fell || self.route.finished
+    }
+
+    fn truncated(&self) -> bool {
+        !self.terminated() && (self.steps >= self.max_ticks || self.boundary)
+    }
+
+    fn sample(&self) -> TickState {
+        let (pos, yaw, pitch, roll) = self.plant.chassis_pose();
+        let vel = self.plant.chassis_vel();
+        let avel = self.plant.chassis_angvel();
+        let q = self.plant.leg_q_all();
+        let contact = self.plant.foot_contacts();
+        let support = self
+            .plant
+            .support_under(pos[0], pos[2], pos[1] + 4.0)
+            .unwrap_or(0.0);
+        TickState {
+            pos,
+            yaw,
+            pitch,
+            roll,
+            vel,
+            avel,
+            body_v: inv_rot_y([vel[0], vel[1], vel[2]], yaw),
+            q,
+            contact,
+            support,
+            ride: pos[1] - support,
+        }
+    }
+
+    fn update_terminal_state(&mut self, tick: &TickState) {
+        if tick.pitch.abs() > 1.0 || tick.roll.abs() > 1.0 || self.plant.chassis_dead(tick.vel) {
+            self.fell = true;
+            return;
+        }
+        let was_finished = self.route.finished;
+        self.route.update(&self.terrain, tick.pos, tick.yaw);
+        if !was_finished && self.route.finished {
+            self.finish_time = self.steps as f64 * DT;
+        }
+        if self.terrain.waypoints.is_empty() && tick.pos[2] > crate::terrain::Z_MAX - 2.0 {
+            self.boundary = true;
+        }
+    }
+
+    fn fill_observation(&mut self, tick: &TickState) {
+        let n = self.frame.legs();
+        let mut w = 0usize;
+        for i in 0..n {
+            for c in 0..3 {
+                self.observation[w] = tick.q[i][c] - self.neutral[i][c];
+                w += 1;
+            }
+        }
+        for i in 0..n {
+            for c in 0..3 {
+                self.observation[w] = (tick.q[i][c] - self.last_q[i][c]) / DT * 0.05;
+                w += 1;
+            }
+        }
+        for i in 0..n {
+            self.observation[w] = if tick.contact[i] { 1.0 } else { 0.0 };
+            w += 1;
+        }
+        self.observation[w] = tick.body_v[0];
+        self.observation[w + 1] = tick.body_v[1];
+        self.observation[w + 2] = tick.body_v[2];
+        self.observation[w + 3] = tick.avel[0];
+        self.observation[w + 4] = tick.avel[1];
+        self.observation[w + 5] = tick.avel[2];
+        self.observation[w + 6] = tick.pitch;
+        self.observation[w + 7] = tick.roll;
+        self.observation[w + 8] = tick.ride - self.stand_y;
+        self.observation[w + 9] = self.route.range;
+        self.observation[w + 10] = self.route.bearing;
+        self.observation[w + 11] = self.cmd;
+        self.observation[w + 12] = jump_required(self.terrain.course);
+        let lips = jump_lip_distances(&self.terrain, tick.pos[2]);
+        self.observation[w + 13] = lips[0];
+        self.observation[w + 14] = lips[1];
+        let scan = w + 15;
+        terrain_scan(
+            &self.terrain,
+            tick.pos,
+            tick.yaw,
+            tick.support,
+            &mut self.observation[scan..scan + N_TERRAIN_SCAN],
+        );
+        let phase = scan + N_TERRAIN_SCAN;
+        for i in 0..n {
+            let ph = (self.clock + self.phase_off[i]) * std::f64::consts::TAU;
+            self.observation[phase + i * 2] = ph.sin();
+            self.observation[phase + i * 2 + 1] = ph.cos();
+        }
+        self.observation[phase + n * 2] = 1.0;
+        debug_assert_eq!(phase + n * 2 + 1, self.observation.len());
+    }
+
+    fn refresh_observation(&mut self) -> TickState {
+        let tick = self.sample();
+        self.update_terminal_state(&tick);
+        self.fill_observation(&tick);
+        tick
+    }
+
+    /// Advance one policy decision using joint offsets in radians.
+    pub fn step(&mut self, action: &[f64]) -> Result<JointStep, String> {
+        let expected = n_act(self.frame);
+        if action.len() != expected {
+            return Err(format!(
+                "joint action width {}, expected {expected}",
+                action.len()
+            ));
+        }
+        if self.is_done() {
+            return Err("cannot step a finished joint episode; reset it first".into());
+        }
+
+        let score_before = self.summary().score;
+        let n = self.frame.legs();
+        for _ in 0..DECIMATION {
+            let tick = self.refresh_observation();
+            if self.is_done() {
+                break;
+            }
+
+            let mut jerk = 0.0;
+            for i in 0..n {
+                for c in 0..3 {
+                    let (lo, hi) = Q_LIMIT[c];
+                    let offset = clamp(action[i * 3 + c], -ACT_RANGE, ACT_RANGE);
+                    let want = clamp(self.neutral[i][c] + offset, lo, hi);
+                    let slew = MAX_JOINT_RATE * DT;
+                    let moved = clamp(want - self.q_cmd[i][c], -slew, slew);
+                    jerk += moved.abs();
+                    self.q_cmd[i][c] += moved;
+                }
+            }
+
+            self.last_q = tick.q;
+            self.plant.drive(&self.q_cmd, &self.phys, DT);
+            for _ in 0..self.substeps {
+                self.plant.step(DT / self.substeps as f64);
+            }
+
+            let down = tick
+                .contact
+                .iter()
+                .take(n)
+                .filter(|contact| **contact)
+                .count();
+            self.duty += (down as f64 - self.duty) * (DT / 0.30);
+            self.support_sum += down as f64;
+            self.air = self.air.max(tick.pos[1] - self.stand_y);
+            let shaped = reward(
+                self.stage,
+                self.cmd,
+                &tick.body_v,
+                tick.pitch,
+                tick.roll,
+                tick.ride,
+                self.stand_y,
+                down,
+                self.duty,
+                n,
+                self.route.bearing,
+            );
+            let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
+            self.total += (shaped - SMOOTH_COST * churn).max(0.0);
+            self.steps += 1;
+            self.clock += DT / 0.5;
+            if self.steps >= self.max_ticks {
+                break;
+            }
+        }
+        self.refresh_observation();
+        let score_after = self.summary().score;
+        Ok(JointStep {
+            observation: self.observation.clone(),
+            reward: score_after - score_before,
+            terminated: self.terminated(),
+            truncated: self.truncated(),
+        })
+    }
+
+    /// Episode metrics at the current state.
+    pub fn summary(&self) -> JointRollout {
+        let (end, _, _, _) = self.plant.chassis_pose();
+        let secs = self.steps as f64 * DT;
+        let route_len = self.terrain.waypoints.len();
+        let waypoint_fraction = if route_len == 0 {
+            1.0
+        } else {
+            self.route.reached as f64 / route_len as f64
+        };
+        let completed = self.route.finished && self.route.reached == route_len;
+        let base_score = self.total * DT / self.stage.horizon().max(1e-6);
+        let mean_support = if self.steps == 0 {
+            0.0
+        } else {
+            self.support_sum / self.steps as f64
+        };
+        let score = episode_score(
+            self.stage,
+            base_score,
+            end[2] - self.start[2],
+            self.cmd,
+            mean_support,
+            self.frame.legs(),
+            waypoint_fraction,
+            completed,
+        );
+        JointRollout {
+            score,
+            distance: end[2] - self.start[2],
+            secs,
+            fell: self.fell,
+            support: mean_support,
+            air: self.air,
+            reached: self.route.reached,
+            finished: self.route.finished,
+            completed,
+            waypoint_fraction,
+            completion_rate: f64::from(u8::from(completed)),
+            finish_time: self.finish_time,
+        }
+    }
+}
+
 /// Run one episode and score it.
 pub fn rollout(
     policy: &JointPolicy,
@@ -544,223 +1120,20 @@ fn rollout_in_env(
     mut norm_sink: Option<&mut ObsNorm>,
     env: RapierEnv,
 ) -> JointRollout {
-    let frame = policy.frame;
-    let n = frame.legs();
-    let no = n_obs(frame);
-    let na = n_act(frame);
-
-    let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
-    // Phase reference only — the same split the hand-written tripod uses for
-    // *which* legs swing together, with nothing about what they should do.
-    let phase_off = gait.offsets;
-    let mut plant = env.plant;
-    let neutral = env.neutral;
-    let substeps = plant.substeps.max(1);
-    let start = env.start;
-    let stand_y = env.stand_y;
-    let cmd = stage.speed_for(terrain.course);
-
-    let mut obs = vec![0.0; no];
-    let mut act = vec![0.0; na];
-    let mut last_q = plant.leg_q_all();
-    // The command is stateful: it slews from wherever it is, starting from
-    // standing, so the first tick cannot snap the legs anywhere.
-    let mut q_cmd = neutral;
-    let mut total = 0.0;
-    let mut support_sum = 0.0;
-    let mut air = 0.0f64;
-    let mut steps = 0usize;
-    let mut fell = false;
-    let mut clock = 0.0f64;
-    let mut route = RouteState::default();
-    route.update(terrain, start, 0.0);
-    let mut finish_time = stage.horizon();
-    // Contact averaged over a window, not read off one tick. See `reward`.
-    let mut duty = frame.legs() as f64;
-    let ticks = (stage.horizon() / DT) as usize;
-
-    for tick in 0..ticks {
-        let (pos, yaw, pitch, roll) = plant.chassis_pose();
-        let vel = plant.chassis_vel();
-        let avel = plant.chassis_angvel();
-        let q = plant.leg_q_all();
-        let contact = plant.foot_contacts();
-
-        // A tilt past this is not recoverable by a position-controlled leg and
-        // every later tick is scored on a machine that is already lost.
-        if pitch.abs() > 1.0 || roll.abs() > 1.0 || plant.chassis_dead(vel) {
-            fell = true;
-            break;
+    let mut joint_env = JointEnv::from_initial(policy.frame, *phys, terrain.clone(), stage, env);
+    let mut act = vec![0.0; n_act(policy.frame)];
+    while !joint_env.is_done() {
+        let mut obs = joint_env.state().to_vec();
+        if let Some(sink) = norm_sink.as_deref_mut() {
+            sink.observe(&obs);
         }
-
-        let support = plant
-            .support_under(pos[0], pos[2], pos[1] + 4.0)
-            .unwrap_or(0.0);
-        let ride = pos[1] - support;
-        let body_v = inv_rot_y([vel[0], vel[1], vel[2]], yaw);
-        let was_finished = route.finished;
-        route.update(terrain, pos, yaw);
-        if !was_finished && route.finished {
-            finish_time = tick as f64 * DT;
-        }
-        if route.finished {
-            break;
-        }
-        let (range, bearing) = (route.range, route.bearing);
-
-        let mut w = 0usize;
-        for i in 0..n {
-            for c in 0..3 {
-                obs[w] = q[i][c] - neutral[i][c];
-                w += 1;
-            }
-        }
-        for i in 0..n {
-            for c in 0..3 {
-                obs[w] = (q[i][c] - last_q[i][c]) / DT * 0.05;
-                w += 1;
-            }
-        }
-        for i in 0..n {
-            obs[w] = if contact[i] { 1.0 } else { 0.0 };
-            w += 1;
-        }
-        obs[w] = body_v[0];
-        obs[w + 1] = body_v[1];
-        obs[w + 2] = body_v[2];
-        obs[w + 3] = avel[0];
-        obs[w + 4] = avel[1];
-        obs[w + 5] = avel[2];
-        obs[w + 6] = pitch;
-        obs[w + 7] = roll;
-        obs[w + 8] = ride - stand_y;
-        obs[w + 9] = range;
-        obs[w + 10] = bearing;
-        obs[w + 11] = cmd;
-        // A narrow GAPS trench and the near edge of a JUMP trench can produce
-        // the same local height samples. The task bit removes that alias: the
-        // controller may step the former but must prepare a ballistic crossing
-        // for the latter.
-        obs[w + 12] = jump_required(terrain.course);
-        let lips = jump_lip_distances(terrain, pos[2]);
-        obs[w + 13] = lips[0];
-        obs[w + 14] = lips[1];
-        let scan = w + 15;
-        terrain_scan(
-            terrain,
-            pos,
-            yaw,
-            support,
-            &mut obs[scan..scan + N_TERRAIN_SCAN],
-        );
-        let phase = scan + N_TERRAIN_SCAN;
-        for i in 0..n {
-            let ph = (clock + phase_off[i]) * std::f64::consts::TAU;
-            obs[phase + i * 2] = ph.sin();
-            obs[phase + i * 2 + 1] = ph.cos();
-        }
-        obs[phase + n * 2] = 1.0;
-        debug_assert_eq!(phase + n * 2 + 1, no);
-
-        if tick % DECIMATION == 0 {
-            if let Some(sink) = norm_sink.as_deref_mut() {
-                sink.observe(&obs);
-            }
-            policy.norm.apply(&mut obs);
-            policy.act(&obs, &mut act);
-        }
-
-        let mut jerk = 0.0;
-        for i in 0..n {
-            for c in 0..3 {
-                let (lo, hi) = Q_LIMIT[c];
-                let want = clamp(neutral[i][c] + act[i * 3 + c], lo, hi);
-                let slew = MAX_JOINT_RATE * DT;
-                let moved = clamp(want - q_cmd[i][c], -slew, slew);
-                jerk += moved.abs();
-                q_cmd[i][c] += moved;
-            }
-        }
-
-        last_q = q;
-        plant.drive(&q_cmd, phys, DT);
-        for _ in 0..substeps {
-            plant.step(DT / substeps as f64);
-        }
-
-        let down = contact.iter().take(n).filter(|c| **c).count();
-        // ~0.3 s time constant: long enough to span the flight phase of a
-        // dynamic gait, short enough that sustained flight still reads as
-        // sustained flight.
-        duty += (down as f64 - duty) * (DT / 0.30);
-        support_sum += down as f64;
-        air = air.max(pos[1] - stand_y);
-        let tick = reward(
-            stage, cmd, &body_v, pitch, roll, ride, stand_y, down, duty, n, bearing,
-        );
-        // Normalised by the most the command could have moved this tick, so
-        // the cost does not change meaning when the slew limit or leg count
-        // does.
-        let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
-        total += (tick - SMOOTH_COST * churn).max(0.0);
-        steps += 1;
-        clock += DT / 0.5;
-
-        if terrain.waypoints.is_empty() && pos[2] > crate::terrain::Z_MAX - 2.0 {
-            break;
-        }
+        policy.norm.apply(&mut obs);
+        policy.act(&obs, &mut act);
+        joint_env
+            .step(&act)
+            .expect("policy action always has the environment width");
     }
-
-    let (end, end_yaw, _, _) = plant.chassis_pose();
-    let was_finished = route.finished;
-    route.update(terrain, end, end_yaw);
-    if !was_finished && route.finished {
-        finish_time = steps as f64 * DT;
-    }
-    let secs = steps as f64 * DT;
-    // A fall is scored on the time it survived, not averaged over it: falling
-    // at one second and standing for three must not come out the same.
-    let denom = stage.horizon().max(1e-6);
-    let route_len = terrain.waypoints.len();
-    let waypoint_fraction = if route_len == 0 {
-        1.0
-    } else {
-        route.reached as f64 / route_len as f64
-    };
-    let completed = route.finished && route.reached == route_len;
-    let base_score = total * DT / denom;
-    let mean_support = if steps == 0 {
-        0.0
-    } else {
-        support_sum / steps as f64
-    };
-    // Route completion is lexicographically stronger than tick quality: even
-    // a perfect unfinished rollout cannot outscore a completed one. Ordered
-    // waypoint credit supplies intermediate landmarks on the way there.
-    let score = episode_score(
-        stage,
-        base_score,
-        end[2] - start[2],
-        cmd,
-        mean_support,
-        n,
-        waypoint_fraction,
-        completed,
-    );
-    JointRollout {
-        score,
-        distance: end[2] - start[2],
-        secs,
-        fell,
-        support: mean_support,
-        air,
-        reached: route.reached,
-        finished: route.finished,
-        completed,
-        waypoint_fraction,
-        completion_rate: f64::from(u8::from(completed)),
-        finish_time,
-    }
+    joint_env.summary()
 }
 
 #[cfg(feature = "nexus-gpu")]
@@ -2325,6 +2698,120 @@ mod tests {
         assert_eq!(a.reached, b.reached);
         assert_eq!(a.finished, b.finished);
         assert_eq!(a.completed, b.completed);
+    }
+
+    #[test]
+    fn stepwise_rewards_reproduce_the_evaluated_episode_and_reset_exactly() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let terrain = Terrain::new(Course::Flat, 17);
+        let policy = JointPolicy::seeded(frame, 5);
+        let expected = rollout(&policy, &phys, &terrain, Stage::Stand, None);
+        let mut env = JointEnv::new(frame, &phys, terrain, Stage::Stand);
+        let initial = env.state().to_vec();
+        let mut action = vec![0.0; n_act(frame)];
+        let mut reward_sum = 0.0;
+        let mut final_step = None;
+
+        while !env.is_done() {
+            let mut observation = env.state().to_vec();
+            policy.norm.apply(&mut observation);
+            policy.act(&observation, &mut action);
+            let step = env.step(&action).expect("valid joint action");
+            assert_eq!(step.observation.len(), n_obs(frame));
+            reward_sum += step.reward;
+            final_step = Some(step);
+        }
+
+        let actual = env.summary();
+        let final_step = final_step.expect("episode produced no transition");
+        assert!(final_step.truncated);
+        assert!(!final_step.terminated);
+        assert!((reward_sum - actual.score).abs() < 1e-12);
+        assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+        assert_eq!(actual.distance.to_bits(), expected.distance.to_bits());
+        assert_eq!(actual.secs.to_bits(), expected.secs.to_bits());
+        assert_eq!(actual.support.to_bits(), expected.support.to_bits());
+        assert_eq!(actual.air.to_bits(), expected.air.to_bits());
+
+        let reset = env.reset();
+        assert_eq!(reset.len(), initial.len());
+        for (a, b) in reset.iter().zip(initial) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn stepwise_environment_rejects_malformed_actions_and_steps_after_done() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let mut env = JointEnv::new(frame, &phys, Terrain::new(Course::Flat, 3), Stage::Stand);
+        let err = env.step(&[0.0]).expect_err("short action was accepted");
+        assert!(err.contains("width"), "unhelpful action error: {err}");
+
+        let action = vec![0.0; n_act(frame)];
+        while !env.is_done() {
+            env.step(&action).expect("valid action");
+        }
+        let err = env
+            .step(&action)
+            .expect_err("finished episode accepted another step");
+        assert!(err.contains("reset"), "unhelpful terminal error: {err}");
+    }
+
+    #[test]
+    fn replay_allocates_gradually_overwrites_oldest_and_samples_deterministically() {
+        let mut replay = JointReplay::new(3, 2, 1).expect("replay");
+        assert_eq!(replay.payload_bytes(), 0);
+        for i in 1..=3 {
+            replay
+                .push(
+                    &[i as f64, i as f64 + 0.5],
+                    &[i as f64 * 0.1],
+                    i as f64,
+                    &[i as f64 + 1.0, i as f64 + 1.5],
+                    i == 2,
+                    i == 3,
+                )
+                .expect("transition");
+        }
+        assert_eq!(replay.len(), 3);
+        assert_eq!(replay.payload_bytes(), 3 * (6 * size_of::<f32>() + 2));
+
+        replay
+            .push(&[4.0, 4.5], &[0.4], 4.0, &[5.0, 5.5], false, false)
+            .expect("overwrite");
+        assert_eq!(replay.rewards, vec![4.0, 2.0, 3.0]);
+        assert_eq!(replay.terminated, vec![false, true, false]);
+        assert_eq!(replay.truncated, vec![false, false, true]);
+
+        let mut a_rng = Rng::new(91);
+        let mut b_rng = Rng::new(91);
+        let a = replay.sample(16, &mut a_rng).expect("sample A");
+        let b = replay.sample(16, &mut b_rng).expect("sample B");
+        assert_eq!(a.observations, b.observations);
+        assert_eq!(a.actions, b.actions);
+        assert_eq!(a.rewards, b.rewards);
+        assert_eq!(a.next_observations, b.next_observations);
+        assert_eq!(a.terminated, b.terminated);
+        assert_eq!(a.truncated, b.truncated);
+    }
+
+    #[test]
+    fn replay_refuses_bad_shapes_non_finite_values_and_empty_samples() {
+        assert!(JointReplay::new(0, 2, 1).is_err());
+        let mut replay = JointReplay::new(4, 2, 1).expect("replay");
+        assert!(replay.sample(1, &mut Rng::new(1)).is_err());
+        assert!(
+            replay
+                .push(&[0.0], &[0.0], 0.0, &[0.0, 0.0], false, false)
+                .is_err()
+        );
+        assert!(
+            replay
+                .push(&[0.0, f64::NAN], &[0.0], 0.0, &[0.0, 0.0], false, false)
+                .is_err()
+        );
     }
 
     #[test]
