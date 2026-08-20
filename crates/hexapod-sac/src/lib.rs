@@ -124,6 +124,10 @@ pub struct SacConfig {
     /// deltas small. This scale keeps Q targets around unity.
     pub reward_scale: f64,
     pub initial_alpha: f64,
+    /// Differential-entropy target per motor action. The usual `-1` heuristic
+    /// is too broad in an 18-joint controller; a safe local Gaussian starts
+    /// near -2.5 nats per joint.
+    pub target_entropy_per_action: f64,
 }
 
 impl Default for SacConfig {
@@ -132,11 +136,12 @@ impl Default for SacConfig {
             hidden: 256,
             gamma: 0.99,
             tau: 0.005,
-            actor_lr: 3.0e-4,
+            actor_lr: 3.0e-5,
             critic_lr: 3.0e-4,
             alpha_lr: 3.0e-4,
             reward_scale: 25.0,
-            initial_alpha: 0.01,
+            initial_alpha: 0.001,
+            target_entropy_per_action: -2.5,
         }
     }
 }
@@ -336,9 +341,10 @@ impl SacAgent {
             let actor_loss_value = actor_loss.to_vec0::<f32>()?;
             self.actor_optim.backward_step(&actor_loss)?;
 
-            let entropy_error = log_probability
-                .detach()
-                .affine(1.0, -(self.actions as f64))?;
+            let entropy_error = log_probability.detach().affine(
+                1.0,
+                self.config.target_entropy_per_action * self.actions as f64,
+            )?;
             let alpha_loss = self
                 .log_alpha
                 .as_tensor()
@@ -593,6 +599,9 @@ mod tests {
             SacConfig {
                 hidden: 32,
                 reward_scale: 1.0,
+                actor_lr: 3.0e-4,
+                initial_alpha: 0.01,
+                target_entropy_per_action: -1.0,
                 ..SacConfig::default()
             },
             7,
