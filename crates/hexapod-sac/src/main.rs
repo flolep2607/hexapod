@@ -74,6 +74,20 @@ impl TrainConfig {
             warmup_action_std: parse(&args, "--warmup-action-std", 0.05)?,
             warmup_hold_fraction: parse(&args, "--warmup-hold-fraction", 0.50)?,
             batch_size: parse(&args, "--batch", 256)?,
+            // 1.0 is the textbook choice and the sample-efficient one, but it
+            // asks for far more gradient work than a single GPU can hide behind
+            // collection, so on a wall-clock budget the right value is whatever
+            // fills the overlap and no more. The `#   phases` line finds it:
+            // raise this until `grad` approaches `step`, because the two run
+            // concurrently and the iteration costs the larger of them.
+            //
+            // Measured on twelve cores and one GPU, ROUGH curriculum, 32
+            // environments, batch 4096: at 0.010 the split is step 90% / grad
+            // 60%, and at 0.015 it is 93% / 71% for 3.5% fewer steps per second
+            // and a policy ahead at every checkpoint of a matched-seed pair --
+            // 5.81 m against 5.35 m at three million transitions, and 3.80 m
+            // against 0.34 m at one million. Roughly 0.0195 would saturate the
+            // remaining headroom, untested.
             updates_per_step: parse(&args, "--utd", 1.0)?,
             reduced: args.iter().any(|a| a == "--reduced"),
             curriculum: args.iter().any(|a| a == "--curriculum"),
