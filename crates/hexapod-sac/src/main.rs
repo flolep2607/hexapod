@@ -73,7 +73,7 @@ impl TrainConfig {
             seed: parse(&args, "--seed", 1)?,
             hidden: parse(&args, "--hidden", 256)?,
             actor_lr: parse(&args, "--actor-lr", 3.0e-5)?,
-            reward_scale: parse(&args, "--reward-scale", 5.0)?,
+            reward_scale: parse(&args, "--reward-scale", 1.0)?,
             initial_alpha: parse(&args, "--initial-alpha", 0.001)?,
             target_entropy_per_action: parse(&args, "--target-entropy-per-action", -2.5)?,
             action_prior_cost: parse(&args, "--action-prior-cost", 1.0)?,
@@ -1080,7 +1080,7 @@ fn print_help() {
          --eval-episodes N    held-out episodes (default 8)\n\
          --hidden N           units in each actor/critic layer (default 256)\n\
          --actor-lr X         actor learning rate (default 3e-5)\n\
-         --reward-scale X     Bellman reward scale (default 5)\n\
+         --reward-scale X     Bellman reward scale (default 1)\n\
          --initial-alpha X    initial entropy coefficient (default 0.001)\n\
          --target-entropy-per-action X entropy target per joint (default -2.5)\n\
          --action-prior-cost X normalized quadratic actor prior (default 1)\n\

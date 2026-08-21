@@ -96,9 +96,13 @@ pub const REFERENCE_SPEED: f64 = 2.0;
 /// the route lived in `episode_score`, which drives checkpoint selection and
 /// curriculum promotion and never reaches the gradient.
 ///
-/// At 2.0 the bonus at the bar is 1.0, which is the largest accumulation any
-/// episode can lose by ending early, so arriving is never worse than not.
-pub const FINISH_BONUS: f64 = 2.0;
+/// The dense term is now paid per step rather than per horizon-fraction, so
+/// `gamma` is what bounds the return an early finish gives up: at most
+/// `per_step / (1 - gamma)`, about 30 for a good gait, no matter how long the
+/// clock runs. At 60.0 the bonus at the bar covers that in full and beating
+/// the bar pays double, so arriving is never worse than dawdling and the
+/// bound holds without the constant referring to the horizon.
+pub const FINISH_BONUS: f64 = 60.0;
 
 /// Spread of the terminal reward around the bar, as a fraction of it.
 ///
@@ -1186,8 +1190,14 @@ impl JointEnv {
             let scored_tick = (shaped - SMOOTH_COST * churn).max(0.0);
             self.total += scored_tick;
             let local_support_cost = SUPPORT_DEFICIT_COST * (1.0 - support_gate(self.duty, n));
-            learning_reward +=
-                (scored_tick - local_support_cost) * DT / self.horizon.max(1e-6);
+            // Per-step and O(1) on purpose. Dividing this by the horizon (as
+            // `base_score` still does, because a *score* must compare across
+            // horizons) made each transition worth ~4e-4, so Q converged to
+            // 0.18 and the actor's prior term was the same size as the whole
+            // value range. `gamma` bounds the return at reward/(1-gamma)
+            // regardless of episode length, which is what keeps FINISH_BONUS
+            // comparable without referring to the clock.
+            learning_reward += scored_tick - local_support_cost;
             self.steps += 1;
             self.clock += DT / 0.5;
             if self.steps >= self.max_ticks {
@@ -1207,10 +1217,15 @@ impl JointEnv {
 
     /// Fraction of the terminal bonus an arrival at `secs` earns: 0.5 at the
     /// bar, rising toward 1.0 for a faster one and falling toward 0 for a
-    /// slower. Nothing is paid until the bar exists.
+    /// slower. Half before any bar exists, so the arrival that sets the bar is
+    /// paid the average rate rather than nothing.
     fn promptness(&self, secs: f64) -> f64 {
+        // Half -- "average" -- until a bar exists. Returning zero meant the
+        // first episode ever to arrive was paid nothing for arriving while
+        // still forfeiting the rest of its clock, and that episode is the one
+        // that sets the bar.
         if self.finish_bar <= 0.0 {
-            return 0.0;
+            return 0.5;
         }
         let z = (self.finish_bar - secs) / (FINISH_SPREAD * self.finish_bar);
         1.0 / (1.0 + (-z).exp())
@@ -2975,7 +2990,17 @@ mod tests {
         assert!(final_step.truncated);
         assert!(!final_step.terminated);
         assert!((reward_sum - actual.score).abs() < 1e-12);
-        assert!((learning_reward_sum - actual.score).abs() < 1e-12);
+        // The dense learning reward is deliberately no longer the score: it is
+        // paid per step so Q lands in a range the critic can resolve, while
+        // `score` stays horizon-normalized so checkpoints compare across
+        // horizons. Proportionality is the invariant that survives.
+        let ticks = actual.secs / DT;
+        assert!(
+            (learning_reward_sum * DT / env.horizon() - actual.score).abs() < 1e-9,
+            "learning reward {learning_reward_sum} over {ticks} ticks did not \
+             telescope to score {}",
+            actual.score
+        );
         assert_eq!(actual.score.to_bits(), expected.score.to_bits());
         assert_eq!(actual.distance.to_bits(), expected.distance.to_bits());
         assert_eq!(actual.secs.to_bits(), expected.secs.to_bits());
@@ -3290,20 +3315,25 @@ mod tests {
         let mut env = JointEnv::new(frame, &phys, Terrain::new(Course::Flat, 3), Stage::Gaps);
         env.set_horizon(8.0);
 
-        // The most any episode can bank from per-tick shaping is one horizon's
-        // worth, which is exactly 1.0.
-        let dawdled_forever = 1.0;
+        // The dense term is paid per step, so what an early finish gives up is
+        // bounded by the discounted sum, not by the horizon: at most
+        // per_step/(1-gamma). A good gait banks about 0.15 a tick and
+        // DECIMATION ticks a step, against the 0.99 the trainer discounts at.
+        let dawdled_forever = 0.15 * DECIMATION as f64 / (1.0 - 0.99);
 
-        // No bar yet means no bonus: there is nothing to be half as good as.
-        assert_eq!(env.promptness(4.0), 0.0);
+        // Before a bar exists arriving pays the average rate. Zero here meant
+        // the episode that sets the bar was never paid for setting it.
+        assert_eq!(env.promptness(4.0), 0.5);
 
         env.set_finish_bar(8.0);
-        // Arriving at the bar is half the bonus, and FINISH_BONUS is set so
-        // that half of it covers the largest accumulation an early finish can
-        // give up.
+        // Arriving exactly at the bar covers that bound in full; beating it
+        // pays up to double.
         let at_bar = FINISH_BONUS * env.promptness(8.0);
-        assert!((at_bar - 1.0).abs() < 1e-9, "bonus at the bar was {at_bar}");
-        assert!(at_bar >= dawdled_forever, "arriving must never be worse");
+        assert!(
+            at_bar >= dawdled_forever,
+            "bonus at the bar {at_bar} must cover the {dawdled_forever} an \
+             early finish gives up"
+        );
 
         // Sooner is strictly better, all the way down.
         let mut previous = f64::NEG_INFINITY;

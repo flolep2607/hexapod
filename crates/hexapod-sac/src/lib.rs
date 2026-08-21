@@ -120,8 +120,10 @@ pub struct SacConfig {
     pub actor_lr: f64,
     pub critic_lr: f64,
     pub alpha_lr: f64,
-    /// Episode scores are intentionally O(1), making individual transition
-    /// deltas small. This scale keeps Q targets around unity.
+    /// The dense transition reward is already O(1) per step, so this stays at
+    /// unity. It was 5.0 to compensate for a per-step reward of ~4e-4, which
+    /// it did not: Q still converged to 0.18, where the actor's prior term was
+    /// the same magnitude as the entire value range.
     pub reward_scale: f64,
     pub initial_alpha: f64,
     /// Differential-entropy target per motor action. The usual `-1` heuristic
@@ -142,7 +144,7 @@ impl Default for SacConfig {
             actor_lr: 3.0e-5,
             critic_lr: 3.0e-4,
             alpha_lr: 3.0e-4,
-            reward_scale: 5.0,
+            reward_scale: 1.0,
             initial_alpha: 0.001,
             target_entropy_per_action: -2.5,
             action_prior_cost: 1.0,
