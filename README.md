@@ -819,19 +819,33 @@ observation and action counts — `19 + n` observations, `2n + 7` actions. At
 three pairs every formula reproduces the original hand-built hexapod exactly,
 down to the phase offsets, which is what the tests check.
 
-Same course, same reward, 300 iterations each, all at a fixed 2 kg all-up:
+Same course, same reward, 300 iterations each, all at a fixed 2.3 kg all-up,
+one seed per row:
 
 | legs | swinging leg mass | hand-tuned | learned |
 | ---: | ---: | ---: | ---: |
-| 4 | 648 g (32 %) | **108.5** | 128.6 |
-| 6 | 972 g (49 %) | 58.2 | **121.6** |
-| 8 | 1296 g (65 %) | 35.3 | **111.5** |
-| 10 | 1620 g (81 %) | 4.0 | **90.8** |
+| 4 | 805 g (35 %) | **74.1** | 86.7 |
+| 6 | 1207 g (52 %) | 60.0 | **73.9** |
+| 8 | 1609 g (70 %) | 55.5 | 65.7 |
+| 10 | 2011 g (87 %) | 52.7 | 60.3 |
 
-The hand-tuned column falls off a cliff: 108.5 down to 4.0 as legs are added.
-The reason is the leg-inertia model — at a fixed all-up mass, every leg added is
-another 162 g that has to be swung, and by ten legs four fifths of the robot is
-legs. Without leg mass in the simulator, extra legs would be free stability.
+The mass column is arithmetic and exact. The reward columns are one seed and
+should be read as a direction, not as gaps: run the six-leg row on three seeds
+and the hand-tuned figure is 60.0, 82.6, 88.6 and the learned one 73.9, 95.0,
+96.1. Every row here carries that much spread.
+
+The direction is a steady decline in both columns as legs are added, and it
+used to be a cliff — an earlier version of this table had the hand-tuned column
+going from 108.5 to 4.0. That was mostly the servo. On the old 20 kg·cm default
+the femur could not swing the extra links at all, so the tenth leg was dead
+weight; on the STS3250's 50 kg·cm it can, and the cost of another leg is a
+few points rather than a collapse. The leg-inertia model is still what makes
+adding legs cost anything — without it extra legs would be free stability —
+but how much it costs is a property of the actuator, not of the leg count.
+
+Ten legs is the real ceiling, and it is a mass argument rather than a reward
+one: 2011 g of swinging leg on a 2.3 kg machine leaves 289 g for chassis,
+battery and compute, which is not a robot.
 They are not, and the two features had to land together for either to say
 anything true.
 
@@ -1003,11 +1017,30 @@ Sizing every catalogue servo as a complete robot, on the default 20-minute,
 
 | servo | all-up | needs | stall | battery | mean | endurance | total |
 | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |
-| MG996R | 1.70 kg | 15.0 | 11.0 | 3S 2200 | 3.9 A | — | under-torqued |
-| DS3218MG | 1.79 kg | 15.8 | 20.0 | 3S 2200 | 2.8 A | 38 min | **$371** |
-| LX-16A | 1.65 kg | 14.5 | 17.0 | 3S 2200 | 1.8 A | 59 min | $495 |
-| STS3215 | 1.73 kg | 15.2 | 19.5 | 2S 5000 | 4.6 A | 23 min | $509 |
-| AX-12A | 2.04 kg | 18.0 | 15.3 | 4S 5000 | 4.0 A | — | under-torqued |
+| SG90 | 0.87 kg | 14.1 | 1.8 | 3S 2200 | 3.1 A | 34 min | under-torqued |
+| MG90S | 0.95 | 15.4 | 2.2 | 3S 2200 | 3.8 A | 28 min | under-torqued |
+| MG995 | 1.83 | 29.7 | 10.0 | 3S 2200 | 2.9 A | 36 min | under-torqued |
+| MG996R | 1.70 | 27.5 | 11.0 | 3S 2200 | 4.7 A | 22 min | under-torqued |
+| DS3218MG | 1.79 | 29.0 | 20.0 | 3S 2200 | 3.3 A | 32 min | under-torqued |
+| LX-16A | 1.65 | 26.6 | 17.0 | 3S 2200 | 2.1 A | 51 min | under-torqued |
+| STS3215 | 1.86 | 30.2 | 19.5 | 3S 2200 | 5.9 A | 41 min | under-torqued |
+| AX-12A | 2.04 | 33.0 | 15.3 | 4S 5000 | 4.6 A | 52 min | under-torqued |
+| STS3250 | 2.40 | 38.8 | 50.0 | 4S 5000 | 3.9 A | 62 min | **$1062** |
+
+The STS3250 is not the cheapest viable build, it is the only one. Every other
+entry in the catalogue is under-torqued once the battery it needs is part of
+the mass it has to carry, and that is the whole point of solving the loop
+rather than sizing in one pass: `needs` is almost exactly linear in `all-up`,
+so a servo too weak to carry its own pack cannot be rescued by picking a
+smaller pack.
+
+Note that `needs` here is about twice what `hexapod bom` asks for on the same
+gait — 38.8 kg·cm against 18.5. The two are different models and both are
+honest: `bom` takes static lever arms and multiplies by a 1.5 transient
+allowance, while this one integrates the whole torque trace including the
+inertia of the legs. With the legs at 52% of the machine and a joint that
+slews at 7.87 rad/s, swinging them is not a 50% allowance on a static number.
+Size on the larger figure.
 
 Two things fall out that are easy to miss by hand. Pack voltage is chosen by the
 servo: a 7.4 V bus servo runs straight off 2S and needs **no regulator at all**,
