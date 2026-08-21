@@ -193,6 +193,17 @@ pub struct Physics {
     /// fine. Only the four-second walk separates 3.92 from 2.45.
     pub motor_max: f64,
 
+    /// Ceiling on joint torque the servo can hold indefinitely, newton-metres.
+    ///
+    /// `motor_max` is the peak; this is the continuous rating, and on the
+    /// STS3250 the two differ by a factor of 1.6 — 25 kg-cm measured sustained
+    /// before the overload trip against 40 kg-cm intermittent. The joint-level
+    /// environment drives at this figure and spends `motor_max` only while a
+    /// boost is engaged, so the machine is not asked to hold a torque that
+    /// would trip its own protection. Nothing else reads it: the gait-level
+    /// paths have no boost action to spend and run at `motor_max`.
+    pub motor_sustained: f64,
+
     /// Build the legs as one reduced-coordinate multibody instead of eighteen
     /// maximal-coordinate impulse joints.
     ///
@@ -229,6 +240,8 @@ impl Default for Physics {
             // 40 kg-cm: what the reference tripod actually needs, which is the
             // STS3250's intermittent rating and not its sustained one.
             motor_max: 3.92,
+            // 25 kg-cm, measured sustained before the overload trip.
+            motor_sustained: 2.45,
             reduced: false,
             // Eighteen STS3250 at 74.5 g is 1.34 kg on its own, and the leg
             // structure another 0.31; the rest is chassis, 3S pack and

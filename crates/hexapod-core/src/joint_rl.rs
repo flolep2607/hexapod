@@ -134,21 +134,81 @@ pub const MAX_JOINT_OBS: usize = 3 * MAX_LEGS  // joint angles
     + N_TERRAIN_SCAN                          // forward terrain heights
     + 2 * MAX_LEGS                            // per-leg clock sin, cos
     + 1                                       // bias
-    + 3 * MAX_LEGS; // executed joint setpoints
+    + 3 * MAX_LEGS                            // executed joint setpoints
+    + 2; // boost burst and lockout remaining
 
-pub const MAX_JOINT_ACT: usize = 3 * MAX_LEGS;
+pub const MAX_JOINT_ACT: usize = 3 * MAX_LEGS + 1; // + boost request
+
+/// Longest single boost, seconds.
+///
+/// The servo's own over-current protection trips above 4.85 A for more than
+/// two seconds, so this is the hardware's number rather than a tuning choice.
+pub const BOOST_SECS: f64 = 2.0;
+
+/// Seconds of lockout per second of boost spent.
+///
+/// Two, so a full burst costs four seconds of cooldown — a third of the time
+/// at the boosted ceiling, against the half the bench recommends for sustained
+/// high load. The servo reaches its 70 C thermal cut in eight minutes at 40%
+/// load, and a duty cycle is the only thing that keeps a policy away from it.
+pub const BOOST_COOLDOWN: f64 = 2.0;
+
+/// Longest cooldown, and so the scale the observation is normalised on.
+pub const BOOST_MAX_COOLDOWN: f64 = BOOST_SECS * BOOST_COOLDOWN;
+
+/// The boost budget: seconds spent in the current burst, seconds locked out.
+///
+/// A real servo does not have a boost button; it has protection circuits that
+/// switch it off. This is those circuits, expressed as something a policy can
+/// plan against — spend up to [`BOOST_SECS`] at [`Physics::motor_max`], then
+/// pay twice what you spent at [`Physics::motor_sustained`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Boost {
+    used: f64,
+    cooldown: f64,
+}
+
+impl Boost {
+    /// Advance one control tick. Returns whether the boosted ceiling applies.
+    fn tick(&mut self, requested: bool) -> bool {
+        if self.cooldown > 0.0 {
+            self.cooldown = (self.cooldown - DT).max(0.0);
+            return false;
+        }
+        if requested && self.used < BOOST_SECS {
+            self.used += DT;
+            return true;
+        }
+        // The burst ended, either released or run to the cap. Pay for it.
+        if self.used > 0.0 {
+            self.cooldown = BOOST_COOLDOWN * self.used;
+            self.used = 0.0;
+        }
+        false
+    }
+
+    /// What the policy is told: burst remaining, then lockout remaining, both
+    /// as fractions. A controller cannot ration something it cannot see.
+    fn observation(&self) -> [f64; 2] {
+        [
+            (BOOST_SECS - self.used) / BOOST_SECS,
+            self.cooldown / BOOST_MAX_COOLDOWN,
+        ]
+    }
+}
 
 /// Observation width for `frame`.
 pub fn n_obs(frame: Frame) -> usize {
     let n = frame.legs();
     // 3n angles + 3n rates + n contacts + 2n phase + 3n setpoints, then the
     // body block. Setpoints are appended so legacy observations stay a prefix.
-    12 * n + 3 + 3 + 2 + 1 + 2 + 1 + 1 + 2 + N_TERRAIN_SCAN + 1
+    12 * n + 3 + 3 + 2 + 1 + 2 + 1 + 1 + 2 + N_TERRAIN_SCAN + 1 + 2
 }
 
 /// Action width for `frame`.
 pub fn n_act(frame: Frame) -> usize {
-    3 * frame.legs()
+    // Three joints a leg, plus one request for the servo boost.
+    3 * frame.legs() + 1
 }
 
 /// Parameter count of the network for `frame`.
@@ -846,6 +906,7 @@ pub struct JointEnv {
     /// boundaries: reading it after `plant.step` gave the pre-step value and a
     /// reward that was identically zero.
     last_remaining: f64,
+    boost: Boost,
     max_ticks: usize,
     boundary: bool,
     observation: Vec<f64>,
@@ -877,6 +938,7 @@ impl JointEnv {
             horizon: stage.horizon(),
             finish_bar: 0.0,
             last_remaining: 0.0,
+            boost: Boost::default(),
             terrain,
             stage,
             initial,
@@ -901,6 +963,7 @@ impl JointEnv {
         };
         env.refresh_observation();
         env.last_remaining = env.remaining();
+        env.boost = Boost::default();
         env
     }
 
@@ -922,6 +985,10 @@ impl JointEnv {
         self.route = RouteState::default();
         self.finish_time = self.horizon;
         self.boundary = false;
+        // Before the refresh, not after: the observation carries the boost
+        // budget, so clearing it afterwards leaves the previous episode's
+        // spending in the vector the caller is handed.
+        self.boost = Boost::default();
         self.refresh_observation();
         // After the route exists, so the first tick's progress is measured from
         // the real starting distance rather than from zero.
@@ -1082,7 +1149,11 @@ impl JointEnv {
                 );
             }
         }
-        debug_assert_eq!(setpoints + n * 3, self.observation.len());
+        let boost = setpoints + n * 3;
+        let budget = self.boost.observation();
+        self.observation[boost] = budget[0];
+        self.observation[boost + 1] = budget[1];
+        debug_assert_eq!(boost + 2, self.observation.len());
     }
 
     fn refresh_observation(&mut self) -> TickState {
@@ -1142,8 +1213,16 @@ impl JointEnv {
                 }
             }
 
+            // The servo holds `motor_sustained` all day and `motor_max` only in
+            // bursts, so that is what it is given. A policy that wants the peak
+            // has to ask for it, and pay twice the time it spends.
+            let boosting = self.boost.tick(action[n * 3] > 0.0);
+            let mut driving = self.phys;
+            if !boosting {
+                driving.motor_max = self.phys.motor_sustained;
+            }
             self.last_q = tick.q;
-            self.plant.drive(&self.q_cmd, &self.phys, DT);
+            self.plant.drive(&self.q_cmd, &driving, DT);
             for _ in 0..self.substeps {
                 self.plant.step(DT / self.substeps as f64);
             }
@@ -1502,6 +1581,16 @@ fn rollout_nexus_batch(
                 ep.obs[phase + i * 2 + 1] = ph.cos();
             }
             ep.obs[phase + n * 2] = 1.0;
+            // This path drives every episode from one batched `plant.drive`
+            // with a single `Physics`, so it cannot give each of them its own
+            // torque ceiling and does not try: it runs at `motor_max`
+            // throughout. The budget it reports is therefore honest for what it
+            // is — always full, never locked — but it is a machine whose boost
+            // costs nothing, which only the gait-level learner sees.
+            // `JointEnv` is where the duty cycle is real.
+            let boost = ep.obs.len() - 2;
+            ep.obs[boost] = 1.0;
+            ep.obs[boost + 1] = 0.0;
 
             if tick % DECIMATION == 0 {
                 if collect_norm {
@@ -2795,9 +2884,12 @@ mod tests {
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
         let mut env = JointEnv::new(frame, &phys, terrain, Stage::WalkFlat);
-        let setpoint_start = n_obs(frame) - n_act(frame);
+        // Setpoints are the last block *before* the boost budget, which is two
+        // inputs wide and is not a setpoint.
+        let setpoint_end = n_obs(frame) - 2;
+        let setpoint_start = setpoint_end - 3 * frame.legs();
         assert!(
-            env.state()[setpoint_start..]
+            env.state()[setpoint_start..setpoint_end]
                 .iter()
                 .all(|value| *value == 0.0)
         );
@@ -2805,12 +2897,20 @@ mod tests {
         let step = env
             .step(&vec![ACT_RANGE; n_act(frame)])
             .expect("valid joint action");
-        let setpoints = &step.observation[setpoint_start..];
+        let setpoints = &step.observation[setpoint_start..setpoint_end];
         assert!(setpoints.iter().any(|value| value.abs() > 0.01));
         assert!(setpoints.iter().all(|value| value.abs() <= 1.0));
 
         let reset = env.reset();
-        assert!(reset[setpoint_start..].iter().all(|value| *value == 0.0));
+        assert!(
+            reset[setpoint_start..setpoint_end]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        // And a fresh episode starts with the whole burst available and no
+        // lockout, which is what the two inputs after the setpoints say.
+        assert_eq!(reset[setpoint_end], 1.0, "reset did not restore the boost");
+        assert_eq!(reset[setpoint_end + 1], 0.0, "reset left a cooldown running");
     }
 
     #[test]
@@ -2863,9 +2963,11 @@ mod tests {
     fn the_observation_vector_is_the_width_it_claims() {
         for legs in [4usize, 6, 10] {
             let frame = Frame::new(legs);
-            let expect = 12 * legs + 16 + N_TERRAIN_SCAN;
+            // + 2 for the boost budget it has to ration, and one action to
+            // spend it with.
+            let expect = 12 * legs + 16 + N_TERRAIN_SCAN + 2;
             assert_eq!(n_obs(frame), expect, "{legs} legs");
-            assert_eq!(n_act(frame), 3 * legs);
+            assert_eq!(n_act(frame), 3 * legs + 1);
             assert!(n_obs(frame) <= MAX_JOINT_OBS);
             assert!(n_act(frame) <= MAX_JOINT_ACT);
         }
@@ -3158,6 +3260,74 @@ mod tests {
                 s.score
             );
         }
+    }
+
+    /// The boost is a duty cycle, not a button, and the arithmetic is the
+    /// servo's: two seconds at the peak, then twice what was spent at the
+    /// sustained ceiling before it can be asked for again.
+    #[test]
+    fn the_boost_costs_twice_the_time_it_buys() {
+        let ticks = |secs: f64| (secs / DT).round() as usize;
+
+        // Held past the cap: it cuts out at two seconds and locks out for four.
+        let mut boost = Boost::default();
+        let mut boosted = 0usize;
+        for _ in 0..ticks(2.0) {
+            if boost.tick(true) {
+                boosted += 1;
+            }
+        }
+        assert_eq!(boosted, ticks(2.0), "the full burst was not available");
+        assert!(!boost.tick(true), "boosting continued past the cap");
+        // Read the lockout it just charged rather than counting ticks up to it,
+        // which is off by the tick that ends the burst and the one that ends
+        // the lockout.
+        let charged = boost.observation()[1] * BOOST_MAX_COOLDOWN;
+        assert!(
+            (charged - BOOST_SECS * BOOST_COOLDOWN).abs() < 2.0 * DT,
+            "a full burst charged {charged:.2} s, wanted {:.2}",
+            BOOST_SECS * BOOST_COOLDOWN
+        );
+        // And it really is locked for that long, and does come back after. A
+        // tick either side: `used` accumulates by DT and does not land on 2.0
+        // exactly.
+        let full = ticks(BOOST_SECS * BOOST_COOLDOWN);
+        let mut waited = 0usize;
+        while !boost.tick(true) {
+            waited += 1;
+            assert!(waited <= full + 4, "the boost never came back");
+        }
+        assert!(
+            waited + 4 >= full,
+            "the lockout ended after {waited} ticks, wanted about {full}"
+        );
+
+        // Released early: the cooldown is proportional to what was actually
+        // spent, so short bursts stay affordable.
+        let mut boost = Boost::default();
+        for _ in 0..ticks(0.5) {
+            assert!(boost.tick(true), "half a second was not available");
+        }
+        assert!(!boost.tick(false), "releasing still boosted");
+        let charged = boost.observation()[1] * BOOST_MAX_COOLDOWN;
+        assert!(
+            (charged - 0.5 * BOOST_COOLDOWN).abs() < 2.0 * DT,
+            "half a second charged {charged:.2} s, wanted {:.2}",
+            0.5 * BOOST_COOLDOWN
+        );
+
+        // And the policy can see both halves of the budget it is rationing.
+        let mut boost = Boost::default();
+        assert_eq!(boost.observation(), [1.0, 0.0], "a fresh budget reads wrong");
+        for _ in 0..ticks(1.0) {
+            boost.tick(true);
+        }
+        let [left, cooling] = boost.observation();
+        assert!((left - 0.5).abs() < 2.0 * DT, "half spent read as {left}");
+        assert_eq!(cooling, 0.0, "cooling down while still boosting");
+        boost.tick(false);
+        let [_, cooling] = boost.observation();
+        assert!((cooling - 0.5).abs() < 0.02, "a one-second burst read {cooling}");
     }
 
     #[test]
