@@ -846,7 +846,6 @@ pub struct JointEnv {
     /// boundaries: reading it after `plant.step` gave the pre-step value and a
     /// reward that was identically zero.
     last_remaining: f64,
-    duty: f64,
     max_ticks: usize,
     boundary: bool,
     observation: Vec<f64>,
@@ -897,7 +896,6 @@ impl JointEnv {
             clock: 0.0,
             route: RouteState::default(),
             finish_time: stage.horizon(),
-            duty: frame.legs() as f64,
             boundary: false,
             observation: vec![0.0; n_obs(frame)],
         };
@@ -923,7 +921,6 @@ impl JointEnv {
         self.clock = 0.0;
         self.route = RouteState::default();
         self.finish_time = self.horizon;
-        self.duty = self.frame.legs() as f64;
         self.boundary = false;
         self.refresh_observation();
         // After the route exists, so the first tick's progress is measured from
@@ -1157,7 +1154,6 @@ impl JointEnv {
                 .take(n)
                 .filter(|contact| **contact)
                 .count();
-            self.duty += (down as f64 - self.duty) * (DT / 0.30);
             self.support_sum += down as f64;
             self.air = self.air.max(tick.pos[1] - self.stand_y);
             // Ground closed on this tick, gated by posture on the way forward
@@ -1165,15 +1161,7 @@ impl JointEnv {
             // would let a policy give ground cheaply in a bad attitude and
             // retake it in a good one, which is the oscillation this whole
             // term exists to make worthless.
-            let gate = posture(
-                self.stage,
-                tick.pitch,
-                tick.roll,
-                tick.ride,
-                self.stand_y,
-                self.duty,
-                n,
-            );
+            let gate = posture(tick.pitch, tick.roll, tick.ride, self.stand_y);
             let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
             let moved = progress_tick(closed, gate);
             // `Stand` has no ground to close, so it keeps the per-tick shaping
@@ -1368,7 +1356,6 @@ struct NexusEpisode {
     clock: f64,
     route: RouteState,
     finish_time: f64,
-    duty: f64,
     /// Route distance left as of the previous tick, so the batch path scores
     /// ground closed from the same quantity `JointEnv::remaining` uses.
     last_remaining: f64,
@@ -1430,7 +1417,6 @@ fn rollout_nexus_batch(
             last_remaining: route.range + terrain.route_tail(route.wp),
             route,
             finish_time: stage.horizon(),
-            duty: n as f64,
             active: true,
         });
     }
@@ -1540,14 +1526,13 @@ fn rollout_nexus_batch(
             ep.last_q = state.q;
 
             let down = state.contacts.iter().take(n).filter(|c| **c).count();
-            ep.duty += (down as f64 - ep.duty) * (DT / 0.30);
             ep.support_sum += down as f64;
             ep.air = ep.air.max(state.pos[1] - ep.stand_y);
             let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
             let remaining_now = ep.route.range + terrain.route_tail(ep.route.wp);
             let closed = ep.last_remaining - remaining_now;
             ep.last_remaining = remaining_now;
-            let gate = posture(stage, state.pitch, state.roll, ride, ep.stand_y, ep.duty, n);
+            let gate = posture(state.pitch, state.roll, ride, ep.stand_y);
             let moved = progress_tick(closed, gate);
             ep.total += if stage == Stage::Stand {
                 let shaped = stand_reward(
@@ -1641,10 +1626,9 @@ fn episode_score(
     // and drifting back. Metres closed telescope: the surge and the drift
     // cancel exactly, so there is nothing left to gate.
     //
-    // `support_gate` penalised the episode by mean contact, because the per-tick
-    // curve and this one disagreed. `posture` applies it per tick now, on the
-    // way forward only, and it is the same function -- so applying it again
-    // here would square it.
+    // `support_gate` penalised the episode by mean contact, to stop a policy
+    // with 50 N-m joints from flying the course. The joints are a real servo's
+    // now and cannot, so it is gone from both sides rather than moved.
     // Reaching the target was worth a flat 1.0 however long it took, so a
     // controller that strolled to the finish scored exactly like one that ran.
     // Time to the target is the actual objective, so pay for it: arriving
@@ -1669,27 +1653,21 @@ fn episode_score(
 /// [0, 1]. The only copy: `reward` and the per-tick progress term both call
 /// this, because every objective bug found tonight was two functions that were
 /// supposed to agree and did not.
-fn posture(
-    stage: Stage,
-    pitch: f64,
-    roll: f64,
-    ride: f64,
-    stand_y: f64,
-    duty: f64,
-    legs: usize,
-) -> f64 {
+/// How well the chassis is being carried, in `0..=1`, as a multiplier on the
+/// ground closed while carrying it that way.
+///
+/// Attitude only. There used to be a support term here as well, scaling the
+/// reward by how many feet were down against `0.35 * legs`, because with 50 N-m
+/// of joint torque a policy could hold itself in the air indefinitely and cover
+/// ground faster than any gait. It cannot any more: the ceiling is the servo's,
+/// and the flight envelope at that ceiling does not contain sustained flight.
+/// So the term was paying to prevent something physics already prevents, while
+/// quietly pricing a hurdle clearance -- the one time leaving the ground is the
+/// correct move -- at a fraction of its worth.
+fn posture(pitch: f64, roll: f64, ride: f64, stand_y: f64) -> f64 {
     let level = (-(pitch * pitch + roll * roll) / 0.08).exp();
     let height = (-((ride - stand_y) / 0.18).powi(2)).exp();
-    if stage == Stage::Stand {
-        return level * height;
-    }
-    // Sustained flight earns nothing, but the test is windowed contact, not
-    // this tick's: judging it per tick outlaws the flight phase every dynamic
-    // gait has, and it did.
-    if duty < 0.15 {
-        return 0.0;
-    }
-    level * height * support_gate(duty, legs)
+    level * height
 }
 
 /// Reward for `closed` metres of route with posture worth `gate`.
@@ -1711,11 +1689,6 @@ fn progress_tick(closed: f64, gate: f64) -> f64 {
     } else {
         closed
     }
-}
-
-fn support_gate(support: f64, legs: usize) -> f64 {
-    let target = (0.35 * legs as f64).max(1.0);
-    clamp(support / target, 0.0, 1.0).powi(2)
 }
 
 /// Per-tick reward for [`Stage::Stand`], the one stage with no ground to close.
@@ -3189,15 +3162,18 @@ mod tests {
 
     #[test]
     fn ground_closed_is_the_whole_objective() {
-        let gate = |duty: f64| posture(Stage::Rough, 0.0, 0.0, 0.0, 0.0, duty, 6);
+        // Attitude is the only thing that scales ground closed. Level and at
+        // ride height, tipped, and tipped while sagging.
+        let upright = posture(0.0, 0.0, 0.0, 0.0);
+        let tipped = posture(0.35, 0.20, 0.0, 0.0);
+        let sagged = posture(0.35, 0.20, -0.12, 0.0);
 
         // Covering more ground is never worth less, at any posture.
-        for duty in [0.2, 1.0, 2.1, 3.0, 6.0] {
-            let g = gate(duty);
+        for g in [upright, tipped, sagged] {
             let mut previous = f64::NEG_INFINITY;
             for tenths in 0..40 {
                 let here = progress_tick(tenths as f64 * 0.1, g);
-                assert!(here >= previous, "more ground scored less at duty {duty}");
+                assert!(here >= previous, "more ground scored less at gate {g}");
                 previous = here;
             }
         }
@@ -3205,35 +3181,36 @@ mod tests {
         // Where the ground was covered cannot matter: the terms telescope, so
         // a burst and a steady crawl over the same distance pay the same. This
         // is what `progress_gate` used to have to enforce after the fact.
-        let g = gate(3.0);
-        let steady: f64 = (0..4).map(|_| progress_tick(0.25, g)).sum();
-        let burst = progress_tick(1.0, g) + 3.0 * progress_tick(0.0, g);
+        let steady: f64 = (0..4).map(|_| progress_tick(0.25, upright)).sum();
+        let burst = progress_tick(1.0, upright) + 3.0 * progress_tick(0.0, upright);
         assert!((steady - burst).abs() < 1e-12, "{steady} vs {burst}");
 
         // Going backward costs, and a there-and-back can never come out ahead
         // -- which is why oscillating in place is not a strategy any more.
-        assert!(progress_tick(-0.5, g) < 0.0, "retreat was free");
-        for duty in [0.2, 1.0, 2.1, 3.0] {
-            let g = gate(duty);
+        assert!(progress_tick(-0.5, upright) < 0.0, "retreat was free");
+        for g in [upright, tipped, sagged] {
             let round_trip = progress_tick(0.8, g) + progress_tick(-0.8, g);
-            assert!(round_trip <= 0.0, "oscillation paid {round_trip} at duty {duty}");
+            assert!(round_trip <= 0.0, "oscillation paid {round_trip} at gate {g}");
         }
 
-        // And the property no gate could give while speed was unbounded: for
-        // the same ground covered, better support is always worth strictly
-        // more, and no distance buys the gate back. A flying machine covering
-        // ten times the ground still loses to a tripod here.
-        let flying = progress_tick(10.0, gate(0.5));
-        let tripod = progress_tick(1.0, gate(3.0));
-        assert!(gate(0.5) < gate(3.0), "support gate is not monotone");
+        // For the same ground covered, carrying the chassis properly is worth
+        // strictly more, and no distance buys the gate back.
+        assert!(upright > tipped && tipped > sagged, "posture is not ordered");
         assert!(
-            flying < tripod * 10.0,
-            "flying {flying} was not dominated by a tripod's {tripod} per metre"
+            progress_tick(1.0, tipped) < progress_tick(1.0, upright),
+            "equal ground did not prefer the better attitude"
         );
         assert!(
-            progress_tick(1.0, gate(0.5)) < progress_tick(1.0, gate(3.0)),
-            "equal ground did not prefer the better gait"
+            progress_tick(10.0, sagged) < progress_tick(1.0, upright) * 10.0,
+            "a sagging machine was not dominated per metre"
         );
+
+        // Support is deliberately not gated any more: leaving the ground is how
+        // a hurdle gets cleared, and what stops a policy living up there is the
+        // servo's torque ceiling rather than a term in the reward. There is no
+        // assertion to make about it -- `posture` does not take a contact count
+        // any more, so its signature is the guarantee, and putting one back
+        // would have to change that signature to compile.
     }
 
     #[test]
