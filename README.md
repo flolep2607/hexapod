@@ -385,7 +385,7 @@ because what pays is getting there. `ground_closed_is_the_whole_objective` and
 On units: simulator speeds are **ten times physical**. `chassis_vel` returns
 `to_sim(linvel)`, which divides by `scale = 0.10`, and the legs are
 `0.30 + 0.80 + 1.00 = 1.8` units of a 0.18 m reach. The old 4.0 parkour command
-was 0.4 m/s on a 2 kg machine, about 1.3 body-widths a second — it read as a
+was 0.4 m/s on a 2.3 kg machine, about 1.3 body-widths a second — it read as a
 highway speed and was not one. Route lengths are in the same units: a course is
 about 62 units, so 6.2 physical metres.
 
@@ -945,12 +945,12 @@ vertical axis, so it is sized by traction instead. One function computes this,
 and the simulator, the torque meter and the power model all call it.
 
 ```
-hexapod bom --mass 2.0 --scale 0.10 --iters 200
+hexapod bom --mass 2.3 --scale 0.10 --iters 200
 ```
 
-On the default 2 kg / 28 cm build the hand-tuned gait needs **12.6 kg·cm** and
-the learned one **17.8 kg·cm** — the peak load on a single foot goes from 9.8 N
-to 17.0 N. An earlier version of this file claimed the opposite, that the
+On the default 2.3 kg / 28 cm build the hand-tuned gait needs **13.7 kg·cm** and
+the learned one **18.5 kg·cm** — the peak load on a single foot goes from 11.3 N
+to 22.5 N. An earlier version of this file claimed the opposite, that the
 learned gait was cheaper to build as well as better at walking; that was true of
 the old kinematic simulator and is not true now. Dropping the duty factor to run
 fast means fewer feet on the ground at the moment of peak load, and somebody has

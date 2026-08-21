@@ -138,7 +138,18 @@ fn main() {
         "eval-all" => eval_all(seed, cfg, phys, &args),
         "speed" => speed(frame, course, seed, iters, cfg, phys),
         "jump" => jump(frame, seed, iters, cfg, phys),
-        "servo" => servo_shootout(frame, course, seed, iters, cfg, build),
+        "servo" => servo_shootout(
+            frame,
+            course,
+            seed,
+            iters,
+            cfg,
+            build,
+            flag(&args, "--seeds")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3usize)
+                .max(1),
+        ),
         "servos" => servos_json(),
         "parts" => parts_json(),
         "courses" => courses_json(),
@@ -1023,6 +1034,15 @@ fn jump(frame: Frame, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
 ///
 /// The servo is not a post-hoc sizing decision any more: its torque-speed line
 /// drives the joints, so it changes what the optimiser converges to.
+/// Train the same course once per servo, over several seeds.
+///
+/// Several, not one, because one is not a measurement. On a single seed the
+/// spread between servos here is about nine points of reward and the spread
+/// between seeds for the *same* servo is twenty-five, so a one-seed table
+/// invites a conclusion its own noise cannot support -- it once read as the
+/// strongest servo in the catalogue being the worst to walk on. The columns
+/// that survive averaging are the ones worth reading: peak load against
+/// rating, and cost of transport.
 fn servo_shootout(
     frame: Frame,
     course: Course,
@@ -1030,51 +1050,65 @@ fn servo_shootout(
     iters: usize,
     cfg: ArsConfig,
     build: Build,
+    seeds: usize,
 ) {
-    let terrain = Terrain::new(course, seed);
     println!(
-        "{} seed {}, {iters} iterations per servo, {:.2} kg at scale {:.3}\n",
+        "{} seeds {}-{}, {iters} iterations per servo, {:.2} kg at scale {:.3}\n",
         course.name(),
         seed,
+        seed + seeds as u64 - 1,
         build.mass_kg,
         build.scale
     );
     println!(
-        "{:<11} {:>7} {:>8} {:>9} {:>9} {:>8} {:>7} {:>7} {:>6}",
-        "servo", "kg-cm", "rpm", "base rwd", "best rwd", "peak/stall", "cycle", "duty", "CoT"
+        "{:<11} {:>7} {:>6} {:>9} {:>9} {:>7} {:>11} {:>7} {:>6}",
+        "servo", "kg-cm", "rpm", "base rwd", "best rwd", "range", "peak/stall", "worst", "CoT"
     );
+
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    let range = |v: &[f64]| {
+        v.iter().copied().fold(f64::MIN, f64::max) - v.iter().copied().fold(f64::MAX, f64::min)
+    };
 
     for servo in SERVOS.iter() {
         let phys = build.physics(Some(servo));
-        let mut t = Trainer::new(
-            Policy::seeded(Preset::default_for(frame), frame),
-            cfg,
-            phys,
-            seed ^ 0xA5A5,
-        );
-        t.record_baseline(&terrain);
-        for _ in 0..iters {
-            t.iterate(&terrain);
+        let (mut base, mut best, mut load, mut cot) = (vec![], vec![], vec![], vec![]);
+        for k in 0..seeds as u64 {
+            let terrain = Terrain::new(course, seed + k);
+            let mut t = Trainer::new(
+                Policy::seeded(Preset::default_for(frame), frame),
+                cfg,
+                phys,
+                (seed + k) ^ 0xA5A5,
+            );
+            t.record_baseline(&terrain);
+            for _ in 0..iters {
+                t.iterate(&terrain);
+            }
+            let e = evaluate(&terrain, &t.best_policy(), &phys, cfg.horizon);
+            base.push(t.baseline_reward);
+            best.push(t.best_reward);
+            load.push(e.peak_servo_load);
+            cot.push(e.cot);
         }
-        let best = t.best_policy();
-        let g = best.gait();
-        let e = evaluate(&terrain, &best, &phys, cfg.horizon);
         println!(
-            "{:<11} {:>7.1} {:>8.0} {:>9.2} {:>9.2} {:>9.2}x {:>7.3} {:>7.3} {:>6.2}",
+            "{:<11} {:>7.1} {:>6.0} {:>9.2} {:>9.2} {:>6.1} {:>10.2}x {:>6.2}x {:>6.2}",
             servo.part,
             servo.stall_kgcm,
             phys.actuator.omega_max * 60.0 / std::f64::consts::TAU,
-            t.baseline_reward,
-            t.best_reward,
-            e.peak_servo_load,
-            g.cycle,
-            g.duty,
-            e.cot
+            mean(&base),
+            mean(&best),
+            range(&best),
+            mean(&load),
+            load.iter().copied().fold(f64::MIN, f64::max),
+            mean(&cot)
         );
     }
     println!(
-        "\npeak/stall above 1.00 means the servo was driven past its rating and\n\
-         the leg gave way under load."
+        "\npeak/stall above 1.00 means the servo was driven past its rating and the\n\
+         leg gave way under load. `worst` is the highest of the {seeds} seeds, which is\n\
+         the number that sizes a build; `range` is the spread of `best rwd` across\n\
+         them, and any reward gap smaller than it is not a result."
     );
 }
 

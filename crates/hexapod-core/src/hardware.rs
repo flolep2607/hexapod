@@ -22,7 +22,7 @@
 //! distributor prices are kept apart because they routinely differ by 3-5x for
 //! the same part. Verify before ordering.
 
-use crate::dynamics::{joint_torques, Actuator, Physics};
+use crate::dynamics::{joint_torques, Actuator, LegMass, Physics};
 use crate::robot::{fk_body, MAX_LEGS};
 use crate::sim::Sim;
 
@@ -67,6 +67,13 @@ impl Build {
     /// This is the join between the two halves of the project: the servo you
     /// are costing is the servo the simulator runs on, at this build's mass
     /// and scale.
+    ///
+    /// Both halves of it. A servo's torque-speed line and a servo's *weight*
+    /// are the same choice, and the legs are half the machine — taking the
+    /// line but leaving the default leg mass simulated a 9 g SG90 swinging
+    /// links built around a 74.5 g one, which loaded it with inertia it would
+    /// never carry and made the comparison between catalogue entries unfair in
+    /// the heavy servo's favour.
     pub fn physics(&self, servo: Option<&Servo>) -> Physics {
         Physics {
             mass_kg: self.mass_kg,
@@ -75,6 +82,10 @@ impl Build {
             actuator: match servo {
                 Some(s) => s.actuator(),
                 None => Actuator::default(),
+            },
+            leg: match servo {
+                Some(s) => LegMass::from_servo(s.mass_g / 1000.0),
+                None => Physics::default().leg,
             },
             ..Physics::default()
         }
