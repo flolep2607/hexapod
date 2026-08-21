@@ -2071,6 +2071,76 @@ mod tests {
         );
     }
 
+    /// Reporting probe: can the hand-tuned tripod actually be run at a given
+    /// joint torque ceiling, and what gains does it need?
+    ///
+    /// Standing is the easy half. This walks the reference gait for four
+    /// seconds and reports where the deck ends up, which is what the torque
+    /// ceiling and the motor gains have to be calibrated against together.
+    #[test]
+    #[ignore]
+    fn zzz_walking_torque_report() {
+        let frame = Frame::new(6);
+        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
+        gait.cycle = walk_cycle(frame, &gait);
+        let terrain = Terrain::new(Course::Flat, 1);
+        let q0 = standing_q(frame, &gait);
+        for (torque, damp, stiff) in [
+            (50.0, 8.0e3, 5.0e6),
+            // Hold the god-motor gains and move only the ceiling.
+            (25.0, 8.0e3, 5.0e6),
+            (12.0, 8.0e3, 5.0e6),
+            (8.00, 8.0e3, 5.0e6),
+            (4.90, 8.0e3, 5.0e6),
+            (3.92, 8.0e3, 5.0e6),
+            (2.45, 8.0e3, 5.0e6),
+            (1.57, 8.0e3, 5.0e6),
+        ] {
+            let mut phys = Physics::default();
+            phys.motor_max = torque;
+            phys.motor_damp = damp;
+            phys.motor_stiff = stiff;
+
+            let mut stand = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            hold(&mut stand, &q0, &phys, 5.0);
+            let stood = stand.chassis_y();
+
+            let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            let mut phase = 0.0;
+            let ticks = (4.0 / crate::sim::DT) as usize;
+            for _ in 0..ticks {
+                drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
+                phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
+            }
+            // How far the worst joint travels against a 0.30 rad step. A
+            // small number here means the position loop cannot follow a
+            // command at all, which standing still does not reveal.
+            let mut travel = f32::MAX;
+            for leg in 0..6 {
+                for j in 0..3 {
+                    let mut pl = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+                    let rel = |q: &ArticulatedPlant| {
+                        let l = q.legs[leg].as_ref().unwrap();
+                        let c = [l._coxa, l._femur, l.tibia][j];
+                        q.bodies[l.hinges[j].parent].rotation().inverse() * *q.bodies[c].rotation()
+                    };
+                    let before = rel(&pl);
+                    let mut cmd = q0;
+                    cmd[leg][j] += 0.30;
+                    hold(&mut pl, &cmd, &phys, 3.0);
+                    let (_, ang) = (rel(&pl) * before.inverse()).to_axis_angle();
+                    travel = travel.min(ang.abs());
+                }
+            }
+            eprintln!(
+                "max {torque:5.2} damp {damp:7.1} stiff {stiff:9.1}  stand5s {stood:.4}  \
+                 travel {travel:.4}/0.30  walk4s y {:.4} z {:.4}",
+                plant.chassis_y(),
+                plant.chassis_z()
+            );
+        }
+    }
+
     /// A wall beside the machine, not in front of it. Swing used to be projected
     /// onto the face (`push_xz`) so the tibia spent the whole step kicking it.
     #[test]

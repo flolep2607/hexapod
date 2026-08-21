@@ -51,7 +51,9 @@ impl Default for Build {
     fn default() -> Self {
         Build {
             scale: 0.10,
-            mass_kg: 2.0,
+            // Same all-up mass as `Physics::default`; the two must agree or the
+            // servo is being costed against a robot the simulator is not running.
+            mass_kg: 2.3,
             dynamic_factor: 1.5,
             traction_ratio: 0.30,
             safety: 1.35,
@@ -456,6 +458,38 @@ pub const SERVOS: &[Servo] = &[
         source: "https://www.robotis.us/dynamixel-ax-12a/",
         provenance: Provenance::Vendor,
         note: "What the PhantomX hexapod runs. Rated (not stall) torque is ~0.2 N-m.",
+    },
+    Servo {
+        part: "STS3250",
+        maker: "Feetech",
+        // Stall, which is where the torque-speed line crosses zero speed and so
+        // the right number for `actuator()`. It is NOT what the joint can hold:
+        // a bench run measured 48 kg-cm for a split second, 25 kg-cm sustained
+        // before the overload trip, against a manufacturer rated figure of 16.
+        // Feetech trips over-current above 4.85 A for 2 s, overload above 80% of
+        // stall for 2.5 s, and disables torque at 70 C -- which a 40% load
+        // reaches in eight minutes at 3.75 C/min. Size a walk on 25 kg-cm.
+        stall_kgcm: 50.0,
+        at_volts: 12.0,
+        speed_s60: 0.133,
+        mass_g: 74.5,
+        stall_amps: 4.2,
+        noload_amps: 0.28,
+        // Not published; every other figure here is off the manufacturer table.
+        idle_amps: 0.01,
+        elec_checked: true,
+        bus: Bus::Serial,
+        metal_gear: true,
+        feedback: true,
+        market_usd: (45.50, 48.70),
+        vendor_usd: Some(45.50),
+        vendor_name: "Shenzhen Feite on Alibaba",
+        source: "https://www.alibaba.com/product-detail/FEETECH-STS3250-12V-50KG-Double-Shaft_1601527075848.html",
+        provenance: Provenance::Vendor,
+        note: "ST-3250-C001. 12-bit encoder, 1:345, 45.2x24.7x35 mm, 25T, 0.43 deg \
+               backlash, 91 N-m/rad torsional. 18 stalling together draw 75.6 A at \
+               12 V; the rated-current budget is 25.2 A. C001 is coreless, C002 \
+               carbon-brush -- not the same part. Feetech spec 2024-01-16 ed. A/0.",
     },
 ];
 

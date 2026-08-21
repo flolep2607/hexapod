@@ -65,9 +65,12 @@ pub struct Actuator {
 }
 
 impl Default for Actuator {
-    /// A generic 20 kg-cm metal-gear digital servo: 0.16 s/60 deg, 1.96 N-m.
+    /// The Feetech STS3250 the build is costed on: 0.133 s/60 deg, 50 kg-cm,
+    /// so 7.87 rad/s no-load and 4.90 N-m at stall. Stall is the right
+    /// intercept for a torque-speed line even though the joint cannot hold it
+    /// -- see `motor_max` for what it can.
     fn default() -> Self {
-        Actuator::from_rating(0.16, 20.0)
+        Actuator::from_rating(0.133, 50.0)
     }
 }
 
@@ -159,10 +162,35 @@ pub struct Physics {
     /// Foot-on-ground friction. Was pinned at a 1.15 floor.
     pub foot_mu: f64,
 
-    /// Ceiling on joint force, simulator units. Not a servo rating — there is
-    /// no torque-speed line, no stall derating and no backdrive any more. It
-    /// exists because an unbounded motor lets the solver inject unbounded
-    /// energy: uncapped, a tripod gait launches the machine kilometres.
+    /// Ceiling on joint torque, newton-metres. There is no torque-speed line
+    /// here, no stall derating and no backdrive: the articulated plant gets one
+    /// hard cap, and it needs one, because an unbounded motor lets the solver
+    /// inject unbounded energy — uncapped, a tripod gait launches the machine
+    /// kilometres.
+    ///
+    /// The number is a servo rating now, which it was not before, and it is the
+    /// *intermittent* one. Sweeping the ceiling alone at these gains, four
+    /// seconds of the reference tripod (`plant::tests::zzz_walking_torque_report`)
+    /// puts the deck at 1.13 m and travels 0.69 m at 3.92 N-m, and at 0.20 m
+    /// having gone nowhere at 2.45 — a cliff between the two, not a slope.
+    ///
+    /// 3.92 N-m is 40 kg-cm, which a bench run on the STS3250 calls its
+    /// intermittent limit; its *sustained* limit is 25 kg-cm, or 2.45 N-m,
+    /// where the gait collapses. The machine therefore walks on a duty cycle it
+    /// cannot hold indefinitely — 40% load reaches the 70 C thermal cut in
+    /// eight minutes — and closing that gap is a policy problem, not a bigger
+    /// number: either a cheaper gait than the hand-tuned tripod, or a torque
+    /// budget the controller spends and lets recover.
+    ///
+    /// 3.92 N-m is also the most the part will actually deliver: its overload
+    /// protection trips above 80% of the 50 kg-cm stall, so a controller asking
+    /// for stall gets a servo that switches itself off.
+    ///
+    /// Judge a change here on the walk, never on the stand. Standing is
+    /// insensitive — the deck holds 0.87 m at every ceiling from 1.57 N-m up —
+    /// and so is a single-joint step, which stalls below 12 N-m on the one case
+    /// of turning a coxa under a loaded planted foot even where the gait walks
+    /// fine. Only the four-second walk separates 3.92 from 2.45.
     pub motor_max: f64,
 
     /// Build the legs as one reduced-coordinate multibody instead of eighteen
@@ -198,13 +226,19 @@ impl Default for Physics {
             solver_iters: 8,
             pgs_iters: 4,
             foot_mu: 1.15,
-            motor_max: 50.0,
+            // 40 kg-cm: what the reference tripod actually needs, which is the
+            // STS3250's intermittent rating and not its sustained one.
+            motor_max: 3.92,
             reduced: false,
-            mass_kg: 2.0,
+            // Eighteen STS3250 at 74.5 g is 1.34 kg on its own, and the leg
+            // structure another 0.31; the rest is chassis, 3S pack and
+            // controller. Raising this raises the torque bill it has to pay
+            // for, which is the point of costing the two together.
+            mass_kg: 2.3,
             scale: 0.10,
             // Rubber foot on dry board. Loose ground scales this down.
             mu: 0.85,
-            leg: LegMass::from_servo(0.060),
+            leg: LegMass::from_servo(0.0745),
             dynamic: 1.5,
             actuator: Actuator::default(),
         }

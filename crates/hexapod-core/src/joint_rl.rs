@@ -53,7 +53,8 @@ pub const ACT_RANGE: f64 = 0.40;
 /// first: chassis 1.5-2.5 m in the air, 0.3 of six feet down on average, and
 /// walking scored 0.454 at the seed falling to 0.017 in twenty-four iterations.
 /// A real controller slews its setpoint; so does this one.
-pub const MAX_JOINT_RATE: f64 = 6.0;
+/// No-load rate of the STS3250: 0.133 s/60 deg.
+pub const MAX_JOINT_RATE: f64 = 7.87;
 
 
 /// Weight on the terminal reward for reaching the target.

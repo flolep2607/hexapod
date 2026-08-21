@@ -527,7 +527,11 @@ mod tests {
         let terrain = Terrain::new(Course::Mixed, 5);
         let mut t = trainer(0xC0FFEE);
         t.record_baseline(&terrain);
-        for _ in 0..60 {
+        // 120, not 60: on the STS3250's torque-speed line the hand-tuned tripod
+        // already scores 85.99 here, and random search needs about a hundred
+        // iterations to beat a baseline that good. Measured on this seed it
+        // reaches 86.53 by 100, 88.21 by 120 and 90.22 by 200.
+        for _ in 0..120 {
             t.iterate(&terrain);
         }
         assert!(
