@@ -116,13 +116,6 @@ pub const FINISH_SPREAD: f64 = 0.30;
 /// look like it is tracking a speed while being useless on a real machine.
 pub const SMOOTH_COST: f64 = 0.08;
 
-/// Episode cost for abandoning supported locomotion. A progress-only learner
-/// otherwise finds that throwing the chassis forward on one foot is easier
-/// than coordinating six legs: the first SAC pilot travelled 1.59 m while
-/// averaging only 0.72 feet down. Proper support pays no cost; sustained
-/// flight or belly-sliding pays the full amount.
-pub const SUPPORT_DEFICIT_COST: f64 = 0.25;
-
 /// Physics ticks per policy decision. The plant still runs at its own rate;
 /// the policy is asked once every this many ticks and its command is held in
 /// between.
@@ -1189,7 +1182,6 @@ impl JointEnv {
             let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
             let scored_tick = (shaped - SMOOTH_COST * churn).max(0.0);
             self.total += scored_tick;
-            let local_support_cost = SUPPORT_DEFICIT_COST * (1.0 - support_gate(self.duty, n));
             // Per-step and O(1) on purpose. Dividing this by the horizon (as
             // `base_score` still does, because a *score* must compare across
             // horizons) made each transition worth ~4e-4, so Q converged to
@@ -1197,7 +1189,7 @@ impl JointEnv {
             // value range. `gamma` bounds the return at reward/(1-gamma)
             // regardless of episode length, which is what keeps FINISH_BONUS
             // comparable without referring to the clock.
-            learning_reward += scored_tick - local_support_cost;
+            learning_reward += scored_tick;
             self.steps += 1;
             self.clock += DT / 0.5;
             if self.steps >= self.max_ticks {
@@ -1244,10 +1236,9 @@ impl JointEnv {
         let completed = self.route.finished && self.route.reached == route_len;
         let base_score = self.total * DT / self.horizon.max(1e-6);
         let mean_support = if self.steps == 0 {
-            // The environment is constructed from a warmed standing plant.
-            // Treating its pre-step support as zero made locomotion episodes
-            // start at -SUPPORT_DEFICIT_COST, so transition rewards no longer
-            // telescoped to the reported episode score.
+            // The environment is constructed from a warmed standing plant, so
+            // its pre-step support is every foot, not none. Reading it as zero
+            // opened a fresh episode on a fully closed support gate.
             self.frame.legs() as f64
         } else {
             self.support_sum / self.steps as f64
@@ -1632,10 +1623,14 @@ fn episode_score(
     } else {
         0.0
     };
-    base_score * progress_gate * support_gate
-        + 0.35 * waypoint_fraction
-        + promptness
-        - SUPPORT_DEFICIT_COST * (1.0 - support_gate)
+    // Support is *only* ever a multiplier, never a subtraction. `reward` already
+    // gates every tick by `enough_feet`, so subtracting a deficit on top of
+    // that double-counted it -- and it was the one term that could drive a
+    // score, or a transition reward, below zero. A negative per-step reward
+    // makes falling over an escape from further penalty, because `terminated`
+    // cuts the bootstrap: the first run with a gradient strong enough to
+    // optimise anything went to 0.60 feet of six and scored -0.229.
+    base_score * progress_gate * support_gate + 0.35 * waypoint_fraction + promptness
 }
 
 fn support_gate(support: f64, legs: usize) -> f64 {
@@ -3042,13 +3037,38 @@ mod tests {
         );
     }
 
+    /// Support is a multiplier everywhere and a subtraction nowhere, so no
+    /// amount of speed buys back a projectile trajectory and no episode can
+    /// earn a negative reward for trying one.
     #[test]
-    fn dense_support_cost_separates_a_tripod_gait_from_a_projectile() {
+    fn support_gates_a_projectile_without_ever_paying_a_negative_reward() {
         assert_eq!(support_gate(3.0, 6), 1.0);
         assert!(support_gate(2.0, 6) > 0.8);
         assert!(support_gate(0.5, 6) < 0.1);
-        let projectile_cost = SUPPORT_DEFICIT_COST * (1.0 - support_gate(0.5, 6));
-        assert!(projectile_cost > 0.9 * SUPPORT_DEFICIT_COST);
+
+        // Unbounded speed cannot outrun the gate: a hexapod on half a foot
+        // going ten times as fast still scores below a tripod at walking pace.
+        let tick = |speed: f64, duty: f64| {
+            reward(
+                Stage::Rough, &[0.0, 0.0, speed], 0.0, 0.0, 0.0, 0.0,
+                duty.round() as usize, duty, 6, 0.0,
+            )
+        };
+        let projectile = tick(20.0, 0.5);
+        let tripod = tick(2.0, 3.0);
+        assert!(
+            projectile < tripod,
+            "a projectile at 10x the speed scored {projectile} against {tripod}"
+        );
+
+        // And nothing anywhere is negative, which is what keeps falling over
+        // from being an escape: `terminated` cuts the bootstrap, so a negative
+        // per-step reward makes ending the episode the profitable move.
+        for duty in [0.0, 0.2, 0.5, 1.0, 2.0, 3.0, 6.0] {
+            for speed in [-5.0, 0.0, 1.0, 20.0] {
+                assert!(tick(speed, duty) >= 0.0, "reward({speed}, {duty}) went negative");
+            }
+        }
     }
 
     #[test]
@@ -3239,13 +3259,22 @@ mod tests {
         let hopping = episode_score(Stage::WalkFlat, 0.9, 1.0, 0.7, 6, 0.0, false, Stage::WalkFlat.horizon());
         let parked = episode_score(Stage::WalkFlat, 0.9, 0.0, 6.0, 6, 0.0, false, Stage::WalkFlat.horizon());
         assert_eq!(parked, 0.0, "safe standing should be a neutral fallback");
+        // Hopping used to be required to score *below* standing, which took a
+        // subtracted support deficit -- the one term that could make a reward
+        // negative, and so the one that made falling over an escape from
+        // accruing more of it. What actually has to hold is that hopping is
+        // dominated, not that it is punished: `enough_feet` already caps it at
+        // a quarter of a tripod's per-tick reward, and here at a ninth of a
+        // tripod's episode score. Standing < hopping < walking is monotone in
+        // usefulness and leaves no valley between standing and a gait, which
+        // is the trap the additive posture terms fell into.
         assert!(
-            hopping < 0.0,
-            "unsupported locomotion must be worse than standing: {hopping:.3}"
+            parked <= hopping && hopping < stable,
+            "ordering broke: parked {parked:.3}, hopping {hopping:.3}, stable {stable:.3}"
         );
         assert!(
             stable > hopping * 5.0,
-            "sustained hopping was not penalised: stable {stable:.3}, hopping {hopping:.3}"
+            "sustained hopping was not dominated: stable {stable:.3}, hopping {hopping:.3}"
         );
     }
 
