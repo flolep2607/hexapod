@@ -55,8 +55,12 @@ pub const ACT_RANGE: f64 = 0.40;
 /// A real controller slews its setpoint; so does this one.
 pub const MAX_JOINT_RATE: f64 = 6.0;
 
-/// The one speed the reward knows about, simulator units — and it is a scale,
-/// not a target.
+/// The unit the speed term is measured in, simulator units.
+///
+/// This is a unit conversion and nothing else. The term is *linear* in speed,
+/// so summing it over an episode gives ground covered divided by
+/// `REFERENCE_SPEED` — the constant scales the number and cannot express a
+/// preference about how the ground was covered.
 ///
 /// There used to be a commanded speed per stage (0.8 walking, 2.0 running, 4.0
 /// for the parkour run-up) that the reward tracked, with a penalty above it.
@@ -64,11 +68,22 @@ pub const MAX_JOINT_RATE: f64 = 6.0;
 /// soon as possible through whatever is in the way, so nothing should prefer a
 /// slower machine and no stage should carry a speed it is supposed to sit on.
 ///
-/// What remains is a single number setting where the speed curve is steep, so
-/// the per-tick shaping stays on a readable scale. The machine chooses its own
-/// pace: fast on flat, slow onto a trench lip, because arriving sooner is what
-/// pays. In physical units this is 0.2 m/s — simulator speeds are ten times
-/// physical, the legs being 1.8 units of a 0.18 m reach.
+/// It was briefly a saturating curve, which was worse than a target. Any
+/// function of speed that is *concave* prefers a steady pace to a varying one
+/// covering the same ground — Jensen's inequality — and the measured size of
+/// that was 24.5%: crossing two ticks at 1.0 paid 1.245 where covering the same
+/// distance as 2.0 then a standstill paid 1.000. It paid the machine not to
+/// brake. Sometimes slowing into a trench lip is how you clear it and keep
+/// going, exactly as slowing into a corner is how you leave it faster, and a
+/// concave per-tick reward cannot represent that.
+///
+/// Linear is the only shape with no opinion: the sum depends on the distance
+/// and not on the profile, so where the speed went is left to the policy and
+/// the whole preference for arriving sooner lives in the terminal bonus, which
+/// is where it can see the trade.
+///
+/// In physical units this is 0.2 m/s — simulator speeds are ten times physical,
+/// the legs being 1.8 units of a 0.18 m reach.
 pub const REFERENCE_SPEED: f64 = 2.0;
 
 /// Weight on the terminal reward for reaching the target.
@@ -1613,9 +1628,9 @@ fn support_gate(support: f64, legs: usize) -> f64 {
     clamp(support / target, 0.0, 1.0).powi(2)
 }
 
-/// Per-tick reward. Hitting the reference speed toward the target is 1.0, so a
-/// stage's score still reads as "what fraction of the reference did it get";
-/// beating the reference pays above 1.0, to a ceiling of 1.582.
+/// Per-tick reward. Moving toward the target at [`REFERENCE_SPEED`] is 1.0;
+/// faster is proportionally more, with no ceiling, because a ceiling is a pace
+/// to settle at.
 #[allow(clippy::too_many_arguments)]
 fn reward(
     stage: Stage,
@@ -1668,25 +1683,15 @@ fn reward(
     // gradient from a standstill; above the command it falls off, so this is
     // still speed *tracking* and not a prize for going as fast as possible.
     let along = body_v[0] * bearing.sin() + body_v[2] * bearing.cos();
-    // Monotone in speed toward the target. The task is to reach a point in
-    // space as soon as possible, so there is no speed at which going faster is
-    // worse, and `cmd` is a reference scale rather than a command: it sets
-    // where the curve is steep, not a value to sit on.
+    // Linear in speed toward the target, so the sum over an episode is the
+    // ground covered and nothing about the profile. See [`REFERENCE_SPEED`]:
+    // both a saturating curve and a tracked command paid the machine to hold
+    // one pace, and holding one pace is not how a trench gets crossed.
     //
-    // The old curve fell off above `cmd` — it was speed *tracking*, and it
-    // showed. On flat ground the first run to reach the ceiling saturated the
-    // speed term and then spent 13M transitions trading stride for a fourth
-    // and fifth planted foot, because nothing above the command was worth
-    // anything. `1 - exp(-along/cmd)` keeps a gradient at every speed.
-    //
-    // Normalized so hitting the reference is still exactly 1.0, which keeps
-    // `promote_at` calibrated where it was earned; exceeding it now pays, up
-    // to 1/(1 - 1/e) = 1.582 asymptotically.
-    let track = if along <= 0.0 {
-        0.0
-    } else {
-        (1.0 - (-along / REFERENCE_SPEED).exp()) / (1.0 - (-1.0f64).exp())
-    };
+    // Unbounded above on purpose. The machine's top speed is set by its servos,
+    // the posture gate pays nothing while airborne, and there is no fastest
+    // speed worth naming — that is the point.
+    let track = (along / REFERENCE_SPEED).max(0.0);
     let aim = (-(bearing * bearing) / 0.5).exp();
 
     // Feet have to leave the ground, but not all of them and not five of six.
@@ -3194,7 +3199,12 @@ mod tests {
             6,
             std::f64::consts::PI,
         );
-        assert!(toward > away + 0.5, "toward {toward:.3}, away {away:.3}");
+        // A ratio rather than an absolute gap: the speed term is linear now, so
+        // an absolute margin only says how far 0.8 is from REFERENCE_SPEED.
+        assert!(
+            toward > away * 4.0,
+            "toward {toward:.3}, away {away:.3}"
+        );
         assert_eq!(
             episode_score(Stage::WalkFlat, 0.9, -0.5, 3.0, 6, 0.0, false, Stage::WalkFlat.horizon()),
             0.0,
@@ -3219,6 +3229,53 @@ mod tests {
     /// without training on it — a saturated objective is a maximum, and ARS
     /// stepping away from one took a perfect 1.000 down to 0.236 in six
     /// iterations when the stage was trained before being checked.
+    /// Sometimes slowing down is how you go faster overall — braking into a
+    /// trench lip to clear it, the way braking into a corner is how you leave
+    /// it quicker. A per-tick reward that is *concave* in speed cannot
+    /// represent that: by Jensen's inequality it strictly prefers one steady
+    /// pace to any varying one covering the same ground. The saturating curve
+    /// this replaced paid 1.245 for two ticks at 1.0 against 1.000 for the same
+    /// distance taken as 2.0 and a standstill — a 24.5% tax on braking.
+    ///
+    /// Linear is the only shape with no such opinion.
+    #[test]
+    fn where_the_speed_went_does_not_change_the_reward() {
+        let at = |speed: f64| {
+            reward(
+                Stage::WalkFlat,
+                &[0.0, 0.0, speed],
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                3,
+                3.0,
+                6,
+                0.0,
+            )
+        };
+        // Equal ground, three different profiles.
+        let steady = at(1.0) + at(1.0) + at(1.0) + at(1.0);
+        let burst = at(4.0) + at(0.0) + at(0.0) + at(0.0);
+        let ramped = at(0.5) + at(1.5) + at(1.5) + at(0.5);
+        assert!(
+            (steady - burst).abs() < 1e-9,
+            "a burst scored {burst} against {steady} for the same distance"
+        );
+        assert!(
+            (steady - ramped).abs() < 1e-9,
+            "a ramp scored {ramped} against {steady} for the same distance"
+        );
+
+        // Which leaves covering more ground in the same time as the only way to
+        // score more. Note the comparison is at equal tick counts: `aim` and
+        // `gait` are paid per tick, so covering the same ground in fewer ticks
+        // banks less of them — which is exactly the hole [`FINISH_BONUS`]
+        // fills, since arriving is what ends an episode early.
+        let faster = at(2.0) + at(2.0) + at(2.0) + at(2.0);
+        assert!(faster > steady, "{faster} should beat {steady} over four ticks");
+    }
+
     /// Reaching the target used to cost the policy return. The per-tick shaping
     /// sums to 1.0 over a full episode, and arriving *terminates* the episode,
     /// so finishing halfway through the horizon banked 0.5 against 1.0 for
@@ -3310,8 +3367,8 @@ mod tests {
             );
             previous = here;
         }
-        // Bounded, so a stage score stays readable.
-        assert!(at(1000.0) < 1.6);
+        // Unbounded on purpose: no speed is the fastest worth having.
+        assert!(at(4.0 * reference) > at(2.0 * reference) * 1.5);
 
     }
 

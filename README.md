@@ -285,13 +285,25 @@ controller that strolled to the finish scored exactly like one that ran.
 
 What replaced them:
 
-- **Speed toward the target is monotone.** `(1 - exp(-along / REFERENCE_SPEED))`
-  normalized so hitting the reference is 1.0, rising to 1.582 asymptotically.
-  There is a gradient at every speed and no ceiling to sit on.
-- **`REFERENCE_SPEED` is one global constant, not a table**, and it is a scale
-  rather than a target: it sets where the curve is steep so the shaping stays
-  readable as a fraction. `reward` and `episode_score` no longer take a
-  commanded speed at all.
+- **Speed toward the target is linear**, `along / REFERENCE_SPEED`, unbounded
+  above. Linear is the only shape with no opinion about *how* the ground was
+  covered: the sum over an episode is the distance, so braking and accelerating
+  scores exactly what holding one pace scores.
+
+  This matters more than it sounds. Any *concave* function of speed strictly
+  prefers a steady pace to a varying one covering the same ground — Jensen's
+  inequality — and the saturating curve that came before was taxing braking by
+  **24.5%**: two ticks at 1.0 paid 1.245 against 1.000 for the same distance as
+  2.0 then a standstill. Sometimes slowing into a trench lip is how you clear it
+  and keep going, the way slowing into a corner is how you leave it faster, and
+  a concave per-tick reward cannot represent that.
+  `where_the_speed_went_does_not_change_the_reward` pins it against three
+  profiles.
+- **`REFERENCE_SPEED` is a unit, not a table and not a target.** Because the
+  term is linear, the constant scales the number and cannot express a
+  preference about the profile. `reward` and `episode_score` take no commanded
+  speed at all, and the whole preference for arriving sooner lives in the
+  terminal bonus, which is where the trade can actually be seen.
 - **Arriving sooner pays, and the policy feels it.** Reaching the target used to
   *cost* return. `learning_reward` is per-tick and sums to 1.0 over a full
   episode; arriving terminates the episode, so finishing halfway through banked
