@@ -867,33 +867,59 @@ have been easy; saying which model is being run is the useful thing.
 
 This is the part that changed most. The servo used to be a post-hoc sizing
 decision; now its torque-speed line drives the joints, so it changes what the
-optimiser converges to. `hexapod servo` trains the same course once per servo:
+optimiser converges to — and so does its *weight*, because a servo's mass and
+its torque curve are one choice and the legs are half this machine.
+`hexapod servo` trains the same course once per servo per seed:
 
-| servo | stall | no-load | hand-tuned | learned | peak / stall |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| SG90 | 1.8 kg·cm | 100 rpm | −156.5 | −42.5 | **11.8×** |
-| MG90S | 2.2 | 125 | −214.2 | −44.0 | **8.8×** |
-| MG995 | 10.0 | 62 | 43.0 | 107.5 | 1.97× |
-| MG996R | 11.0 | 71 | 57.7 | **119.4** | 1.41× |
-| DS3218MG | 20.0 | 62 | 58.2 | 110.5 | **0.89×** |
-| LX-16A | 17.0 | 45 | 27.3 | 98.1 | 1.11× |
-| STS3215 | 19.5 | 42 | 18.1 | **116.7** | **0.84×** |
-| AX-12A | 15.3 | 59 | 48.8 | 110.5 | 1.35× |
+| servo | stall | no-load | hand-tuned | learned | range | peak / stall | CoT |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SG90 | 1.8 kg·cm | 100 rpm | −38.2 | −6.9 | 16.4 | **19.3×** | 0.28 |
+| MG90S | 2.2 | 125 | −28.2 | 0.4 | 49.1 | **18.0×** | 0.36 |
+| MG995 | 10.0 | 62 | 74.3 | **96.1** | 28.9 | **2.43×** | 0.20 |
+| MG996R | 11.0 | 71 | 76.2 | 93.3 | 32.0 | **2.79×** | 0.22 |
+| DS3218MG | 20.0 | 62 | 74.3 | 94.9 | 27.8 | **1.43×** | 0.27 |
+| LX-16A | 17.0 | 45 | 78.0 | 92.5 | 28.8 | **1.41×** | 0.20 |
+| STS3215 | 19.5 | 42 | 73.7 | 92.1 | 20.4 | **1.65×** | 0.21 |
+| AX-12A | 15.3 | 59 | 76.7 | 90.2 | 34.6 | **1.63×** | 0.23 |
+| STS3250 | 50.0 | 75 | **81.7** | 90.1 | 30.3 | 0.73× | 0.34 |
 
-The micro servos are driven nine to twelve times past their rating: the legs
-fold, the chassis sits on the ground, and the reward is deeply negative — the
+Five seeds, averaged. `range` is the spread of the learned column across them;
+`peak / stall` is the worst of the five, because the worst case is what sizes a
+build.
+
+**Read the range column before the reward columns.** Every servo that walks at
+all lands within six points of every other on the learned reward, and each
+individual servo moves twenty to thirty-five points between seeds. On reward
+these are the same servo. One seed says otherwise and says something different
+each time it is asked — it once put the strongest part in the catalogue last of
+everything that walks, which is a finding until you run it again and get the
+opposite. That is why the column exists.
+
+The micro servos are driven eighteen to nineteen times past their rating: the
+legs fold, the chassis sits on the ground, and the reward is negative — the
 robot does not walk, in the simulator, for the same reason it would not walk on
 a bench. The useful part is that this is a **second, independent** route to the
 same conclusion the static sizing arithmetic reaches: the torque calculation
-says the build needs about 18 kg·cm, and the only two servos that stay under
-stall in simulation are the 19.5 and 20 kg·cm ones. Two different models
-agreeing is worth more than either alone.
+says the build needs about 18 kg·cm, and *no* servo under 50 kg·cm stays inside
+its rating once a search is allowed to use it. The two 19.5-and-20 kg·cm parts
+that clear the static requirement on paper are driven to 1.65× and 1.43× of
+stall by a learned gait. Two different models agreeing is worth more than
+either alone, and here they agree that the static number is a floor, not a
+spec.
+
+The exception is the STS3250, the only entry never driven past its rating on
+any seed — 0.48× mean, 0.73× worst. It pays for that headroom in cost of
+transport, 0.34 against 0.20–0.27 for the rest, which is stable across every
+seed and is not noise: it is fast enough that the search converges on energetic
+gaits, and running costs more per metre than walking. Headroom and efficiency
+are the trade, not headroom and speed.
 
 Note also that the *learned* column is much flatter than the hand-tuned one.
-Given a search, most of these servos end up somewhere between 98 and 119 —
-the learner adapts the gait to the actuator, which is exactly what it is for,
-and exactly why the servo has to be a simulator input rather than a sizing
-decision made afterwards.
+Given a search, every adequate servo ends up between 90 and 96 — the learner
+adapts the gait to the actuator, which is exactly what it is for, and exactly
+why the servo has to be a simulator input rather than a sizing decision made
+afterwards. What the search cannot adapt away is the rating it has to exceed
+to get there.
 
 ## The learner
 
