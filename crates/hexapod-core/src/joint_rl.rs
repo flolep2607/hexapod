@@ -3411,6 +3411,63 @@ mod tests {
         );
     }
 
+    /// What the plant can physically do, as a function of `motor_max`.
+    ///
+    /// Reported, not asserted: this is the measurement that says which force
+    /// ceiling still clears a `HURDLE_HI` wall while making sustained flight
+    /// impossible. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn flight_envelope_against_motor_max() {
+        let frame = Frame::new(6);
+        println!("motor_max  period  peak_air  mean_feet  distance");
+        for motor_max in [0.4, 0.6, 1.0, 1.8, 3.0, 50.0] {
+            let phys = Physics { motor_max, ..Physics::default() };
+            let mut best = (0.0f64, 0.0f64, 0.0f64, 0usize);
+            // Alternate every joint between its extremes. The period that
+            // launches the machine highest is the plant's flight envelope,
+            // whatever choreography a policy would actually find.
+            for period in [4usize, 8, 12, 20, 30] {
+                let mut env = JointEnv::new(
+                    frame,
+                    &phys,
+                    Terrain::new(Course::Flat, 11),
+                    Stage::WalkFlat,
+                );
+                let mut step = 0usize;
+                while !env.is_done() {
+                    let sign = if (step / period) % 2 == 0 { 1.0 } else { -1.0 };
+                    let action = vec![sign * ACT_RANGE; n_act(frame)];
+                    if env.step(&action).is_err() {
+                        break;
+                    }
+                    step += 1;
+                }
+                let r = env.summary();
+                if r.air > best.0 {
+                    best = (r.air, r.support, r.distance, period);
+                }
+                println!(
+                    "{motor_max:9.2}  {period:6}  {:8.3}  {:9.2}  {:8.3}  fell={}",
+                    r.air, r.support, r.distance, r.fell
+                );
+            }
+            // Can it just stand up at this torque? Zero action holds the
+            // neutral pose, so this is the "does the machine support its own
+            // weight" question, separately from what it can leap.
+            let mut still = JointEnv::new(
+                frame, &phys, Terrain::new(Course::Flat, 11), Stage::WalkFlat,
+            );
+            let zero = vec![0.0; n_act(frame)];
+            while !still.is_done() && still.step(&zero).is_ok() {}
+            let stood = still.summary();
+            println!(
+                "  -> motor_max {motor_max:.2} N-m: best air {:.3} at period {} (tallest hurdle {:.2}) | standing: feet {:.2} ride-fell={}",
+                best.0, best.3, crate::terrain::HURDLE_HI, stood.support, stood.fell
+            );
+        }
+    }
+
     #[test]
     fn rapier_ars_is_deterministic_across_worker_counts() {
         let frame = Frame::new(6);

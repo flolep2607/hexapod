@@ -39,6 +39,15 @@ struct TrainConfig {
     initial_alpha: f64,
     target_entropy_per_action: f64,
     action_prior_cost: f64,
+    /// Per-joint torque ceiling, N-m. `None` keeps the plant's own default.
+    ///
+    /// Rapier's world is SI -- masses in kg, gravity -9.81, lengths scaled on
+    /// insert -- so `set_motor_max_force` on a revolute joint is a torque in
+    /// N-m. The default 50.0 is roughly eleven times a DS3240MG's 4.41 N-m
+    /// stall and twenty-eight times an AX-18A's 1.80, which is what let a
+    /// policy fly: measured, 50 N-m reaches 2.465 units of air where 1.8
+    /// reaches 0.218, and below 1.0 the machine cannot stand at all.
+    motor_max: Option<f64>,
     device: String,
     out: PathBuf,
     init: Option<PathBuf>,
@@ -77,6 +86,13 @@ impl TrainConfig {
             initial_alpha: parse(&args, "--initial-alpha", 0.001)?,
             target_entropy_per_action: parse(&args, "--target-entropy-per-action", -2.5)?,
             action_prior_cost: parse(&args, "--action-prior-cost", 1.0)?,
+            motor_max: match value(&args, "--motor-max") {
+                None => None,
+                Some(text) => Some(
+                    text.parse::<f64>()
+                        .map_err(|_| "--motor-max wants a torque in N-m")?,
+                ),
+            },
             device: value(&args, "--device").unwrap_or_else(|| "cpu".into()),
             out: PathBuf::from(
                 value(&args, "--out")
@@ -157,11 +173,14 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     let frame = Frame::new(6);
     let observations = n_obs(frame);
     let actions = n_act(frame);
-    let physics = if config.reduced {
+    let mut physics = if config.reduced {
         Physics::reduced()
     } else {
         Physics::default()
     };
+    if let Some(torque) = config.motor_max {
+        physics.motor_max = torque;
+    }
     let stage = config.stage;
     let ladder_ceiling = ceiling(stage);
     // Every environment starts on the easiest rung. Promotion takes one
@@ -576,11 +595,14 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
     // Which plant this actor was trained against. Absent in checkpoints
     // written before the reduced-coordinate path existed, and those are all
     // impulse — so absent means false, not unknown.
-    let physics = if metadata_field(&metadata, "reduced") == Some("true") {
+    let mut physics = if metadata_field(&metadata, "reduced") == Some("true") {
         Physics::reduced()
     } else {
         Physics::default()
     };
+    if let Some(torque) = config.motor_max {
+        physics.motor_max = torque;
+    }
     let (hidden, normalizer) = load_checkpoint_state(path, observations, actions)?;
     let actor_observations = normalizer.mean.len();
 
@@ -1098,6 +1120,8 @@ fn print_help() {
          --initial-alpha X    initial entropy coefficient (default 0.001)\n\
          --target-entropy-per-action X entropy target per joint (default -2.5)\n\
          --action-prior-cost X normalized quadratic actor prior (default 1)\n\
+         --motor-max X        per-joint torque ceiling, N-m (default 50; a\n\
+                              DS3240MG stalls at 4.41, an AX-18A at 1.80)\n\
          --device cpu|cuda:N  tensor device (CUDA requires --features cuda)\n\
          --seed N             deterministic run seed\n\
          --out PATH           best actor safetensors checkpoint\n\
