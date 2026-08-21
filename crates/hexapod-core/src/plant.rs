@@ -1151,7 +1151,7 @@ mod axis_probe {
 
     /// Worst `|cos|` between the axis a hinge was built with and the axis its
     /// child actually turns about, over every leg and joint.
-    fn worst_axis(phys: &Physics) -> (f32, String) {
+    pub(super) fn worst_axis(phys: &Physics) -> (f32, String) {
         let frame = crate::robot::Frame::new(6);
         let gait = Policy::seeded(Preset::Tripod, frame).gait();
         let terrain = Terrain::new(Course::Flat, 1);
@@ -2069,6 +2069,59 @@ mod tests {
             travelled[0],
             travelled[1]
         );
+    }
+
+    /// Reporting probe: what a solver setting costs and whether it still walks.
+    ///
+    /// The trainer spends 93% of its wall clock inside `step`, so this is the
+    /// only table that matters for throughput. Correctness first though: a
+    /// cheaper setting that cannot hold the deck up is not cheaper, and the
+    /// impulse plant's `4/8/4` is not a taste -- below it the revolute
+    /// constraints are visibly violated. The reduced plant makes the hinge one
+    /// coordinate instead of five constraint rows, so it is the one setting
+    /// that can be cheap without giving that up.
+    #[test]
+    #[ignore]
+    fn zzz_solver_cost_report() {
+        let frame = Frame::new(6);
+        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
+        gait.cycle = walk_cycle(frame, &gait);
+        let terrain = Terrain::new(Course::Flat, 1);
+        let q0 = standing_q(frame, &gait);
+
+        // `substeps` is deliberately not varied here: `drive_terrain` steps the
+        // plant once per tick and ignores it, so it would look free and change
+        // nothing. `joint_rl::tests::zzz_substeps_report` is where it is real.
+        for (name, phys) in [
+            ("impulse 8/4 (default)", Physics::default()),
+            ("impulse 4/2", Physics { solver_iters: 4, pgs_iters: 2, ..Physics::default() }),
+            ("impulse 16/8", Physics { solver_iters: 16, pgs_iters: 8, ..Physics::default() }),
+            ("reduced 1/1 (preset)", Physics::reduced()),
+            ("reduced 4/1", Physics { solver_iters: 4, pgs_iters: 1, ..Physics::reduced() }),
+        ] {
+            // Stand, then walk, then time a fixed number of driven ticks.
+            let mut stand = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            hold(&mut stand, &q0, &phys, 5.0);
+            let stood = stand.chassis_y();
+
+            let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            let mut phase = 0.0;
+            let ticks = (4.0 / crate::sim::DT) as usize;
+            let started = std::time::Instant::now();
+            for _ in 0..ticks {
+                drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
+                phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
+            }
+            let secs = started.elapsed().as_secs_f64();
+            let (cos, _) = super::axis_probe::worst_axis(&phys);
+            eprintln!(
+                "{name:24}  {:>7.0} tick/s  {:>6.1} us  stand5s {stood:.4}  walk4s y {:.4} z {:>7.4}  hinge {cos:.4}",
+                ticks as f64 / secs,
+                secs / ticks as f64 * 1e6,
+                plant.chassis_y(),
+                plant.chassis_z()
+            );
+        }
     }
 
     /// Reporting probe: can the hand-tuned tripod actually be run at a given

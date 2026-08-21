@@ -48,6 +48,7 @@ struct TrainConfig {
     /// policy fly: measured, 50 N-m reaches 2.465 units of air where 1.8
     /// reaches 0.218, and below 1.0 the machine cannot stand at all.
     motor_max: Option<f64>,
+    substeps: Option<usize>,
     device: String,
     out: PathBuf,
     init: Option<PathBuf>,
@@ -86,6 +87,13 @@ impl TrainConfig {
             initial_alpha: parse(&args, "--initial-alpha", 0.001)?,
             target_entropy_per_action: parse(&args, "--target-entropy-per-action", -2.5)?,
             action_prior_cost: parse(&args, "--action-prior-cost", 1.0)?,
+            substeps: match value(&args, "--substeps") {
+                None => None,
+                Some(text) => Some(
+                    text.parse::<usize>()
+                        .map_err(|_| format!("--substeps wants a whole number, got {text:?}"))?,
+                ),
+            },
             motor_max: match value(&args, "--motor-max") {
                 None => None,
                 Some(text) => Some(
@@ -180,6 +188,14 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     };
     if let Some(torque) = config.motor_max {
         physics.motor_max = torque;
+    }
+    // Rapier steps per control tick. The cost of a step is exactly linear in
+    // this, and it is 93% of the trainer's wall clock, so halving it very
+    // nearly doubles throughput. It also halves the integration accuracy the
+    // position motor gets, and a policy is precisely the thing that finds and
+    // exploits a loose contact solver -- watch `feet` if you lower it.
+    if let Some(n) = config.substeps {
+        physics.substeps = n.max(1);
     }
     let stage = config.stage;
     let ladder_ceiling = ceiling(stage);
@@ -675,6 +691,14 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
     };
     if let Some(torque) = config.motor_max {
         physics.motor_max = torque;
+    }
+    // Rapier steps per control tick. The cost of a step is exactly linear in
+    // this, and it is 93% of the trainer's wall clock, so halving it very
+    // nearly doubles throughput. It also halves the integration accuracy the
+    // position motor gets, and a policy is precisely the thing that finds and
+    // exploits a loose contact solver -- watch `feet` if you lower it.
+    if let Some(n) = config.substeps {
+        physics.substeps = n.max(1);
     }
     let (hidden, normalizer) = load_checkpoint_state(path, observations, actions)?;
     let actor_observations = normalizer.mean.len();
@@ -1193,7 +1217,8 @@ fn print_help() {
          --initial-alpha X    initial entropy coefficient (default 0.001)\n\
          --target-entropy-per-action X entropy target per joint (default -2.5)\n\
          --action-prior-cost X normalized quadratic actor prior (default 1)\n\
-         --motor-max X        per-joint torque ceiling, N-m (default 50; a\n\
+         --substeps N         Rapier steps per control tick (default 4)\n\
+        \x20--motor-max X        per-joint torque ceiling, N-m (default 50; a\n\
                               DS3240MG stalls at 4.41, an AX-18A at 1.80)\n\
          --device cpu|cuda:N  tensor device (CUDA requires --features cuda)\n\
          --seed N             deterministic run seed\n\
@@ -1205,6 +1230,56 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    /// Reporting probe: does stepping the fleet actually run in parallel?
+    ///
+    /// The trainer spends 93% of its wall clock here, and its throughput was
+    /// flat from 12 environments to 32 -- which is what serial execution looks
+    /// like, since flat steps/s means the iteration got proportionally longer.
+    #[test]
+    #[ignore]
+    fn zzz_fleet_parallelism_report() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        eprintln!("rayon threads {}", rayon::current_num_threads());
+        for n in [1usize, 4, 12, 32] {
+            let build = || {
+                (0..n)
+                    .map(|i| {
+                        JointEnv::new(frame, &phys, Terrain::new(Course::Flat, 7 + i as u64), Stage::WalkFlat)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let action = vec![0.05; 18];
+            let ticks = 200usize;
+
+            let mut serial = build();
+            let started = std::time::Instant::now();
+            for _ in 0..ticks {
+                for env in serial.iter_mut() {
+                    let _ = env.step(&action);
+                }
+            }
+            let s_secs = started.elapsed().as_secs_f64();
+
+            let mut par = build();
+            let started = std::time::Instant::now();
+            for _ in 0..ticks {
+                par.par_iter_mut().for_each(|env| {
+                    let _ = env.step(&action);
+                });
+            }
+            let p_secs = started.elapsed().as_secs_f64();
+
+            let total = (ticks * n) as f64;
+            eprintln!(
+                "{n:3} envs  serial {:>7.0} step/s   parallel {:>7.0} step/s   speedup {:.2}x",
+                total / s_secs,
+                total / p_secs,
+                s_secs / p_secs
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

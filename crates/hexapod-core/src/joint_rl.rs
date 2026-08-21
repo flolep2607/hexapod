@@ -3071,6 +3071,122 @@ mod tests {
 
     /// The four properties the old speed curve needed subtle tests for, and
     /// which this objective has by construction.
+    /// Reporting probe: what a `step` is actually made of.
+    ///
+    /// The trainer spends 93% of its wall clock in `step`, and `step` is not
+    /// only physics: every tick rebuilds a 103-input observation, which reads
+    /// eighteen joints, casts a ray for ground height and probes the
+    /// heightfield fifteen times for the forward scan. Worth knowing which
+    /// half to attack before attacking either.
+    #[test]
+    #[ignore]
+    fn zzz_step_breakdown_report() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let action = vec![0.05; 18];
+        let n = 400usize;
+
+        for (name, course, stage) in [
+            ("flat/walk", Course::Flat, Stage::WalkFlat),
+            ("steps/rough", Course::Steps, Stage::Rough),
+        ] {
+            let make = || JointEnv::new(frame, &phys, Terrain::new(course, 7), stage);
+
+            let mut env = make();
+            let started = std::time::Instant::now();
+            for _ in 0..n {
+                if env.step(&action).is_err() {
+                    env.reset();
+                }
+            }
+            let whole = started.elapsed().as_secs_f64() / n as f64 * 1e6;
+
+            // Observation only: the same work `step` does twice per call,
+            // without advancing the plant.
+            let mut env = make();
+            let started = std::time::Instant::now();
+            for _ in 0..n * 2 {
+                let _ = env.refresh_observation();
+            }
+            let obs = started.elapsed().as_secs_f64() / n as f64 * 1e6;
+
+            // And its two halves.
+            let mut env = make();
+            let started = std::time::Instant::now();
+            for _ in 0..n * 2 {
+                let _ = env.sample();
+            }
+            let sample = started.elapsed().as_secs_f64() / n as f64 * 1e6;
+
+            let mut env = make();
+            let tick = env.sample();
+            let started = std::time::Instant::now();
+            for _ in 0..n * 2 {
+                env.fill_observation(&tick);
+            }
+            let fill = started.elapsed().as_secs_f64() / n as f64 * 1e6;
+
+            eprintln!(
+                "{name:12}  step {whole:7.1} us  = observation {obs:6.1} ({:4.1}%)  + plant {:7.1} us   [sample {sample:5.1} fill {fill:5.1}]",
+                100.0 * obs / whole,
+                whole - obs
+            );
+        }
+    }
+
+    /// Reporting probe: what `substeps` buys and costs on the learner's path.
+    ///
+    /// `substeps` is honoured here and nowhere else -- `plant::tests::
+    /// drive_terrain`, which the hand-gait probes use, steps once per tick and
+    /// ignores it -- so this is the only place its effect can be seen. It
+    /// multiplies the dominant cost directly and linearly: the trainer spends
+    /// 93% of its wall clock in `step`, and `step` is 99.8% plant.
+    ///
+    /// Choosing a timestep is a convergence question, so this drives an
+    /// identical seeded action sequence at each setting and reports how far the
+    /// result moves. Standing still says nothing -- it holds at every setting
+    /// down to one substep -- so the sequence has to be one that throws the
+    /// machine around.
+    #[test]
+    #[ignore]
+    fn zzz_substeps_report() {
+        let frame = Frame::new(6);
+        let n = 400usize;
+
+        // One action sequence, generated once, replayed at every setting.
+        let mut rng = Rng::new(0x5BB57E);
+        let script = (0..n)
+            .map(|_| (0..18).map(|_| clamp(rng.normal() * 0.5, -1.0, 1.0) * ACT_RANGE).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        for substeps in [1usize, 2, 3, 4, 6, 8] {
+            let mut phys = Physics::default();
+            phys.substeps = substeps;
+            let mut env =
+                JointEnv::new(frame, &phys, Terrain::new(Course::Flat, 7), Stage::WalkFlat);
+            let _ = env.set_command(1.5);
+            let started = std::time::Instant::now();
+            let mut steps = 0usize;
+            for action in &script {
+                if env.step(action).is_err() {
+                    break;
+                }
+                steps += 1;
+            }
+            let secs = started.elapsed().as_secs_f64();
+            let s = env.summary();
+            eprintln!(
+                "substeps {substeps}  {:7.1} us/step  {:6.0} step/s  |  steps {steps:3}  dist {:7.4}  support {:.3}  fell {:5}  score {:.5}",
+                secs / steps.max(1) as f64 * 1e6,
+                steps as f64 / secs,
+                s.distance,
+                s.support,
+                s.fell,
+                s.score
+            );
+        }
+    }
+
     #[test]
     fn ground_closed_is_the_whole_objective() {
         let gate = |duty: f64| posture(Stage::Rough, 0.0, 0.0, 0.0, 0.0, duty, 6);
