@@ -125,12 +125,220 @@ batch, while Candle differentiates the policy and value networks. Until Nexus
 matches the reference plant's standing dynamics, SAC uses parallel reusable
 Rapier worlds for experience and may use CUDA for the network updates.
 
-The SAC CLI exposes `WALK-FLAT` and `RUN-FLAT` explicitly. Random-action smoke
-tests validate plumbing but are not locomotion evidence. Start `RUN-FLAT` only
-after held-out walking evaluation crosses its score gate; harder terrain is
-never trained merely because a fixed iteration budget expired. The best actor
-is saved as safetensors with a `.meta` file containing its stage, exact
-observation normalizer, and run configuration.
+### Sizing a run to this machine
+
+The learner is update-bound, not physics-bound, and by a wide margin. Measured
+on a 12-core CPU with an RTX 3070:
+
+| Stage | Rate |
+|---|---|
+| Rapier collection, `--envs 16` | 5,600 steps/s |
+| Collection, `--envs 48` or `--envs 96` | no faster — `par_iter` already saturates the cores |
+| Update, `--batch 256`, CUDA | 200/s = 51k replay samples/s |
+| Update, `--batch 1024`, CUDA | 133/s = 136k samples/s |
+| Update, `--batch 4096`, CUDA | 61/s = 251k samples/s |
+| Update, `--batch 256`, CPU | 31/s = 8k samples/s |
+
+Two consequences. Raising `--envs` buys command diversity per iteration, never
+throughput. And the minibatch is nearly free: these are 256-unit MLPs, so a
+batch-256 update is kernel-launch-bound and a batch-4096 update costs only 3.3x
+as much for 16x the data.
+
+That makes `--utd 1.0` the wrong default here by two orders of magnitude. It
+pins collection to the update rate — 61 to 200 transitions/s — so a day of
+training buys a few million transitions. Balancing the two rates instead means
+`utd = updates_per_second / 5600`: about 0.01 at `--batch 4096`, which still
+replays each transition ~45 times. Either side of the balance point costs the
+same 10 hours per 100M transitions, so prefer the large batch for the better
+gradient per step:
+
+```bash
+cargo run --release -p hexapod-sac --features cuda -- --device cuda:0 \
+  --batch 4096 --utd 0.01 --actor-lr 3e-4 --steps 100000000 \
+  --replay 5000000 --warmup 50000 --eval-interval 1000000
+```
+
+### The reduced-coordinate plant
+
+`--reduced` builds the eighteen hinges as one branched multibody instead of
+eighteen impulse joints, and it exists because the step cost is *entirely* the
+hinges. Measured on flat ground, one core: 0.043 ms per joint, flat from 12 to
+30 joints, and identical on `FLAT` and `GAUNTLET` — terrain is free, the
+articulation is everything. Rapier's `simd8` and `block-solver` change nothing
+here (0.569 vs 0.563 ms); they vectorise contact manifolds, of which a hexapod
+standing on six feet has six.
+
+In reduced coordinates a hinge is one number, so it cannot leave its axis:
+`axis_probe` reports `|cos| = 1.0000` at `1/4/1`, where the impulse plant gives
+0.9305 — a coxa 21.5 degrees off its own axis — and needs `4/8/4` merely to
+clear 0.99. The whole suite passes on it. In the trainer it collects 30,000
+transitions in 5.18 s against 7.58 s, so **1.46x**.
+
+**It is not the same machine.** Rapier's articulated solver factorises a mass
+matrix per substep, so per iteration it is ~5x dearer and only wins by needing
+a quarter of the substeps — and the gait that comes out is different. The
+gate-clearing walker, evaluated on 20 held-out episodes at seed 30360831:
+
+| Plant | score | distance | mean feet down |
+|---|---|---|---|
+| impulse `4/8/4` (reference) | 0.496 | 1.29 m | 2.79 |
+| reduced `1/1/1` | 0.243 | 0.62 m | 2.10 |
+| reduced `1/4/1` | 0.000 | -0.10 m | 2.25 |
+
+198 passing assertions were necessary and not sufficient: they check structural
+invariants — hinge lengths, axes, standing, falls — not gait dynamics. So
+`--reduced` is a fork that orphans every checkpoint, for 1.46x. Start a fresh
+lineage on it deliberately or not at all; it is off by default, recorded as
+`reduced=` in the `.meta`, and `--eval` reads that field back so an actor is
+never scored on the plant it was not trained on.
+
+The remaining physics-neutral win is granularity. Stepping 12 envs with one
+rayon dispatch per control tick — what the loop does now — runs at 9,109
+steps/s; stepping the same 12 envs in 400-step segments runs at 15,346, i.e.
+5.1x a single core against 8.6x. That 1.7x costs a CPU actor copy per worker
+and changes no physics at all.
+
+For scale: published rough-terrain locomotion budgets are 1.5e8 control steps
+(legged_gym ANYmal rough: 4096 envs x 24 steps x 1500 updates) and 2e8 (MJX Go1
+rough). Every checkpoint in `checkpoints/` was trained on 1.4e5 or less — under
+0.1% of that. Collection and updates are serialized in the training loop, so
+overlapping them is worth a further 2x whenever that matters more than the
+config change above.
+
+`--stage` takes any of `walk-flat`, `run-flat`, `rough`, `gaps`, `jump` or
+`mixed`. Random-action smoke tests validate plumbing but are not locomotion
+evidence. Start `RUN-FLAT` only after held-out walking evaluation crosses its
+score gate; harder terrain is never trained merely because a fixed iteration
+budget expired. The best actor is saved as safetensors with a `.meta` file
+containing its stage, exact observation normalizer, and run configuration, plus
+a `.latest` snapshot rewritten at every evaluation whatever it scored — the
+promoted file is the one to judge a run by, the snapshot is only there so an
+unattended run that dies on a plateau has not lost the hours since its last
+improvement.
+
+### Per-environment difficulty
+
+`--curriculum` gives every environment its own rung on a five-step ladder —
+`WALK-FLAT`, `ROUGH`, `GAPS`, `JUMP`, `MIXED` — and `--stage` names the ceiling
+rather than a single target. Each rung is an existing stage, so it brings its
+own courses, its own command (including the run-up the parkour pair needs) and
+its own horizon; nothing here is a new judgement about what is hard. An episode
+scoring 0.8 moves that environment up one, under 0.5 moves it down, and
+anything between holds. At the ceiling a pass resamples at or below it.
+
+`MIXED` is a rung and not just a ceiling. The four stages below it name six
+courses between them, and `MIXED` is the only stage that samples all fifteen —
+without it on the ladder, `SLALOM`, `SLICK`, `RAMPS`, `GAUNTLET`, `BEAM`,
+`PILLARS`, `WASHBOARD` and `GLACIER` are never trained at any difficulty, and
+nothing fails to say so. `the_ladder_reaches_every_course` is the regression
+test for that.
+
+**Progress** is `max(distance / (command x horizon), waypoint_fraction)`.
+Neither measure works alone. Ground covered is the right test on the
+four-second flat stage and unreachable on `MIXED`, whose 2.5 m/s over 30 s asks
+for 75 m of a course about forty long. Route fraction is right on `MIXED` and
+close to meaningless on flat, where four seconds of good walking clears one of
+eight waypoints. Whichever says the episode went well did the measuring.
+
+This is the `legged_gym` rule rather than a global gate, and levels being per
+robot is the point: a global ladder promotes the whole run at once and then has
+nothing left that can still walk on flat. Measured with a trained walker as
+`--init`, the fleet promotes off `WALK-FLAT` within one episode, cannot hold
+`ROUGH`, and is demoted back — oscillating on the boundary it can just carry,
+which is the mechanism working rather than a fault.
+
+**A quarter of the environments never promote or demote.** They resample the
+whole ladder up to the ceiling every episode. Promotion moves a climber up
+exactly one rung, so while the fleet climbs, the rungs it left empty out — and
+the replay buffer is no defence, because 2M transitions at ~1,900 steps/s is
+about eighteen minutes of experience. Flat-ground transitions are long gone
+before a terrain stage is finished with. The review set is the only thing that
+keeps a cleared rung in the data distribution, which is what
+`the_review_set_keeps_every_cleared_rung_in_the_mix` asserts.
+
+**`JUMP` is a different skill, not harder terrain**, and a ladder rung is the
+wrong shape for it: difficulty curricula work when the skill is continuous, and
+a wall taller than the body is a ballistic phase the walking gait does not
+contain. `HURDLES` puts the ramp *inside* one course instead — walls spanning
+the corridor that grow from `HURDLE_LO` 0.20, a step the walking gait already
+clears, to `HURDLE_HI` 0.95, above the tuned tripod's 0.93 standing height, so
+nothing but leaving the ground gets over the last of them. Spacing opens up with
+the height, because a taller wall needs a longer approach. Failing does not end
+the episode: the machine stops at the wall it cannot clear, and the route
+station per wall turns that into a graded score rather than a fall, so the
+run-up and the push-off get found where failing is still cheap.
+
+## No target speed
+
+The objective is to reach a point in space as soon as possible through whatever
+is in the way. Nothing in the reward prefers a slower machine, and no stage
+carries a speed it is supposed to sit on.
+
+There used to be a commanded speed per stage — 0.8 walking, 2.0 running, 4.0 for
+the parkour run-up — that the per-tick reward tracked, with a Gaussian falloff
+above it. Two things were wrong with that. Speed *tracking* means exceeding the
+command is punished, and it showed: the first run to reach the flat ceiling
+saturated the speed term at 2.5M transitions and then spent 13M more trading
+stride for a fourth and fifth planted foot, because going faster was worth
+nothing. And reaching the target paid a flat 1.0 however long it took, so a
+controller that strolled to the finish scored exactly like one that ran.
+
+What replaced them:
+
+- **Speed toward the target is monotone.** `(1 - exp(-along / REFERENCE_SPEED))`
+  normalized so hitting the reference is 1.0, rising to 1.582 asymptotically.
+  There is a gradient at every speed and no ceiling to sit on.
+- **`REFERENCE_SPEED` is one global constant, not a table**, and it is a scale
+  rather than a target: it sets where the curve is steep so the shaping stays
+  readable as a fraction. `reward` and `episode_score` no longer take a
+  commanded speed at all.
+- **Arriving sooner pays.** A completed route is worth `1 + (1 - secs/horizon)`:
+  2.0 for arriving immediately, the old 1.0 for arriving as the horizon expires.
+
+So the machine picks its own pace — fast on the flat, slow onto a trench lip —
+because what pays is getting there. `going_faster_toward_the_target_is_never_worth_less`
+and `reaching_the_target_sooner_scores_higher` are the checks.
+
+On units: simulator speeds are **ten times physical**. `chassis_vel` returns
+`to_sim(linvel)`, which divides by `scale = 0.10`, and the legs are
+`0.30 + 0.80 + 1.00 = 1.8` units of a 0.18 m reach. The old 4.0 parkour command
+was 0.4 m/s on a 2 kg machine, about 1.3 body-widths a second — it read as a
+highway speed and was not one. `REFERENCE_SPEED = 2.0` is 0.2 m/s.
+
+**The promotion gates need recalibrating.** `Stage::promote_at` — 0.45 walking
+down to 0.22 for jumping — was tuned against the old per-stage commands, and
+under one global reference a flat-ground walker at the old 0.8 command scores
+0.64 per tick where it used to score 1.0. Old checkpoints still load and still
+run; their recorded scores are not comparable to new ones.
+
+### The tripod term is flat-ground only
+
+`Stage::gait_weight` pays 0.10 for a tripod-shaped support pattern on
+`STAND`/`WALK-FLAT`/`RUN-FLAT` and nothing on terrain; whatever it does not take
+goes to speed tracking, so no stage is quietly scored out of a lower maximum
+than another. On flat the term is load-bearing — without it the search finds
+hopping, and mean support fell to 1.2 feet of six. On terrain it is a
+hand-specified gait constraining exploration exactly where the machine has to
+improvise, and the published ablation on this morphology is that a prescribed
+tripod contact reward *hindered* obstacle learning where a style prior learned
+from flat ground did not.
+
+The first run to reach the flat ceiling is why this is no longer a guess. Over
+15.5M transitions at a 0.8 m/s command:
+
+| transitions | score | distance | mean feet down |
+|---|---|---|---|
+| 2.5M | 0.609 | 1.70 m | **3.34** |
+| 4.5M | 0.865 | 3.12 m | 4.51 |
+| 10.5M | 0.906 | 3.48 m | 4.62 |
+| 15.5M | 0.893 | 3.52 m | **5.39** |
+
+Score rose 49% and then flattened while the gait went from a clean tripod to
+five feet on the ground. That is the correct optimum of this objective at a slow
+command — tracking saturates, posture is already maximal, and 0.10 of tripod
+shaping is cheap next to the stability of another planted foot. It is also why
+the answer is a faster command rather than a bigger gait bonus: at 2.0 m/s a
+five-foot stance cannot deliver the speed, so tracking has to buy leg lifting.
 
 For `RUN-FLAT`, `--start-speed 0.8 --speed-ramp-steps N` raises the command
 ceiling linearly to 2.0 m/s while parallel environments are deterministically
@@ -193,7 +401,7 @@ there it is the thing on screen:
 ## The simulator
 
 A **centroidal rigid-body** model with Coulomb contact and actuator limits
-trains the policy. The dashboard's live robot is the other plant: Rapier 0.32,
+trains the policy. The dashboard's live robot is the other plant: Rapier 0.35,
 one chassis, three revolute joints per leg, motors limited by the servo's stall
 torque. The About tab says so in the page too.
 

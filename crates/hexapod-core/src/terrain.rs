@@ -48,10 +48,11 @@ pub enum Course {
     Washboard = 12,
     Chasm = 13,
     Glacier = 14,
+    Hurdles = 15,
 }
 
 /// Every course, in the order the dashboard lists them.
-pub const COURSES: [Course; 15] = [
+pub const COURSES: [Course; 16] = [
     Course::Flat,
     Course::Steps,
     Course::Rubble,
@@ -67,6 +68,7 @@ pub const COURSES: [Course; 15] = [
     Course::Washboard,
     Course::Chasm,
     Course::Glacier,
+    Course::Hurdles,
 ];
 
 impl Course {
@@ -91,6 +93,7 @@ impl Course {
             Course::Washboard => "WASHBOARD",
             Course::Chasm => "CHASM",
             Course::Glacier => "GLACIER",
+            Course::Hurdles => "HURDLES",
         }
     }
 
@@ -105,7 +108,7 @@ impl Course {
     /// scoring a machine that was never going to make it.
     #[inline]
     pub fn is_jump(self) -> bool {
-        matches!(self, Course::Jump | Course::Chasm)
+        matches!(self, Course::Jump | Course::Chasm | Course::Hurdles)
     }
 }
 
@@ -128,6 +131,14 @@ const ICE_THICK: f64 = 0.01;
 /// Narrowest plank the machine can actually stand on: six legs stand at
 /// about ±1.2 m, so anything under this has nowhere to put the middle pair.
 pub const BEAM_MIN_W: f64 = 2.8;
+
+/// Hurdle heights, first wall to last.
+///
+/// The low end is a step the walking gait already clears. The high end is above
+/// the standing ride height — about 0.93 for the tuned tripod — so nothing but
+/// leaving the ground gets over it.
+pub const HURDLE_LO: f64 = 0.20;
+pub const HURDLE_HI: f64 = 0.95;
 /// Height of a slalom wall. Well above anything a leg can reach, so it is not
 /// an obstacle to climb — it is somewhere the machine cannot go.
 pub const WALL_TOP: f64 = 1.8;
@@ -577,6 +588,36 @@ impl Terrain {
             Course::Washboard => self.gen_washboard(&mut r, 5.0, Z_MAX - 4.0),
             Course::Chasm => self.gen_chasm(&mut r),
             Course::Glacier => self.gen_glacier(&mut r, 8.0, 42.0),
+            Course::Hurdles => self.gen_hurdles(&mut r),
+        }
+    }
+
+    /// Walls across the corridor that grow as the machine advances: the first
+    /// are a step, the last are above standing height and have to be jumped.
+    ///
+    /// Every other course holds one difficulty from end to end, so a policy
+    /// either can do it or cannot, and the ones that need a jump give a learner
+    /// no way in — clearing a wall taller than the body is not harder walking,
+    /// it is a movement the walking gait does not contain. Here the curriculum
+    /// is inside the course. The early walls fall to the gait it already has,
+    /// each one after is slightly more than the last, and the run-up and the
+    /// push-off get found where they are still cheap. Failing does not end the
+    /// episode either: the machine simply stops at the wall it cannot clear,
+    /// which is a graded score rather than a fall.
+    ///
+    /// Walls span the full corridor, so there is no going around one.
+    fn gen_hurdles(&mut self, r: &mut Rng) {
+        let (z0, z1) = (6.0, Z_MAX - 8.0);
+        let mut z = z0;
+        while z < z1 {
+            let progress = ((z - z0) / (z1 - z0)).clamp(0.0, 1.0);
+            let h = HURDLE_LO + progress * (HURDLE_HI - HURDLE_LO);
+            let thick = r.range(0.30, 0.55);
+            self.push(-CORRIDOR_HALF, CORRIDOR_HALF, z, z + thick, h, GRIP_STEP);
+            self.waypoints.push([0.0, z + thick + 1.5]);
+            // A taller wall needs a longer approach, so the spacing opens up
+            // with the height rather than staying at the first wall's stride.
+            z += thick + r.range(3.2, 4.4) + 2.0 * progress;
         }
     }
 
@@ -1750,4 +1791,44 @@ mod tests {
             "contact with the top face is penetration"
         );
     }
+    /// The point of HURDLES is the ramp: a wall the walking gait clears at the
+    /// start and one it cannot possibly clear at the end, so the run-up gets
+    /// learned where failing is cheap. A course that is uniformly hard teaches
+    /// a policy to give up at the first wall.
+    #[test]
+    fn hurdles_grow_from_a_step_to_above_standing_height() {
+        for seed in 1..6 {
+            let t = Terrain::new(Course::Hurdles, seed);
+            let mut walls: Vec<(f64, f64)> =
+                t.obstacles.iter().map(|o| (o.z0, o.top)).collect();
+            walls.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite"));
+            assert!(walls.len() >= 6, "seed {seed} made only {} walls", walls.len());
+
+            // Monotone in height along the course, first to last.
+            for pair in walls.windows(2) {
+                assert!(
+                    pair[1].1 >= pair[0].1,
+                    "seed {seed}: wall at {:.1} is lower than the one before it",
+                    pair[1].0
+                );
+            }
+            let (first, last) = (walls[0].1, walls[walls.len() - 1].1);
+            assert!(
+                first <= HURDLE_LO + 0.05,
+                "seed {seed}: the first wall is already {first:.2} high"
+            );
+            assert!(
+                last >= 0.75,
+                "seed {seed}: the last wall is only {last:.2}, nothing has to jump"
+            );
+            // Full width, so there is no walking around one.
+            for o in &t.obstacles {
+                assert!(o.x0 <= -CORRIDOR_HALF && o.x1 >= CORRIDOR_HALF);
+            }
+            // A route station per wall, plus the finish the generator appends,
+            // so the score measures which wall it got stuck at.
+            assert_eq!(t.waypoints.len(), walls.len() + 1);
+        }
+    }
+
 }

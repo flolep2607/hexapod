@@ -27,6 +27,8 @@ struct TrainConfig {
     warmup_hold_fraction: f64,
     batch_size: usize,
     updates_per_step: f64,
+    reduced: bool,
+    curriculum: bool,
     policy_warmup_updates: usize,
     eval_interval: usize,
     eval_episodes: usize,
@@ -63,6 +65,8 @@ impl TrainConfig {
             warmup_hold_fraction: parse(&args, "--warmup-hold-fraction", 0.50)?,
             batch_size: parse(&args, "--batch", 256)?,
             updates_per_step: parse(&args, "--utd", 1.0)?,
+            reduced: args.iter().any(|a| a == "--reduced"),
+            curriculum: args.iter().any(|a| a == "--curriculum"),
             policy_warmup_updates: parse(&args, "--policy-warmup-updates", 1_000)?,
             eval_interval: parse(&args, "--eval-interval", 10_000)?,
             eval_episodes: parse(&args, "--eval-episodes", 8)?,
@@ -153,8 +157,28 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     let frame = Frame::new(6);
     let observations = n_obs(frame);
     let actions = n_act(frame);
-    let physics = Physics::default();
+    let physics = if config.reduced {
+        Physics::reduced()
+    } else {
+        Physics::default()
+    };
     let stage = config.stage;
+    let ladder_ceiling = ceiling(stage);
+    // Every environment starts on the easiest rung. Promotion takes one
+    // episode, so the fleet spreads itself within seconds; seeding it spread
+    // out instead just fills replay with a policy falling over on terrain it
+    // cannot yet walk on.
+    let reviewers = (config.environments as f64 * REVIEW_SHARE).round() as usize;
+    let mut rungs = config.curriculum.then(|| {
+        (0..config.environments)
+            .map(|index| Rung {
+                level: 0,
+                course: LADDER[0].courses()[0],
+                review: index < reviewers,
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut episode_seed = 0u64;
     let mut environments = (0..config.environments)
         .map(|index| {
             JointEnv::new(
@@ -266,12 +290,18 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         );
         let environment_count = environments.len();
         for (index, (environment, state)) in environments.iter_mut().zip(&mut states).enumerate() {
-            let training_command = stratified_speed(
-                config.start_speed,
-                command_ceiling,
-                index,
-                environment_count,
-            );
+            let training_command = match rungs.as_ref() {
+                // Each rung carries its own command, including the run-up the
+                // parkour courses need; the stratified ramp is a flat-ground
+                // tool and does not belong on a trench.
+                Some(rungs) => rungs[index].command(),
+                None => stratified_speed(
+                    config.start_speed,
+                    command_ceiling,
+                    index,
+                    environment_count,
+                ),
+            };
             let observation = environment.set_command(training_command)?;
             state.copy_from_slice(observation);
         }
@@ -332,6 +362,18 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 step.truncated,
             )?;
             states[index] = if step.terminated || step.truncated {
+                if let Some(rungs) = rungs.as_mut() {
+                    let summary = environments[index].summary();
+                    let progress = rungs[index].progress(&summary);
+                    rungs[index] = advance(rungs[index], ladder_ceiling, progress, &mut rng);
+                    episode_seed += 1;
+                    environments[index] = rung_env(
+                        rungs[index],
+                        frame,
+                        &physics,
+                        config.seed ^ (0x9E37_79B9 * episode_seed),
+                    );
+                }
                 environments[index].reset().to_vec()
             } else {
                 step.observation.clone()
@@ -388,6 +430,38 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 actor = stats.actor_loss,
                 wall = started.elapsed().as_secs_f64(),
             );
+            if let Some(rungs) = rungs.as_ref() {
+                let mut histogram = [0usize; LADDER.len()];
+                for rung in rungs.iter() {
+                    histogram[rung.level] += 1;
+                }
+                let climbers = rungs.iter().filter(|r| !r.review).collect::<Vec<_>>();
+                let mean = if climbers.is_empty() {
+                    0.0
+                } else {
+                    climbers.iter().map(|r| r.level as f64).sum::<f64>() / climbers.len() as f64
+                };
+                println!(
+                    "#   rungs {} · climbing {:.2} · review {} · ceiling {}",
+                    histogram
+                        .iter()
+                        .take(ladder_ceiling + 1)
+                        .enumerate()
+                        .map(|(level, count)| format!("{}={count}", LADDER[level].name()))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    mean,
+                    rungs.len() - climbers.len(),
+                    LADDER[ladder_ceiling].name(),
+                );
+            }
+            save_actor_to(
+                &snapshot_path(&config.out),
+                &agent,
+                &normalizer,
+                &config,
+                &evaluation,
+            )?;
             if evaluation.score > best_score {
                 best_score = evaluation.score;
                 save_checkpoint(&agent, &normalizer, &config, &evaluation)?;
@@ -412,11 +486,17 @@ fn evaluate(
 ) -> AppResult<JointRollout> {
     let mut total = JointRollout::default();
     let mut rng = Rng::new(seed ^ 0xE7A1);
+    // Round-robin the stage's courses rather than pinning flat ground, so a
+    // terrain stage is scored on what it trains on. `JointEnv` takes its
+    // command from `speed_for(course)`, which is what gives the parkour pair
+    // its run-up. Pick `--eval-episodes` as a multiple of the course count if
+    // you want the mean to weight them evenly.
+    let courses = stage.courses();
     for episode in 0..episodes {
         let mut environment = JointEnv::new(
             frame,
             physics,
-            Terrain::new(Course::Flat, seed + episode as u64),
+            Terrain::new(courses[episode % courses.len()], seed + episode as u64),
             stage,
         );
         while !environment.is_done() {
@@ -465,6 +545,14 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
     let actions = n_act(frame);
     let metadata = std::fs::read_to_string(meta_path(path))?;
     let stage = parse_stage(metadata_required(&metadata, "stage")?)?;
+    // Which plant this actor was trained against. Absent in checkpoints
+    // written before the reduced-coordinate path existed, and those are all
+    // impulse — so absent means false, not unknown.
+    let physics = if metadata_field(&metadata, "reduced") == Some("true") {
+        Physics::reduced()
+    } else {
+        Physics::default()
+    };
     let (hidden, normalizer) = load_checkpoint_state(path, observations, actions)?;
     let actor_observations = normalizer.mean.len();
 
@@ -482,7 +570,7 @@ fn evaluate_checkpoint(config: &TrainConfig, device: &Device, path: &Path) -> Ap
     let rollout = evaluate(
         &agent,
         &normalizer,
-        &Physics::default(),
+        &physics,
         frame,
         stage,
         actor_observations,
@@ -516,12 +604,35 @@ fn save_checkpoint(
     config: &TrainConfig,
     evaluation: &JointRollout,
 ) -> AppResult<()> {
-    if let Some(parent) = config.out.parent() {
+    save_actor_to(&config.out, agent, normalizer, config, evaluation)
+}
+
+/// The most recent actor, written at every evaluation whatever it scored.
+///
+/// `save_checkpoint` promotes on improvement, which is the right rule for
+/// selection and the wrong one for a run left alone overnight: a long plateau
+/// followed by a crash loses every transition since the last gain. This is the
+/// crash-recovery copy, never the promoted one — resume from it with `--init`,
+/// but judge the run by `--out`.
+fn snapshot_path(out: &Path) -> PathBuf {
+    let mut value = out.as_os_str().to_owned();
+    value.push(".latest");
+    PathBuf::from(value)
+}
+
+fn save_actor_to(
+    path: &Path,
+    agent: &SacAgent,
+    normalizer: &ObsNorm,
+    config: &TrainConfig,
+    evaluation: &JointRollout,
+) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    agent.save_actor(&config.out)?;
+    agent.save_actor(path)?;
     let metadata = format!(
-        "format=hexapod-sac-actor-v1\nstage={}\nscore={:.17}\ndistance={:.17}\nseed={}\ninit={}\nstart_speed={:.17}\nspeed_ramp_steps={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
+        "format=hexapod-sac-actor-v1\nstage={}\nscore={:.17}\ndistance={:.17}\nseed={}\ninit={}\nstart_speed={:.17}\nspeed_ramp_steps={}\nobservations={}\nactions={}\nhidden={}\nactor_lr={:.17}\nreward_scale={:.17}\ninitial_alpha={:.17}\ntarget_entropy_per_action={:.17}\naction_prior_cost={:.17}\nwarmup_action_std={:.17}\nwarmup_hold_fraction={:.17}\npolicy_warmup_updates={}\nreduced={}\ncurriculum={}\nnorm_n={:.17}\nnorm_mean={}\nnorm_m2={}\n",
         config.stage.name(),
         evaluation.score,
         evaluation.distance,
@@ -543,11 +654,13 @@ fn save_checkpoint(
         config.warmup_action_std,
         config.warmup_hold_fraction,
         config.policy_warmup_updates,
+        config.reduced,
+        config.curriculum,
         normalizer.n,
         join_f64(&normalizer.mean),
         join_f64(&normalizer.m2),
     );
-    std::fs::write(meta_path(&config.out), metadata)?;
+    std::fs::write(meta_path(path), metadata)?;
     Ok(())
 }
 
@@ -661,8 +774,128 @@ fn parse_stage(value: &str) -> AppResult<Stage> {
     match value.to_ascii_lowercase().replace('_', "-").as_str() {
         "walk-flat" | "walk" => Ok(Stage::WalkFlat),
         "run-flat" | "run" => Ok(Stage::RunFlat),
-        _ => Err(format!("unsupported SAC stage {value:?}; use walk-flat or run-flat").into()),
+        "rough" => Ok(Stage::Rough),
+        "gaps" => Ok(Stage::Gaps),
+        "jump" => Ok(Stage::Jump),
+        "mixed" => Ok(Stage::Mixed),
+        _ => Err(format!(
+            "unsupported SAC stage {value:?}; use walk-flat, run-flat, rough, gaps, jump or mixed"
+        )
+        .into()),
     }
+}
+
+/// Difficulty ladder for the per-environment curriculum, in the order the
+/// stages already define. Nothing here is a new judgement about what is hard:
+/// each rung is one existing stage, with its own courses, command and horizon.
+/// `MIXED` is a rung and not just a ceiling: the four stages below it name six
+/// courses between them, and `MIXED` is the only stage that samples all
+/// fifteen. Without it here, SLALOM, SLICK, RAMPS, GAUNTLET, BEAM, PILLARS,
+/// WASHBOARD and GLACIER would never be trained at any difficulty.
+const LADDER: [Stage; 5] = [
+    Stage::WalkFlat,
+    Stage::Rough,
+    Stage::Gaps,
+    Stage::Jump,
+    Stage::Mixed,
+];
+
+/// Share of environments that ignore promotion and resample the whole ladder
+/// every episode.
+///
+/// Promotion moves an environment up exactly one rung, so while the fleet is
+/// climbing, the rungs it has left empty out and nothing in the replay window
+/// remembers them. The buffer is no defence: 2M transitions at ~1,900 steps/s
+/// is about eighteen minutes of experience, so flat-ground transitions are gone
+/// long before a terrain stage is finished with. These environments are the
+/// standing review set that keeps every cleared rung in the data distribution.
+const REVIEW_SHARE: f64 = 0.25;
+
+/// Highest rung `stage` allows.
+fn ceiling(stage: Stage) -> usize {
+    match stage {
+        Stage::Stand | Stage::WalkFlat | Stage::RunFlat => 0,
+        Stage::Rough => 1,
+        Stage::Gaps => 2,
+        Stage::Jump => 3,
+        Stage::Mixed => 4,
+    }
+}
+
+/// Where one environment currently sits.
+#[derive(Clone, Copy)]
+struct Rung {
+    level: usize,
+    course: Course,
+    /// Never promoted or demoted; resamples the whole ladder instead.
+    review: bool,
+}
+
+impl Rung {
+    fn stage(self) -> Stage {
+        LADDER[self.level]
+    }
+
+    fn command(self) -> f64 {
+        self.stage().speed_for(self.course)
+    }
+
+    fn sample(level: usize, review: bool, rng: &mut Rng) -> Rung {
+        let courses = LADDER[level].courses();
+        let course = courses[rng.next_u64() as usize % courses.len()];
+        Rung { level, course, review }
+    }
+
+    /// How much of this rung the episode got through, on a scale where 1.0 is
+    /// a pass.
+    ///
+    /// Neither available measure works alone. Ground covered against
+    /// `command x horizon` is the right test on the four-second flat stage and
+    /// unreachable on `MIXED`, whose 2.5 m/s over 30 s asks for 75 m of a course
+    /// about forty long. Route fraction is the right test on `MIXED` and close
+    /// to meaningless on flat, where four seconds of walking clears one of
+    /// eight waypoints however well it went. Whichever says the episode went
+    /// well is the one that did the measuring.
+    fn progress(self, rollout: &JointRollout) -> f64 {
+        let reach = self.command() * self.stage().horizon();
+        let by_ground = if reach > 0.0 { rollout.distance / reach } else { 0.0 };
+        by_ground.max(rollout.waypoint_fraction)
+    }
+}
+
+/// Promote an environment that covered its ground, demote one that did not.
+///
+/// This is the `legged_gym` rule rather than a global stage gate: levels are
+/// per robot, so every rung below the ceiling stays populated for as long as
+/// some environment keeps failing out of it, and easy terrain never leaves the
+/// replay. A global ladder promotes the whole run at once and then has nothing
+/// left that can still walk on flat ground.
+///
+/// At the ceiling a passing episode resamples anywhere at or below it, which is
+/// what stops the top rung from crowding out everything it was built on.
+fn advance(rung: Rung, ceiling: usize, progress: f64, rng: &mut Rng) -> Rung {
+    if rung.review {
+        return Rung::sample(rng.next_u64() as usize % (ceiling + 1), true, rng);
+    }
+    if progress >= 0.8 {
+        if rung.level >= ceiling {
+            return Rung::sample(rng.next_u64() as usize % (ceiling + 1), false, rng);
+        }
+        return Rung::sample(rung.level + 1, false, rng);
+    }
+    if progress < 0.5 && rung.level > 0 {
+        return Rung::sample(rung.level - 1, false, rng);
+    }
+    Rung::sample(rung.level, false, rng)
+}
+
+fn rung_env(rung: Rung, frame: Frame, physics: &Physics, seed: u64) -> JointEnv {
+    JointEnv::new(
+        frame,
+        physics,
+        Terrain::new(rung.course, seed),
+        rung.stage(),
+    )
 }
 
 fn curriculum_speed(stage: Stage, start: f64, ramp_steps: usize, transitions: usize) -> f64 {
@@ -695,6 +928,8 @@ fn print_help() {
          --warmup-hold-fraction X exact standing share of warm-up envs (default 0.50)\n\
          --batch N            replay minibatch (default 256)\n\
          --utd X              gradient updates per transition (default 1.0)\n\
+         --reduced            reduced-coordinate plant: same machine, ~1.6x faster\n\
+         --curriculum         per-environment difficulty levels up to --stage\n\
          --policy-warmup-updates N critic-only updates before actor training (default 1000)\n\
          --eval-interval N    held-out evaluation cadence (default 10000)\n\
          --eval-episodes N    held-out episodes (default 8)\n\
@@ -717,21 +952,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sac_stage_names_are_explicit_and_reject_harder_terrain() {
+    fn sac_stage_names_cover_the_whole_ladder() {
         assert_eq!(parse_stage("walk-flat").expect("walk"), Stage::WalkFlat);
         assert_eq!(parse_stage("RUN_FLAT").expect("run"), Stage::RunFlat);
-        assert!(parse_stage("mixed").is_err());
+        // Terrain used to be refused here because only the ARS trainer could
+        // reach it. `--stage` now names the curriculum's ceiling instead.
+        assert_eq!(parse_stage("rough").expect("rough"), Stage::Rough);
+        assert_eq!(parse_stage("mixed").expect("mixed"), Stage::Mixed);
+        assert!(parse_stage("parkour").is_err());
     }
 
+    /// The promotion rule is the only place difficulty moves, so it is the one
+    /// thing here that has to be right: a rung that never demotes fills replay
+    /// with a policy falling into trenches, and one that never promotes is a
+    /// flat-ground trainer with extra steps.
     #[test]
-    fn speed_curriculum_reaches_and_holds_the_stage_target() {
-        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 0, 0), 2.0);
-        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 0), 0.8);
-        assert!((curriculum_speed(Stage::RunFlat, 0.8, 100, 50) - 1.4).abs() < 1e-12);
-        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 100), 2.0);
-        assert_eq!(curriculum_speed(Stage::RunFlat, 0.8, 100, 200), 2.0);
-        assert_eq!(stratified_speed(0.8, 2.0, 0, 16), 0.8);
-        assert_eq!(stratified_speed(0.8, 2.0, 15, 16), 2.0);
-        assert_eq!(stratified_speed(0.8, 2.0, 0, 1), 2.0);
+    fn rungs_promote_on_progress_and_demote_without_it() {
+        let mut rng = Rng::new(7);
+        let top = ceiling(Stage::Mixed);
+        assert_eq!(top, LADDER.len() - 1);
+        assert_eq!(ceiling(Stage::WalkFlat), 0);
+        assert_eq!(ceiling(Stage::Rough), 1);
+
+        let start = Rung { level: 1, course: Stage::Rough.courses()[0], review: false };
+
+        // Covered its ground: up one, and onto that stage's own courses.
+        let up = advance(start, top, 0.9, &mut rng);
+        assert_eq!(up.level, 2);
+        assert!(Stage::Gaps.courses().contains(&up.course));
+
+        // Barely moved: down one. In between: held, so a rung it is only just
+        // surviving is not thrown away.
+        assert_eq!(advance(start, top, 0.1, &mut rng).level, 0);
+        assert_eq!(advance(start, top, 0.65, &mut rng).level, 1);
+
+        // The bottom rung is the floor, however badly it goes.
+        let floor = Rung { level: 0, course: Course::Flat, review: false };
+        assert_eq!(advance(floor, top, 0.0, &mut rng).level, 0);
+
+        // A ceiling is a ceiling, at the top and lower down: `--stage rough`
+        // must not wander onto trenches.
+        let peak = Rung { level: top, course: Stage::Mixed.courses()[0], review: false };
+        let capped = Rung { level: 1, course: Stage::Rough.courses()[0], review: false };
+        for _ in 0..256 {
+            assert!(advance(peak, top, 1.0, &mut rng).level <= top);
+            assert!(advance(capped, 1, 1.0, &mut rng).level <= 1);
+        }
     }
+
+    /// Both progress measures are needed, and each is wrong outside its own
+    /// regime — this pins which one takes over where.
+    #[test]
+    fn progress_uses_ground_on_flat_and_the_route_on_mixed() {
+        let flat = Rung { level: 0, course: Course::Flat, review: false };
+        // Four seconds of walking clears one of eight waypoints, so the route
+        // fraction is tiny while the episode was in fact a pass.
+        let walked = JointRollout { distance: 3.3, waypoint_fraction: 0.125, ..Default::default() };
+        assert!(flat.progress(&walked) >= 0.8, "3.3 m against a 3.2 m reach is a pass");
+
+        let mixed = Rung { level: ceiling(Stage::Mixed), course: Course::Slalom, review: false };
+        // 2.5 m/s over 30 s asks 75 m of a course about forty long, so ground
+        // covered can never pass; finishing the route has to.
+        let finished = JointRollout { distance: 38.0, waypoint_fraction: 1.0, ..Default::default() };
+        assert!(mixed.progress(&finished) >= 0.8, "a completed route is a pass");
+        let stalled = JointRollout { distance: 2.0, waypoint_fraction: 0.1, ..Default::default() };
+        assert!(mixed.progress(&stalled) < 0.5, "going nowhere is not");
+    }
+
+    /// The review set is what stops a cleared rung from leaving the data. The
+    /// replay window is about eighteen minutes of experience, so nothing else
+    /// remembers flat ground once the fleet has climbed off it.
+    #[test]
+    fn the_review_set_keeps_every_cleared_rung_in_the_mix() {
+        let mut rng = Rng::new(11);
+        let top = ceiling(Stage::Mixed);
+        let mut seen = [false; LADDER.len()];
+        let mut rung = Rung { level: top, course: Stage::Mixed.courses()[0], review: true };
+        for _ in 0..2000 {
+            // A reviewer passing at the ceiling must still come back down.
+            rung = advance(rung, top, 1.0, &mut rng);
+            assert!(rung.review, "a reviewer must stay a reviewer");
+            assert!(rung.level <= top);
+            seen[rung.level] = true;
+        }
+        assert!(seen.iter().all(|hit| *hit), "review never revisited some rung: {seen:?}");
+    }
+
+    /// Every course has to be reachable by some rung. The ladder first shipped
+    /// topping out at JUMP, which silently meant SLALOM, SLICK, RAMPS,
+    /// GAUNTLET, BEAM, PILLARS, WASHBOARD and GLACIER were never trained at
+    /// any difficulty — nine of fifteen courses, and nothing failed.
+    #[test]
+    fn the_ladder_reaches_every_course() {
+        let reachable: Vec<Course> = LADDER
+            .iter()
+            .flat_map(|stage| stage.courses().iter().copied())
+            .collect();
+        for course in hexapod_core::terrain::COURSES {
+            assert!(
+                reachable.contains(&course),
+                "no rung of the ladder ever trains {course:?}"
+            );
+        }
+    }
+
 }
