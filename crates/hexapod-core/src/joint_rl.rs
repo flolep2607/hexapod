@@ -1730,8 +1730,17 @@ fn reward(
     // hopping on one leg still collected most of the speed reward. A hexapod
     // on fewer than two feet is not walking, whatever its velocity says, so
     // below that the tick is worth almost nothing.
-    let enough_feet = ((duty - 0.35) / 1.4).clamp(0.0, 1.0);
-    let posture = level * height * enough_feet;
+    //
+    // This is `support_gate`, the same curve `episode_score` grades on, and
+    // deliberately not a second shape. A linear ramp saturating at 1.75 feet
+    // lived here instead, which valued flight at 0.31 where the score valued
+    // it at 0.14 and handed full credit to a machine on two feet -- no
+    // gradient at all from there to a tripod. A run with the gradient finally
+    // scaled to be visible sat at 0.67, 1.48 and 0.78 feet across three evals
+    // while covering its distance airborne, because at 10x speed that was
+    // worth 0.91 against a tripod's 1.00. Squared and reaching full credit at
+    // 0.35 * legs, the same flight is worth 0.48.
+    let posture = level * height * support_gate(duty, legs);
     // Whatever the tripod term does not take goes to speed tracking, so the
     // weights still sum to one and a terrain stage is not quietly scored out
     // of a lower maximum than a flat one.
@@ -3057,8 +3066,20 @@ mod tests {
         let projectile = tick(20.0, 0.5);
         let tripod = tick(2.0, 3.0);
         assert!(
-            projectile < tripod,
+            projectile * 2.0 < tripod,
             "a projectile at 10x the speed scored {projectile} against {tripod}"
+        );
+
+        // And pin *which* curve does it, because a bare `projectile < tripod`
+        // passed while `reward` used a linear ramp of its own that valued the
+        // same flight at 0.31 where `episode_score` valued it at 0.14. At equal
+        // speed the ratio between two duties has to be the gate's ratio and
+        // nothing else, which no second shape can satisfy.
+        let ratio = tick(2.0, 0.5) / tick(2.0, 3.0);
+        let gate = support_gate(0.5, 6) / support_gate(3.0, 6);
+        assert!(
+            (ratio - gate).abs() < 1e-12,
+            "reward's support curve is not `support_gate`: {ratio} vs {gate}"
         );
 
         // And nothing anywhere is negative, which is what keeps falling over
