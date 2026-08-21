@@ -182,9 +182,11 @@ pub struct Physics {
     /// number: either a cheaper gait than the hand-tuned tripod, or a torque
     /// budget the controller spends and lets recover.
     ///
-    /// 3.92 N-m is also the most the part will actually deliver: its overload
-    /// protection trips above 80% of the 50 kg-cm stall, so a controller asking
-    /// for stall gets a servo that switches itself off.
+    /// Stall is 50 kg-cm and a bench run peaked at 48 for a split second, so
+    /// 4.5 N-m — 46 kg-cm — is inside what the part has been seen to deliver,
+    /// but only just, and only briefly: the overload protection trips above 80%
+    /// of stall after 2.5 s, which is why reaching it is gated behind a boost
+    /// budget rather than being the ceiling all the time.
     ///
     /// Judge a change here on the walk, never on the stand. Standing is
     /// insensitive — the deck holds 0.87 m at every ceiling from 1.57 N-m up —
@@ -193,15 +195,20 @@ pub struct Physics {
     /// fine. Only the four-second walk separates 3.92 from 2.45.
     pub motor_max: f64,
 
-    /// Ceiling on joint torque the servo can hold indefinitely, newton-metres.
+    /// Ceiling on joint torque outside a boost, newton-metres.
     ///
-    /// `motor_max` is the peak; this is the continuous rating, and on the
-    /// STS3250 the two differ by a factor of 1.6 — 25 kg-cm measured sustained
-    /// before the overload trip against 40 kg-cm intermittent. The joint-level
-    /// environment drives at this figure and spends `motor_max` only while a
-    /// boost is engaged, so the machine is not asked to hold a torque that
-    /// would trip its own protection. Nothing else reads it: the gait-level
-    /// paths have no boost action to spend and run at `motor_max`.
+    /// The joint-level environment drives at this figure and spends
+    /// `motor_max` only while a boost is engaged. At 3.92 N-m — 40 kg-cm — this
+    /// is what the reference tripod measurably needs to walk at all, and it is
+    /// deliberately above what the servo can hold under its own protection:
+    /// the bench figure for sustained torque is 25 kg-cm, and 40 kg-cm is 80%
+    /// of stall, exactly where the overload trip fires after 2.5 s. So this is
+    /// a choice to run the part hard rather than to run it safe, taken because
+    /// the machine does not walk on the safe number. Cooling, a lighter build
+    /// or a bigger servo are the ways to buy that margin back.
+    ///
+    /// Nothing else reads it: the gait-level paths have no boost action to
+    /// spend and run at `motor_max` throughout.
     pub motor_sustained: f64,
 
     /// Build the legs as one reduced-coordinate multibody instead of eighteen
@@ -237,11 +244,11 @@ impl Default for Physics {
             solver_iters: 8,
             pgs_iters: 4,
             foot_mu: 1.15,
-            // 40 kg-cm: what the reference tripod actually needs, which is the
-            // STS3250's intermittent rating and not its sustained one.
-            motor_max: 3.92,
-            // 25 kg-cm, measured sustained before the overload trip.
-            motor_sustained: 2.45,
+            // 46 kg-cm boosted, 40 kg-cm normally. A bench run on the STS3250
+            // peaked at 48 kg-cm for a split second, so the boost ceiling is
+            // inside what the part has been seen to deliver.
+            motor_max: 4.5,
+            motor_sustained: 3.92,
             reduced: false,
             // Eighteen STS3250 at 74.5 g is 1.34 kg on its own, and the leg
             // structure another 0.31; the rest is chassis, 3S pack and

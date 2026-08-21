@@ -2145,6 +2145,8 @@ mod tests {
             (12.0, 8.0e3, 5.0e6),
             (8.00, 8.0e3, 5.0e6),
             (4.90, 8.0e3, 5.0e6),
+            // The two the build actually uses: boosted, then normal.
+            (4.50, 8.0e3, 5.0e6),
             (3.92, 8.0e3, 5.0e6),
             (2.45, 8.0e3, 5.0e6),
             (1.57, 8.0e3, 5.0e6),
