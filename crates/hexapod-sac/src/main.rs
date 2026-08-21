@@ -842,8 +842,18 @@ const REVIEW_SHARE: f64 = 0.25;
 /// Episodes in the moving average behind the finish bar.
 const FINISH_WINDOW: f64 = 200.0;
 
-/// How much an episode moves its environment's horizon, up or down.
-const HORIZON_STEP: f64 = 1.15;
+/// Share of an episode's growth range added per qualifying episode, so it takes
+/// 80 of them to go from a stage's own horizon to the cap.
+///
+/// This was a 1.15x *multiplier*, which from an 8 s floor added 1.2 s at a time
+/// and reached 12.2 s in three qualifying episodes. Every one of those steps
+/// lengthened episodes by 15% at once, and the fleet felt it: at 4M transitions
+/// the reach bar moved for the first time, the clock went 8.0 -> 9.2 -> 12.2 s,
+/// six of sixteen environments were demoted out of ROUGH, and the benchmark
+/// score fell from 0.082 to 0.030 before recovering. Growth that arrives in one
+/// lump is a distribution shift; the same growth spread over eighty episodes is
+/// a curriculum.
+const HORIZON_GAIN: f64 = 0.0125;
 
 /// Longest an episode may grow, as a multiple of its stage's own horizon.
 ///
@@ -1022,16 +1032,20 @@ impl ReachBar {
 /// time. As the policy improves the bar rises with it, which makes the growth
 /// self-limiting rather than a one-way trip to the ceiling.
 fn grow_horizon(current: f64, floor: f64, summary: &JointRollout, reach: f64) -> f64 {
-    let factor = if summary.completed {
-        1.0
+    // One eightieth of the range either way, never a multiple of where the
+    // horizon happens to be: a proportional step compounds, so the same
+    // qualifying episode is worth more time the more time it already has.
+    let step = HORIZON_GAIN * floor * (HORIZON_MAX - 1.0);
+    let delta = if summary.completed {
+        0.0
     } else if summary.fell || summary.distance <= 0.0 {
-        1.0 / HORIZON_STEP
+        -step
     } else if summary.distance >= reach {
-        HORIZON_STEP
+        step
     } else {
-        1.0
+        0.0
     };
-    (current * factor).clamp(floor, floor * HORIZON_MAX)
+    (current + delta).clamp(floor, floor * HORIZON_MAX)
 }
 
 fn rung_env(rung: Rung, frame: Frame, physics: &Physics, seed: u64) -> JointEnv {
@@ -1216,7 +1230,21 @@ mod tests {
             horizon = grow_horizon(horizon, floor, &walked(99.0), reach);
         }
         assert_eq!(horizon, floor * HORIZON_MAX);
-        assert!(HORIZON_MAX <= 2.0, "a big cap starved the fleet of resets");
+
+        // And it gets there smoothly. No single episode may move the clock by
+        // more than a fiftieth of the range, in either direction, at any
+        // horizon -- a 15% multiplier moved it by 1.2 s a time from an 8 s
+        // floor, which dumped the benchmark score every time it fired.
+        let span = floor * (HORIZON_MAX - 1.0);
+        for start in [floor, floor * 1.2, floor * 1.6, floor * HORIZON_MAX] {
+            for outcome in [walked(99.0), walked(0.0), walked(-1.0), fell, done] {
+                let moved = (grow_horizon(start, floor, &outcome, reach) - start).abs();
+                assert!(
+                    moved <= span / 50.0,
+                    "one episode moved the horizon {moved} s from {start} s"
+                );
+            }
+        }
     }
 
     /// The reach bar is the same ratchet as the finish bar, the other way up:
