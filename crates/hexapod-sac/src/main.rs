@@ -189,11 +189,25 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     if let Some(torque) = config.motor_max {
         physics.motor_max = torque;
     }
-    // Rapier steps per control tick. The cost of a step is exactly linear in
-    // this, and it is 93% of the trainer's wall clock, so halving it very
-    // nearly doubles throughput. It also halves the integration accuracy the
-    // position motor gets, and a policy is precisely the thing that finds and
-    // exploits a loose contact solver -- watch `feet` if you lower it.
+    // Rapier steps per control tick. Lowering it was measured and lost, twice
+    // over, so the default is where it should be and this flag exists to let
+    // someone re-check rather than to be used.
+    //
+    // A controlled pair on ROUGH -- same seed, same everything else -- had 4
+    // substeps at score 0.080 and 5.35 m after three million transitions
+    // against 2 substeps at 0.055 and 3.48 m. Worse per sample, and worse per
+    // wall second as well: the cheap run reached three million in 862 s, by
+    // which time the accurate one was already past 4.4 m. The support column
+    // says why. Two substeps keeps all six feet on the ground through two
+    // million transitions while four is down to 4.97 and lifting legs, which
+    // is what a position loop too coarse to execute a crisp leg lift looks
+    // like.
+    //
+    // The throughput was not there either. A step's cost is exactly linear in
+    // this and the trainer spends 93% of its wall clock stepping, which
+    // predicts 2.07x; the run delivered 1.37x, because halving the collection
+    // cost moves the bottleneck onto the gradient step -- `grad` goes from 59%
+    // of wall to 67%. Pricing the physics alone is not enough.
     if let Some(n) = config.substeps {
         physics.substeps = n.max(1);
     }
