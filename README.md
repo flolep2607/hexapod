@@ -348,14 +348,29 @@ that arrived gets nothing, having had time to spare. A short horizon early is
 cheap, many resets and fast turnover on the gait, and useless later when the
 finish is out of reach however well the machine moves.
 
-The condition matters more than it looks. It first shipped requiring
-`waypoint_fraction >= 0.5`, half the whole route, which could never be earned:
-measured on the first curriculum run, the machine walked 4.1 m of a 40 m course,
-so route fraction sat near 0.1, every environment stayed pinned at its 8 s stage
-horizon, the finish was unreachable by construction — and therefore no episode
-ever arrived, the finish bar never came into existence, and the terminal arrival
-reward was dead code the whole time. Gating on whether the clock bound it lets
-the horizon bootstrap instead: more time reaches further, which earns more time.
+The condition took three attempts and the first two were both the wrong shape.
+
+Requiring `waypoint_fraction >= 0.5` — half the whole route — could never be
+earned: measured, the machine walked 4.1 m of a 40 m course, so route fraction
+sat near 0.1, every environment stayed pinned at its 8 s stage horizon, and the
+finish was unreachable by construction. Which made the terminal arrival reward
+dead code: nothing ever arrived, so the finish bar never came into existence.
+
+Replacing it with "still moving forward when the clock expired" was worse in the
+other direction. That is true of *any* walking policy, so the horizon grew
+unconditionally: episodes reached 42 s against a stage horizon of 8, the fleet
+saw roughly a quarter as many episodes, resets and course seeds per million
+transitions, and the score stopped improving — 3.5M transitions oscillating
+between 0.02 and 0.20 without ever beating the checkpoint it started from.
+
+Neither measured competence. The condition now is `distance >= reach`, where
+`reach` is the monotone best of a moving average of ground covered — the same
+ratchet as the finish bar, the other way up. Only an episode that beat what the
+policy has been managing earns more time, and the bar rises as the policy
+improves, so growth is self-limiting instead of a one-way trip to the ceiling.
+`HORIZON_MAX` came down from 6.0 to 2.0 with it: long episodes are how
+route-following gets learned and short ones are where sample diversity comes
+from, and 6.0 let the first crowd out the second.
 
 So the machine picks its own pace — fast on the flat, slow onto a trench lip —
 because what pays is getting there. `going_faster_toward_the_target_is_never_worth_less`

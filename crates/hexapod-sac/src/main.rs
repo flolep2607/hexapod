@@ -180,6 +180,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     });
     let mut episode_seed = 0u64;
     let mut bar = FinishBar::default();
+    let mut reach = ReachBar::default();
     let mut horizons = vec![stage.horizon(); config.environments];
     let mut environments = (0..config.environments)
         .map(|index| {
@@ -372,10 +373,11 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 if summary.completed {
                     bar.observe(summary.secs);
                 }
+                reach.observe(summary.distance);
                 let floor = rungs
                     .as_ref()
                     .map_or(stage.horizon(), |rungs| rungs[index].stage().horizon());
-                horizons[index] = grow_horizon(horizons[index], floor, &summary);
+                horizons[index] = grow_horizon(horizons[index], floor, &summary, reach.value());
                 if let Some(rungs) = rungs.as_mut() {
                     let progress = rungs[index].progress(&summary);
                     rungs[index] = advance(rungs[index], ladder_ceiling, progress, &mut rng);
@@ -457,12 +459,13 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                     climbers.iter().map(|r| r.level as f64).sum::<f64>() / climbers.len() as f64
                 };
                 println!(
-                    "#   bar {} · horizon {:.1}-{:.1} s",
+                    "#   bar {} · reach {:.2} m · horizon {:.1}-{:.1} s",
                     if bar.value() > 0.0 {
                         format!("{:.2} s", bar.value())
                     } else {
                         "none yet".into()
                     },
+                    reach.value(),
                     horizons.iter().copied().fold(f64::INFINITY, f64::min),
                     horizons.iter().copied().fold(0.0, f64::max),
                 );
@@ -843,7 +846,17 @@ const FINISH_WINDOW: f64 = 200.0;
 const HORIZON_STEP: f64 = 1.15;
 
 /// Longest an episode may grow, as a multiple of its stage's own horizon.
-const HORIZON_MAX: f64 = 6.0;
+///
+/// This was 6.0, and 6.0 was too much. Episodes reached 42 s against a stage
+/// horizon of 8, so at a fixed transition budget the fleet saw roughly a
+/// quarter as many episodes, resets and course seeds — and the score stopped
+/// improving. Long episodes are how route-following gets learned and short ones
+/// are where sample diversity comes from; 2.0 is a compromise that cannot run
+/// away from the diversity.
+const HORIZON_MAX: f64 = 2.0;
+
+/// Episodes in the moving average behind the reach bar.
+const REACH_WINDOW: f64 = 200.0;
 
 /// The finish time worth half the terminal bonus: the best the policy has
 /// managed, never the merely recent.
@@ -961,6 +974,32 @@ fn advance(rung: Rung, ceiling: usize, progress: f64, rng: &mut Rng) -> Rung {
     Rung::sample(rung.level, false, rng)
 }
 
+/// Monotone best of a moving average of ground covered. Same ratchet as
+/// [`FinishBar`], the other way up because more distance is better.
+#[derive(Clone, Copy, Default)]
+struct ReachBar {
+    best: f64,
+    recent: f64,
+}
+
+impl ReachBar {
+    fn value(self) -> f64 {
+        self.best
+    }
+
+    fn observe(&mut self, metres: f64) {
+        if !metres.is_finite() || metres <= 0.0 {
+            return;
+        }
+        self.recent = if self.recent <= 0.0 {
+            metres
+        } else {
+            self.recent + (metres - self.recent) / REACH_WINDOW
+        };
+        self.best = self.best.max(self.recent);
+    }
+}
+
 /// How long this environment's next episode should be.
 ///
 /// The clock is extended when the clock is what stopped it. Falling is not a
@@ -969,21 +1008,28 @@ fn advance(rung: Rung, ceiling: usize, progress: f64, rng: &mut Rng) -> Rung {
 /// many resets than from long ones. Arriving extends nothing: an episode that
 /// completed had time to spare.
 ///
-/// This used to require `waypoint_fraction >= 0.5`, half the whole route, which
-/// could never be earned. Measured on the first curriculum run: the machine
-/// walked 4.1 m of a 40 m course, so route fraction sat near 0.1, every
-/// environment stayed pinned at the 8 s stage horizon, and the finish was
-/// unreachable by construction — which meant no episode ever arrived, the
-/// finish bar never existed, and the terminal reward was dead code. Gating on
-/// *whether the clock bound it* rather than on how much course was left lets
-/// the horizon bootstrap: more time reaches further, which earns more time.
-fn grow_horizon(current: f64, floor: f64, summary: &JointRollout) -> f64 {
+/// Both earlier conditions were the wrong shape. Requiring
+/// `waypoint_fraction >= 0.5` — half the whole route — could never be earned:
+/// the machine walked 4.1 m of a 40 m course, so every environment stayed
+/// pinned at its stage horizon and the finish was unreachable by construction.
+/// Replacing it with "still moving forward when the clock expired" is true of
+/// *any* walking policy, so the horizon grew unconditionally to the cap and
+/// stayed there, and the score stopped improving. Neither one measured
+/// competence.
+///
+/// `reach` does: it is the monotone best of a moving average of ground covered,
+/// so only an episode that beat what the policy has been managing earns more
+/// time. As the policy improves the bar rises with it, which makes the growth
+/// self-limiting rather than a one-way trip to the ceiling.
+fn grow_horizon(current: f64, floor: f64, summary: &JointRollout, reach: f64) -> f64 {
     let factor = if summary.completed {
         1.0
     } else if summary.fell || summary.distance <= 0.0 {
         1.0 / HORIZON_STEP
-    } else {
+    } else if summary.distance >= reach {
         HORIZON_STEP
+    } else {
+        1.0
     };
     (current * factor).clamp(floor, floor * HORIZON_MAX)
 }
@@ -1137,43 +1183,58 @@ mod tests {
         assert!(seen.iter().all(|hit| *hit), "review never revisited some rung: {seen:?}");
     }
 
-    /// Time is extended when the clock is what stopped it, and not otherwise.
-    /// Each branch matters: a faller that grew would spend longer falling, a
-    /// finisher that grew was never short of time, and — the one that bit — a
-    /// machine walking well with most of the course still ahead of it has to be
-    /// able to buy time, or the finish stays unreachable forever and the whole
-    /// arrival reward is dead code.
+    /// Time is extended only when the machine just did better than it has been
+    /// doing. Both earlier conditions were the wrong shape: half-the-route
+    /// could never be earned, and "still moving forward" is true of any walking
+    /// policy, so the horizon went straight to the cap and the score stalled.
     #[test]
-    fn the_clock_is_extended_when_the_clock_is_what_stopped_it() {
+    fn only_beating_its_own_reach_buys_more_time() {
         let floor = 8.0;
         let walked = |metres: f64| JointRollout { distance: metres, ..Default::default() };
+        let reach = 5.0;
 
-        // Still going forward when time ran out, with 90% of the course left:
-        // this is the case the old rule refused and the run was stuck on.
-        let barely_started = JointRollout {
-            distance: 4.1,
-            waypoint_fraction: 0.1,
-            ..Default::default()
-        };
-        assert!(grow_horizon(floor, floor, &barely_started) > floor);
-
-        // Went nowhere, or backwards: give it back, short resets are cheaper.
-        assert!(grow_horizon(floor * 2.0, floor, &walked(0.0)) < floor * 2.0);
-        assert!(grow_horizon(floor * 2.0, floor, &walked(-1.0)) < floor * 2.0);
-        // Fell: same, and never below the stage's own horizon.
+        // Beat the standing best: it can use more time.
+        assert!(grow_horizon(floor, floor, &walked(6.0), reach) > floor);
+        // Moving, but no better than usual: hold. This is the case that used to
+        // grow unconditionally and run the horizon to its ceiling.
+        assert_eq!(grow_horizon(floor, floor, &walked(4.0), reach), floor);
+        // Went nowhere, or backwards, or fell: give it back, short resets being
+        // cheaper for a policy that is not moving. Never below the stage's own.
+        assert!(grow_horizon(floor * 1.5, floor, &walked(0.0), reach) < floor * 1.5);
+        assert!(grow_horizon(floor * 1.5, floor, &walked(-1.0), reach) < floor * 1.5);
         let fell = JointRollout { distance: 9.0, fell: true, ..Default::default() };
-        assert!(grow_horizon(floor * 2.0, floor, &fell) < floor * 2.0);
-        assert_eq!(grow_horizon(floor, floor, &fell), floor);
+        assert!(grow_horizon(floor * 1.5, floor, &fell, reach) < floor * 1.5);
+        assert_eq!(grow_horizon(floor, floor, &fell, reach), floor);
         // Arrived: it had time to spare.
-        let finished = JointRollout { distance: 40.0, completed: true, ..Default::default() };
-        assert_eq!(grow_horizon(floor * 2.0, floor, &finished), floor * 2.0);
+        let done = JointRollout { distance: 40.0, completed: true, ..Default::default() };
+        assert_eq!(grow_horizon(floor * 1.5, floor, &done, reach), floor * 1.5);
 
-        // Growth is bounded, and reaches the cap from the floor.
+        // Bounded, and the cap is close enough that episode length cannot run
+        // away from the reset diversity.
         let mut horizon = floor;
         for _ in 0..500 {
-            horizon = grow_horizon(horizon, floor, &walked(5.0));
+            horizon = grow_horizon(horizon, floor, &walked(99.0), reach);
         }
         assert_eq!(horizon, floor * HORIZON_MAX);
+        assert!(HORIZON_MAX <= 2.0, "a big cap starved the fleet of resets");
+    }
+
+    /// The reach bar is the same ratchet as the finish bar, the other way up:
+    /// it must not slip when the policy has a bad patch, or a bad patch would
+    /// buy the horizon growth that a good one earned.
+    #[test]
+    fn the_reach_bar_never_slips() {
+        let mut reach = ReachBar::default();
+        assert_eq!(reach.value(), 0.0);
+        for _ in 0..2000 {
+            reach.observe(4.0);
+        }
+        let four = reach.value();
+        assert!(four > 0.0 && four <= 4.0);
+        for _ in 0..20_000 {
+            reach.observe(0.5);
+            assert!(reach.value() >= four - 1e-12, "reach slipped to {}", reach.value());
+        }
     }
 
     /// The whole reason the bar is a ratchet. A bar that followed a moving
