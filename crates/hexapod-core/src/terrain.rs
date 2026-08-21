@@ -13,7 +13,7 @@
 //! the ones with something in the way it threads the gaps, which is the whole
 //! point of having it.
 
-use crate::math::{clamp, Rng, V3};
+use crate::math::{clamp, hypot2, Rng, V3};
 
 /// Half-width of the walkable corridor, in metres. Also where the two
 /// invisible walls are: the robot cannot cross them, and neither can a rock.
@@ -213,6 +213,11 @@ pub struct Terrain {
     pub obstacles: Vec<Obstacle>,
     /// The route, in order. Always ends at the far end of the corridor.
     pub waypoints: Vec<[f64; 2]>,
+    /// Distance from each waypoint to the end of the route, along the route.
+    /// Paying a policy for ground closed needs a remaining-distance that does
+    /// not jump when a waypoint is credited, and the straight line to the last
+    /// waypoint is not it: on a slalom it cuts through the cones.
+    tail: Vec<f64>,
     buckets: Vec<Vec<u16>>,
 }
 
@@ -223,6 +228,7 @@ impl Terrain {
             seed,
             obstacles: Vec::new(),
             waypoints: Vec::new(),
+            tail: Vec::new(),
             buckets: vec![Vec::new(); N_BUCKETS],
         };
         t.generate();
@@ -231,7 +237,39 @@ impl Terrain {
         if t.course.is_jump() || t.course == Course::Beam {
             t.snap_waypoints_to_ground();
         }
+        // After every waypoint is in its final place, including the snap.
+        t.rebuild_tail();
         t
+    }
+
+    /// Cumulative route distance from each waypoint to the last.
+    fn rebuild_tail(&mut self) {
+        let n = self.waypoints.len();
+        self.tail = vec![0.0; n];
+        for i in (0..n.saturating_sub(1)).rev() {
+            let (a, b) = (self.waypoints[i], self.waypoints[i + 1]);
+            self.tail[i] = self.tail[i + 1] + hypot2(b[0] - a[0], b[1] - a[1]);
+        }
+    }
+
+    /// Route distance still to run from waypoint `i` onward, not counting the
+    /// leg the machine is on. Saturates like [`Terrain::waypoint`].
+    #[inline]
+    pub fn route_tail(&self, i: usize) -> f64 {
+        match self.tail.len() {
+            0 => 0.0,
+            n => self.tail[i.min(n - 1)],
+        }
+    }
+
+    /// The whole route, from the start of the corridor to the last waypoint.
+    /// This is the most ground any episode can close, so it is what turns
+    /// metres into a fraction for scoring.
+    pub fn route_length(&self) -> f64 {
+        match self.waypoints.first() {
+            None => Z_MAX,
+            Some(first) => hypot2(first[0], first[1]) + self.route_tail(0),
+        }
     }
 
     /// Where the two invisible walls are, as a distance from the centreline.

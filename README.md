@@ -285,25 +285,31 @@ controller that strolled to the finish scored exactly like one that ran.
 
 What replaced them:
 
-- **Speed toward the target is linear**, `along / REFERENCE_SPEED`, unbounded
-  above. Linear is the only shape with no opinion about *how* the ground was
-  covered: the sum over an episode is the distance, so braking and accelerating
-  scores exactly what holding one pace scores.
+- **There is no speed term at all.** The objective is *metres of route closed*:
+  `progress_tick(closed, gate)` pays the reduction in remaining route distance,
+  gated by posture going forward and charged in full going back. A linear speed
+  term came first and was better than the saturating curve it replaced — it had
+  no opinion about *how* ground was covered, where any concave function of speed
+  prefers a steady pace to a varying one over the same distance (Jensen), and
+  the old curve taxed braking by **24.5%**. Sometimes slowing into a trench lip
+  is how you clear it, the way slowing into a corner is how you leave it faster.
 
-  This matters more than it sounds. Any *concave* function of speed strictly
-  prefers a steady pace to a varying one covering the same ground — Jensen's
-  inequality — and the saturating curve that came before was taxing braking by
-  **24.5%**: two ticks at 1.0 paid 1.245 against 1.000 for the same distance as
-  2.0 then a standstill. Sometimes slowing into a trench lip is how you clear it
-  and keep going, the way slowing into a corner is how you leave it faster, and
-  a concave per-tick reward cannot represent that.
-  `where_the_speed_went_does_not_change_the_reward` pins it against three
-  profiles.
-- **`REFERENCE_SPEED` is a unit, not a table and not a target.** Because the
-  term is linear, the constant scales the number and cannot express a
-  preference about the profile. `reward` and `episode_score` take no commanded
-  speed at all, and the whole preference for arriving sooner lives in the
-  terminal bonus, which is where the trade can actually be seen.
+  But linear-and-unbounded was itself the exploit. A speed term with no ceiling
+  cannot be gated: a posture gate of `g` costs nothing you cannot recover by
+  going `1/g` faster. Measured — doubling the cost of flight left mean support
+  at 0.72 of six and raised Q from 29.5 to 31.0, because the policy simply flew
+  twice as fast. Ground closed has no such slack. It is bounded by the route, it
+  telescopes so oscillating pays exactly zero, and with no speed term left there
+  is nothing to buy the gate back with. `ground_closed_is_the_whole_objective`
+  pins all four properties.
+- **The dense reward and the score are one quantity in two units.** Every
+  objective bug in this codebase has been those two drifting apart — a horizon
+  divisor on both that made the reward 2000× too small to learn from, a support
+  deficit subtracted from each on a different basis, a progress gate on only one
+  of them, two differently-shaped support curves.
+  `the_dense_reward_and_the_score_are_the_same_quantity` asserts
+  `learning_reward / route_length == score` exactly, across four stage/course
+  pairs. It replaced a test that asserted the opposite.
 - **Arriving sooner pays, and the policy feels it.** Reaching the target used to
   *cost* return. `learning_reward` is per-tick and sums to 1.0 over a full
   episode; arriving terminates the episode, so finishing halfway through banked
@@ -373,14 +379,15 @@ route-following gets learned and short ones are where sample diversity comes
 from, and 6.0 let the first crowd out the second.
 
 So the machine picks its own pace — fast on the flat, slow onto a trench lip —
-because what pays is getting there. `going_faster_toward_the_target_is_never_worth_less`
-and `reaching_the_target_sooner_scores_higher` are the checks.
+because what pays is getting there. `ground_closed_is_the_whole_objective` and
+`reaching_the_target_sooner_scores_higher` are the checks.
 
 On units: simulator speeds are **ten times physical**. `chassis_vel` returns
 `to_sim(linvel)`, which divides by `scale = 0.10`, and the legs are
 `0.30 + 0.80 + 1.00 = 1.8` units of a 0.18 m reach. The old 4.0 parkour command
 was 0.4 m/s on a 2 kg machine, about 1.3 body-widths a second — it read as a
-highway speed and was not one. `REFERENCE_SPEED = 2.0` is 0.2 m/s.
+highway speed and was not one. Route lengths are in the same units: a course is
+about 62 units, so 6.2 physical metres.
 
 **The promotion gates need recalibrating.** `Stage::promote_at` — 0.45 walking
 down to 0.22 for jumping — was tuned against the old per-stage commands, and

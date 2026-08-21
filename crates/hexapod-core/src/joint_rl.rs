@@ -55,36 +55,6 @@ pub const ACT_RANGE: f64 = 0.40;
 /// A real controller slews its setpoint; so does this one.
 pub const MAX_JOINT_RATE: f64 = 6.0;
 
-/// The unit the speed term is measured in, simulator units.
-///
-/// This is a unit conversion and nothing else. The term is *linear* in speed,
-/// so summing it over an episode gives ground covered divided by
-/// `REFERENCE_SPEED` — the constant scales the number and cannot express a
-/// preference about how the ground was covered.
-///
-/// There used to be a commanded speed per stage (0.8 walking, 2.0 running, 4.0
-/// for the parkour run-up) that the reward tracked, with a penalty above it.
-/// That answers the wrong question. The task is to reach a point in space as
-/// soon as possible through whatever is in the way, so nothing should prefer a
-/// slower machine and no stage should carry a speed it is supposed to sit on.
-///
-/// It was briefly a saturating curve, which was worse than a target. Any
-/// function of speed that is *concave* prefers a steady pace to a varying one
-/// covering the same ground — Jensen's inequality — and the measured size of
-/// that was 24.5%: crossing two ticks at 1.0 paid 1.245 where covering the same
-/// distance as 2.0 then a standstill paid 1.000. It paid the machine not to
-/// brake. Sometimes slowing into a trench lip is how you clear it and keep
-/// going, exactly as slowing into a corner is how you leave it faster, and a
-/// concave per-tick reward cannot represent that.
-///
-/// Linear is the only shape with no opinion: the sum depends on the distance
-/// and not on the profile, so where the speed went is left to the policy and
-/// the whole preference for arriving sooner lives in the terminal bonus, which
-/// is where it can see the trade.
-///
-/// In physical units this is 0.2 m/s — simulator speeds are ten times physical,
-/// the legs being 1.8 units of a 0.18 m reach.
-pub const REFERENCE_SPEED: f64 = 2.0;
 
 /// Weight on the terminal reward for reaching the target.
 ///
@@ -870,6 +840,11 @@ pub struct JointEnv {
     /// has seen an episode reach the target, and no bonus is paid before then:
     /// there is nothing to be half as good as yet.
     finish_bar: f64,
+    /// Route distance left as of the previous tick. `self.route` only refreshes
+    /// at the top of a tick, so progress has to be measured across tick
+    /// boundaries: reading it after `plant.step` gave the pre-step value and a
+    /// reward that was identically zero.
+    last_remaining: f64,
     duty: f64,
     max_ticks: usize,
     boundary: bool,
@@ -901,6 +876,7 @@ impl JointEnv {
             max_ticks: (stage.horizon() / DT) as usize,
             horizon: stage.horizon(),
             finish_bar: 0.0,
+            last_remaining: 0.0,
             terrain,
             stage,
             initial,
@@ -925,6 +901,7 @@ impl JointEnv {
             observation: vec![0.0; n_obs(frame)],
         };
         env.refresh_observation();
+        env.last_remaining = env.remaining();
         env
     }
 
@@ -948,6 +925,9 @@ impl JointEnv {
         self.duty = self.frame.legs() as f64;
         self.boundary = false;
         self.refresh_observation();
+        // After the route exists, so the first tick's progress is measured from
+        // the real starting distance rather than from zero.
+        self.last_remaining = self.remaining();
         &self.observation
     }
 
@@ -1139,6 +1119,14 @@ impl JointEnv {
                 break;
             }
 
+            // Ground closed since the previous tick. `self.route` was just
+            // refreshed, so this is the only place in the loop where it is
+            // current -- reading it after `plant.step` returns the pre-step
+            // value and makes the whole reward identically zero.
+            let remaining_now = self.remaining();
+            let closed = self.last_remaining - remaining_now;
+            self.last_remaining = remaining_now;
+
             let mut jerk = 0.0;
             for i in 0..n {
                 for c in 0..3 {
@@ -1167,20 +1155,39 @@ impl JointEnv {
             self.duty += (down as f64 - self.duty) * (DT / 0.30);
             self.support_sum += down as f64;
             self.air = self.air.max(tick.pos[1] - self.stand_y);
-            let shaped = reward(
+            // Ground closed on this tick, gated by posture on the way forward
+            // and charged in full on the way back. Gating the retreat too
+            // would let a policy give ground cheaply in a bad attitude and
+            // retake it in a good one, which is the oscillation this whole
+            // term exists to make worthless.
+            let gate = posture(
                 self.stage,
-                &tick.body_v,
                 tick.pitch,
                 tick.roll,
                 tick.ride,
                 self.stand_y,
-                down,
                 self.duty,
                 n,
-                self.route.bearing,
             );
             let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
-            let scored_tick = (shaped - SMOOTH_COST * churn).max(0.0);
+            let moved = progress_tick(closed, gate);
+            // `Stand` has no ground to close, so it keeps the per-tick shaping
+            // it was always scored on. Everywhere else the objective is metres,
+            // and `reward` is not consulted at all.
+            let scored_tick = if self.stage == Stage::Stand {
+                let shaped = stand_reward(
+                    &tick.body_v,
+                    tick.pitch,
+                    tick.roll,
+                    tick.ride,
+                    self.stand_y,
+                    down,
+                    n,
+                );
+                (shaped - SMOOTH_COST * churn).max(0.0)
+            } else {
+                moved - SMOOTH_COST * churn * DT
+            };
             self.total += scored_tick;
             // Per-step and O(1) on purpose. Dividing this by the horizon (as
             // `base_score` still does, because a *score* must compare across
@@ -1205,6 +1212,25 @@ impl JointEnv {
             terminated: self.terminated(),
             truncated: self.truncated(),
         })
+    }
+
+    /// Route distance still to run: the leg the machine is on, plus every leg
+    /// after it. Zero once the route is finished.
+    ///
+    /// This, and not speed, is what the policy is paid to reduce. A speed term
+    /// cannot be gated: `track` had no ceiling on purpose -- there is no
+    /// fastest speed worth naming -- so any support gate `g < 1` was bought
+    /// back by going `1/g` faster. Measured, not argued: making flight cost
+    /// twice as much moved mean support 0.72 -> 0.72 and pushed Q 29.5 -> 31.0,
+    /// because the policy simply flew twice as fast. Ground closed has no such
+    /// slack. It is bounded by the route, it telescopes, so oscillating pays
+    /// exactly zero, and with no speed term left there is nothing to buy a
+    /// gate back with.
+    fn remaining(&self) -> f64 {
+        if self.route.finished {
+            return 0.0;
+        }
+        self.route.range + self.terrain.route_tail(self.route.wp)
     }
 
     /// Fraction of the terminal bonus an arrival at `secs` earns: 0.5 at the
@@ -1234,7 +1260,15 @@ impl JointEnv {
             self.route.reached as f64 / route_len as f64
         };
         let completed = self.route.finished && self.route.reached == route_len;
-        let base_score = self.total * DT / self.horizon.max(1e-6);
+        // Metres closed as a fraction of the route. Horizon-independent because
+        // it no longer mentions the clock at all, where the old rate was
+        // horizon-independent only by dividing by it -- which is what made the
+        // transition reward 2000x too small to learn from.
+        let base_score = if self.stage == Stage::Stand {
+            self.total * DT / self.horizon.max(1e-6)
+        } else {
+            self.total / self.terrain.route_length().max(1e-6)
+        };
         let mean_support = if self.steps == 0 {
             // The environment is constructed from a warmed standing plant, so
             // its pre-step support is every foot, not none. Reading it as zero
@@ -1246,9 +1280,6 @@ impl JointEnv {
         let score = episode_score(
             self.stage,
             base_score,
-            end[2] - self.start[2],
-            mean_support,
-            self.frame.legs(),
             waypoint_fraction,
             completed,
             secs,
@@ -1333,6 +1364,9 @@ struct NexusEpisode {
     route: RouteState,
     finish_time: f64,
     duty: f64,
+    /// Route distance left as of the previous tick, so the batch path scores
+    /// ground closed from the same quantity `JointEnv::remaining` uses.
+    last_remaining: f64,
     active: bool,
 }
 
@@ -1388,6 +1422,7 @@ fn rollout_nexus_batch(
             steps: 0,
             fell: false,
             clock: 0.0,
+            last_remaining: route.range + terrain.route_tail(route.wp),
             route,
             finish_time: stage.horizon(),
             duty: n as f64,
@@ -1503,20 +1538,20 @@ fn rollout_nexus_batch(
             ep.duty += (down as f64 - ep.duty) * (DT / 0.30);
             ep.support_sum += down as f64;
             ep.air = ep.air.max(state.pos[1] - ep.stand_y);
-            let shaped = reward(
-                stage,
-                &body_v,
-                state.pitch,
-                state.roll,
-                ride,
-                ep.stand_y,
-                down,
-                ep.duty,
-                n,
-                bearing,
-            );
             let churn = jerk / (MAX_JOINT_RATE * DT * 3.0 * n as f64);
-            ep.total += (shaped - SMOOTH_COST * churn).max(0.0);
+            let remaining_now = ep.route.range + terrain.route_tail(ep.route.wp);
+            let closed = ep.last_remaining - remaining_now;
+            ep.last_remaining = remaining_now;
+            let gate = posture(stage, state.pitch, state.roll, ride, ep.stand_y, ep.duty, n);
+            let moved = progress_tick(closed, gate);
+            ep.total += if stage == Stage::Stand {
+                let shaped = stand_reward(
+                    &body_v, state.pitch, state.roll, ride, ep.stand_y, down, n,
+                );
+                (shaped - SMOOTH_COST * churn).max(0.0)
+            } else {
+                moved - SMOOTH_COST * churn * DT
+            };
             ep.steps += 1;
             ep.clock += DT / 0.5;
             if terrain.waypoints.is_empty() && state.pos[2] > crate::terrain::Z_MAX - 2.0 {
@@ -1554,17 +1589,12 @@ fn rollout_nexus_batch(
             ep.support_sum / ep.steps as f64
         };
         let distance = end.pos[2] - ep.start[2];
-        let base_score = ep.total * DT / stage.horizon().max(1e-6);
-        let score = episode_score(
-            stage,
-            base_score,
-            distance,
-            mean_support,
-            n,
-            waypoint_fraction,
-            completed,
-            secs,
-        );
+        let base_score = if stage == Stage::Stand {
+            ep.total * DT / stage.horizon().max(1e-6)
+        } else {
+            ep.total / terrains[env].route_length().max(1e-6)
+        };
+        let score = episode_score(stage, base_score, waypoint_fraction, completed, secs);
         out.push(NexusBatchRollout {
             rollout: JointRollout {
                 score,
@@ -1589,9 +1619,6 @@ fn rollout_nexus_batch(
 fn episode_score(
     stage: Stage,
     base_score: f64,
-    distance: f64,
-    support: f64,
-    legs: usize,
     waypoint_fraction: f64,
     completed: bool,
     // Simulated seconds the episode lasted. An episode terminates on route
@@ -1601,18 +1628,18 @@ fn episode_score(
     if stage == Stage::Stand {
         return base_score;
     }
-    // Tick reward alone can still be gamed by oscillating forward during
-    // rewarded instants and drifting farther backward between them. Keep it
-    // only in proportion to net progress along the course. A quarter of
-    // commanded progress opens the full shaping reward; no or negative
-    // progress earns none.
-    let expected = (REFERENCE_SPEED * stage.horizon()).max(1e-6);
-    let progress_gate = clamp(distance / (0.25 * expected), 0.0, 1.0);
-    // A one-foot hopper can have forward instants and respectable net travel,
-    // but it is not a usable hexapod gait. Penalise the whole episode by mean
-    // contact, reaching full credit at roughly two feet on a hexapod. Squaring
-    // keeps a brief flight phase affordable and makes sustained hopping steep.
-    let support_gate = support_gate(support, legs);
+    // `base_score` is now net metres closed over route length, so both of the
+    // gates that used to sit here are gone rather than moved.
+    //
+    // `progress_gate` scaled the tick reward by net progress, because a tick
+    // reward paid for instantaneous speed could be farmed by surging forward
+    // and drifting back. Metres closed telescope: the surge and the drift
+    // cancel exactly, so there is nothing left to gate.
+    //
+    // `support_gate` penalised the episode by mean contact, because the per-tick
+    // curve and this one disagreed. `posture` applies it per tick now, on the
+    // way forward only, and it is the same function -- so applying it again
+    // here would square it.
     // Reaching the target was worth a flat 1.0 however long it took, so a
     // controller that strolled to the finish scored exactly like one that ran.
     // Time to the target is the actual objective, so pay for it: arriving
@@ -1630,7 +1657,55 @@ fn episode_score(
     // makes falling over an escape from further penalty, because `terminated`
     // cuts the bootstrap: the first run with a gradient strong enough to
     // optimise anything went to 0.60 feet of six and scored -0.229.
-    base_score * progress_gate * support_gate + 0.35 * waypoint_fraction + promptness
+    base_score + 0.35 * waypoint_fraction + promptness
+}
+
+/// Upright, at ride height, and standing on enough feet, as one multiplier in
+/// [0, 1]. The only copy: `reward` and the per-tick progress term both call
+/// this, because every objective bug found tonight was two functions that were
+/// supposed to agree and did not.
+fn posture(
+    stage: Stage,
+    pitch: f64,
+    roll: f64,
+    ride: f64,
+    stand_y: f64,
+    duty: f64,
+    legs: usize,
+) -> f64 {
+    let level = (-(pitch * pitch + roll * roll) / 0.08).exp();
+    let height = (-((ride - stand_y) / 0.18).powi(2)).exp();
+    if stage == Stage::Stand {
+        return level * height;
+    }
+    // Sustained flight earns nothing, but the test is windowed contact, not
+    // this tick's: judging it per tick outlaws the flight phase every dynamic
+    // gait has, and it did.
+    if duty < 0.15 {
+        return 0.0;
+    }
+    level * height * support_gate(duty, legs)
+}
+
+/// Reward for `closed` metres of route with posture worth `gate`.
+///
+/// Forward progress is gated; retreat is charged in full. Gating the retreat
+/// too would let a policy give ground cheaply in a bad attitude and retake it
+/// in a good one, which is the oscillation this term exists to make worthless.
+///
+/// Linear in distance with `gate <= 1` is the whole point. The speed curve this
+/// replaced was unbounded above -- deliberately, since no top speed is worth
+/// naming -- and that is precisely what made it exploitable: a gate of `g`
+/// costs nothing you cannot recover by going `1/g` faster. Here, for the same
+/// ground covered, more posture is always worth more, and no amount of anything
+/// else substitutes for it.
+#[inline]
+fn progress_tick(closed: f64, gate: f64) -> f64 {
+    if closed > 0.0 {
+        closed * gate
+    } else {
+        closed
+    }
 }
 
 fn support_gate(support: f64, legs: usize) -> f64 {
@@ -1638,114 +1713,32 @@ fn support_gate(support: f64, legs: usize) -> f64 {
     clamp(support / target, 0.0, 1.0).powi(2)
 }
 
-/// Per-tick reward. Moving toward the target at [`REFERENCE_SPEED`] is 1.0;
-/// faster is proportionally more, with no ceiling, because a ceiling is a pace
-/// to settle at.
-#[allow(clippy::too_many_arguments)]
-fn reward(
-    stage: Stage,
+/// Per-tick reward for [`Stage::Stand`], the one stage with no ground to close.
+///
+/// Everything else is paid in metres of route closed, gated by [`posture`], so
+/// there is no speed term here any more and no reference speed to name. The
+/// curve that used to live here -- linear in speed toward the waypoint, no
+/// ceiling -- is what made the objective exploitable: unbounded above by
+/// design, so any support gate `g < 1` was recovered by flying `1/g` faster.
+/// Measured rather than argued: doubling the cost of flight moved mean support
+/// 0.72 -> 0.72 while Q rose 29.5 -> 31.0.
+fn stand_reward(
     body_v: &[f64; 3],
     pitch: f64,
     roll: f64,
     ride: f64,
     stand_y: f64,
     down: usize,
-    // Feet on the ground, averaged over a ~0.3 s window.
-    duty: f64,
     legs: usize,
-    bearing: f64,
 ) -> f64 {
-    // Upright and at ride height. This is the whole objective for `Stand` and
-    // a precondition everywhere else: a controller that scores well on speed
-    // while dragging its belly is not one to build the next stage on.
+    // Unchanged from the objective `Stand` was trained on: additive, not the
+    // multiplicative gate locomotion uses, because holding still *is* the task
+    // here and there is no progress term for attitude to gate.
     let level = (-(pitch * pitch + roll * roll) / 0.08).exp();
     let height = (-((ride - stand_y) / 0.18).powi(2)).exp();
-
-    if stage == Stage::Stand {
-        let still = (-(body_v[0] * body_v[0] + body_v[2] * body_v[2]) / 0.05).exp();
-        let feet = down as f64 / legs as f64;
-        return 0.40 * level + 0.30 * height + 0.20 * still + 0.10 * feet;
-    }
-
-    // Sustained flight earns nothing — these motors can throw a 2 kg machine
-    // on 2 m legs clean into the air, and unchecked that is the first thing
-    // random search finds. But the test is the *windowed* contact, not this
-    // tick's. Judging it per tick outlaws the flight phase every dynamic gait
-    // has, and it did: a policy that had learned to cover 3.5 m in 4 s — 0.87
-    // m/s against a 0.8 m/s command — scored 0.07, because its brief contacts
-    // read as "airborne" on most individual ticks.
-    if duty < 0.15 {
-        return 0.0;
-    }
-
-    // Speed toward the ordered waypoint. Using speed along the body's heading
-    // lets a policy turn around and improve its score while its world progress
-    // becomes negative. Projecting velocity onto the target direction makes
-    // that exploit score zero and still gives a smooth guide while turning.
-    // Deliberately *not* the gait-level trainer's Gaussian: that is a scoring
-    // function, and this has to be a guide.
-    //
-    // A Gaussian centred on the command is flat where training starts. At rest
-    // against a 0.8 m/s command it reads exp(-(0.8/0.37)^2) = 0.009, and its
-    // slope there is nearly zero, so nothing pulls the machine into moving at
-    // all — measured, walking sat at 0.20 for iterations while lifting legs
-    // and covering no ground. Rising linearly to the command gives a constant
-    // gradient from a standstill; above the command it falls off, so this is
-    // still speed *tracking* and not a prize for going as fast as possible.
-    let along = body_v[0] * bearing.sin() + body_v[2] * bearing.cos();
-    // Linear in speed toward the target, so the sum over an episode is the
-    // ground covered and nothing about the profile. See [`REFERENCE_SPEED`]:
-    // both a saturating curve and a tracked command paid the machine to hold
-    // one pace, and holding one pace is not how a trench gets crossed.
-    //
-    // Unbounded above on purpose. The machine's top speed is set by its servos,
-    // the posture gate pays nothing while airborne, and there is no fastest
-    // speed worth naming — that is the point.
-    let track = (along / REFERENCE_SPEED).max(0.0);
-    let aim = (-(bearing * bearing) / 0.5).exp();
-
-    // Feet have to leave the ground, but not all of them and not five of six.
-    // A flat "some foot is up" bonus paid the same for a tripod as for hopping
-    // on one leg, and hopping is easier to find — mean support fell to 1.2 of
-    // six. Peaking at half the legs is what a tripod looks like, and it is the
-    // only support pattern that both moves and stays statically safe.
-    let half = legs as f64 * 0.5;
-    let gait = (-((duty - half) / 1.5).powi(2)).exp();
-
-    // Posture is a *gate*, not a term to be paid for.
-    //
-    // Additively, standing perfectly still collected 0.20 for being level plus
-    // 0.15 for ride height plus 0.10 for facing the right way — 0.454 of a
-    // possible 1.0 for doing nothing. Worse, the first move any policy makes
-    // costs some of that attitude reward before it earns any tracking reward,
-    // so the search had to cross a valley to start walking and mostly did not.
-    //
-    // As a multiplier, holding attitude is worth nothing on its own and losing
-    // it forfeits everything. Standing still now has about 0.16 of per-tick
-    // shaping (and zero episode fitness after the progress gate), walking well
-    // still approaches 1.0, and the path between them runs downhill.
-    //
-    // Support is part of the gate too, not a bonus. As a 0.10 term the machine
-    // kept trading it away: mean support fell to 1.3 feet of six, because
-    // hopping on one leg still collected most of the speed reward. A hexapod
-    // on fewer than two feet is not walking, whatever its velocity says, so
-    // below that the tick is worth almost nothing.
-    //
-    // This is `support_gate`, the same curve `episode_score` grades on, and
-    // deliberately not a second shape. A linear ramp saturating at 1.75 feet
-    // lived here instead, which valued flight at 0.31 where the score valued
-    // it at 0.14 and handed full credit to a machine on two feet -- no
-    // gradient at all from there to a tripod. A run with the gradient finally
-    // scaled to be visible sat at 0.67, 1.48 and 0.78 feet across three evals
-    // while covering its distance airborne, because at 10x speed that was
-    // worth 0.91 against a tripod's 1.00. Squared and reaching full credit at
-    // 0.35 * legs, the same flight is worth 0.48.
-    let posture = level * height * support_gate(duty, legs);
-    // Whatever the tripod term does not take goes to speed tracking, so the
-    // weights still sum to one and a terrain stage is not quietly scored out
-    // of a lower maximum than a flat one.
-    let gait_w = stage.gait_weight();
-    ((0.85 - gait_w) * track + 0.15 * aim + gait_w * gait) * posture
+    let still = (-(body_v[0] * body_v[0] + body_v[2] * body_v[2]) / 0.05).exp();
+    let feet = down as f64 / legs as f64;
+    0.40 * level + 0.30 * height + 0.20 * still + 0.10 * feet
 }
 
 /// ARS configuration for the joint-level trainer.
@@ -3018,78 +3011,108 @@ mod tests {
         }
     }
 
+    /// The dense reward and the score are one quantity in two units, and this
+    /// is the check that says so.
+    ///
+    /// Every objective bug found in this session was those two drifting apart:
+    /// the dense term divided by the horizon while the score was too (reward
+    /// 2000x too small to learn from); a support deficit subtracted from both
+    /// on different bases (score -0.229 while Q was +24); a progress gate on
+    /// the score only (Q 29 against score 0.003); and two different support
+    /// curves (flight worth 0.31 to the gradient, 0.14 to the score). The old
+    /// version of this test asserted the opposite -- that the dense reward
+    /// *exceeded* the score -- and so licensed exactly that drift, on `Stand`
+    /// and flat ground alone.
     #[test]
-    fn value_learning_gets_a_dense_signal_before_net_progress_is_earned() {
-        let frame = Frame::new(6);
-        let phys = Physics::default();
-        let terrain = Terrain::new(Course::Flat, 17);
-        let mut env = JointEnv::new(frame, &phys, terrain, Stage::WalkFlat);
-        let action = vec![0.0; n_act(frame)];
-        let mut exact_reward = 0.0;
-        let mut learning_reward = 0.0;
+    fn the_dense_reward_and_the_score_are_the_same_quantity() {
+        for (stage, course) in [
+            (Stage::WalkFlat, Course::Flat),
+            (Stage::Rough, Course::Steps),
+            (Stage::Gaps, Course::Gaps),
+            (Stage::Mixed, Course::Slalom),
+        ] {
+            let frame = Frame::new(6);
+            let phys = Physics::default();
+            let terrain = Terrain::new(course, 17);
+            let route = terrain.route_length();
+            let mut env = JointEnv::new(frame, &phys, terrain, stage);
+            let action = vec![0.0; n_act(frame)];
+            let mut learning = 0.0;
 
-        while !env.is_done() {
-            let step = env.step(&action).expect("valid standing action");
-            exact_reward += step.reward;
-            learning_reward += step.learning_reward;
+            while !env.is_done() {
+                learning += env
+                    .step(&action)
+                    .expect("valid action")
+                    .learning_reward;
+            }
+
+            let rollout = env.summary();
+            // A still policy banks no waypoint and no arrival, so the score is
+            // its `base_score` and nothing else -- which makes the comparison
+            // exact rather than approximate.
+            assert_eq!(rollout.reached, 0, "a still policy reached a waypoint");
+            assert!(!rollout.completed, "a still policy completed a route");
+            assert!(
+                (learning / route - rollout.score).abs() < 1e-9,
+                "{} on {}: dense {} over {route} m is not score {}",
+                stage.name(),
+                course.name(),
+                learning,
+                rollout.score
+            );
         }
-
-        let rollout = env.summary();
-        assert!((exact_reward - rollout.score).abs() < 1e-12);
-        assert!(
-            learning_reward > exact_reward + 0.05,
-            "dense reward {learning_reward:.3} did not guide beyond exact score {exact_reward:.3}"
-        );
-        assert!(
-            rollout.distance < 0.25 * Stage::WalkFlat.speed() * Stage::WalkFlat.horizon(),
-            "standing unexpectedly earned the full net-progress gate"
-        );
     }
 
-    /// Support is a multiplier everywhere and a subtraction nowhere, so no
-    /// amount of speed buys back a projectile trajectory and no episode can
-    /// earn a negative reward for trying one.
+
+    /// The four properties the old speed curve needed subtle tests for, and
+    /// which this objective has by construction.
     #[test]
-    fn support_gates_a_projectile_without_ever_paying_a_negative_reward() {
-        assert_eq!(support_gate(3.0, 6), 1.0);
-        assert!(support_gate(2.0, 6) > 0.8);
-        assert!(support_gate(0.5, 6) < 0.1);
+    fn ground_closed_is_the_whole_objective() {
+        let gate = |duty: f64| posture(Stage::Rough, 0.0, 0.0, 0.0, 0.0, duty, 6);
 
-        // Unbounded speed cannot outrun the gate: a hexapod on half a foot
-        // going ten times as fast still scores below a tripod at walking pace.
-        let tick = |speed: f64, duty: f64| {
-            reward(
-                Stage::Rough, &[0.0, 0.0, speed], 0.0, 0.0, 0.0, 0.0,
-                duty.round() as usize, duty, 6, 0.0,
-            )
-        };
-        let projectile = tick(20.0, 0.5);
-        let tripod = tick(2.0, 3.0);
-        assert!(
-            projectile * 2.0 < tripod,
-            "a projectile at 10x the speed scored {projectile} against {tripod}"
-        );
-
-        // And pin *which* curve does it, because a bare `projectile < tripod`
-        // passed while `reward` used a linear ramp of its own that valued the
-        // same flight at 0.31 where `episode_score` valued it at 0.14. At equal
-        // speed the ratio between two duties has to be the gate's ratio and
-        // nothing else, which no second shape can satisfy.
-        let ratio = tick(2.0, 0.5) / tick(2.0, 3.0);
-        let gate = support_gate(0.5, 6) / support_gate(3.0, 6);
-        assert!(
-            (ratio - gate).abs() < 1e-12,
-            "reward's support curve is not `support_gate`: {ratio} vs {gate}"
-        );
-
-        // And nothing anywhere is negative, which is what keeps falling over
-        // from being an escape: `terminated` cuts the bootstrap, so a negative
-        // per-step reward makes ending the episode the profitable move.
-        for duty in [0.0, 0.2, 0.5, 1.0, 2.0, 3.0, 6.0] {
-            for speed in [-5.0, 0.0, 1.0, 20.0] {
-                assert!(tick(speed, duty) >= 0.0, "reward({speed}, {duty}) went negative");
+        // Covering more ground is never worth less, at any posture.
+        for duty in [0.2, 1.0, 2.1, 3.0, 6.0] {
+            let g = gate(duty);
+            let mut previous = f64::NEG_INFINITY;
+            for tenths in 0..40 {
+                let here = progress_tick(tenths as f64 * 0.1, g);
+                assert!(here >= previous, "more ground scored less at duty {duty}");
+                previous = here;
             }
         }
+
+        // Where the ground was covered cannot matter: the terms telescope, so
+        // a burst and a steady crawl over the same distance pay the same. This
+        // is what `progress_gate` used to have to enforce after the fact.
+        let g = gate(3.0);
+        let steady: f64 = (0..4).map(|_| progress_tick(0.25, g)).sum();
+        let burst = progress_tick(1.0, g) + 3.0 * progress_tick(0.0, g);
+        assert!((steady - burst).abs() < 1e-12, "{steady} vs {burst}");
+
+        // Going backward costs, and a there-and-back can never come out ahead
+        // -- which is why oscillating in place is not a strategy any more.
+        assert!(progress_tick(-0.5, g) < 0.0, "retreat was free");
+        for duty in [0.2, 1.0, 2.1, 3.0] {
+            let g = gate(duty);
+            let round_trip = progress_tick(0.8, g) + progress_tick(-0.8, g);
+            assert!(round_trip <= 0.0, "oscillation paid {round_trip} at duty {duty}");
+        }
+
+        // And the property no gate could give while speed was unbounded: for
+        // the same ground covered, better support is always worth strictly
+        // more, and no distance buys the gate back. A flying machine covering
+        // ten times the ground still loses to a tripod here.
+        let flying = progress_tick(10.0, gate(0.5));
+        let tripod = progress_tick(1.0, gate(3.0));
+        assert!(gate(0.5) < gate(3.0), "support gate is not monotone");
+        assert!(
+            flying < tripod * 10.0,
+            "flying {flying} was not dominated by a tripod's {tripod} per metre"
+        );
+        assert!(
+            progress_tick(1.0, gate(0.5)) < progress_tick(1.0, gate(3.0)),
+            "equal ground did not prefer the better gait"
+        );
     }
 
     #[test]
@@ -3238,118 +3261,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn speed_away_from_the_waypoint_cannot_improve_tracking_reward() {
-        let body_v = [0.0, 0.0, 0.8];
-        let toward = reward(
-            Stage::WalkFlat,
-            &body_v,
-            0.0,
-            0.0,
-            1.0,
-            1.0,
-            3,
-            3.0,
-            6,
-            0.0,
-        );
-        let away = reward(
-            Stage::WalkFlat,
-            &body_v,
-            0.0,
-            0.0,
-            1.0,
-            1.0,
-            3,
-            3.0,
-            6,
-            std::f64::consts::PI,
-        );
-        // A ratio rather than an absolute gap: the speed term is linear now, so
-        // an absolute margin only says how far 0.8 is from REFERENCE_SPEED.
-        assert!(
-            toward > away * 4.0,
-            "toward {toward:.3}, away {away:.3}"
-        );
-        assert_eq!(
-            episode_score(Stage::WalkFlat, 0.9, -0.5, 3.0, 6, 0.0, false, Stage::WalkFlat.horizon()),
-            0.0,
-            "an episode that moved backward kept shaping reward"
-        );
-        let stable = episode_score(Stage::WalkFlat, 0.9, 1.0, 2.1, 6, 0.0, false, Stage::WalkFlat.horizon());
-        let hopping = episode_score(Stage::WalkFlat, 0.9, 1.0, 0.7, 6, 0.0, false, Stage::WalkFlat.horizon());
-        let parked = episode_score(Stage::WalkFlat, 0.9, 0.0, 6.0, 6, 0.0, false, Stage::WalkFlat.horizon());
-        assert_eq!(parked, 0.0, "safe standing should be a neutral fallback");
-        // Hopping used to be required to score *below* standing, which took a
-        // subtracted support deficit -- the one term that could make a reward
-        // negative, and so the one that made falling over an escape from
-        // accruing more of it. What actually has to hold is that hopping is
-        // dominated, not that it is punished: `enough_feet` already caps it at
-        // a quarter of a tripod's per-tick reward, and here at a ninth of a
-        // tripod's episode score. Standing < hopping < walking is monotone in
-        // usefulness and leaves no valley between standing and a gait, which
-        // is the trap the additive posture terms fell into.
-        assert!(
-            parked <= hopping && hopping < stable,
-            "ordering broke: parked {parked:.3}, hopping {hopping:.3}, stable {stable:.3}"
-        );
-        assert!(
-            stable > hopping * 5.0,
-            "sustained hopping was not dominated: stable {stable:.3}, hopping {hopping:.3}"
-        );
-    }
 
-    /// With motors this strong, standing is free: the seeded policy already
-    /// saturates the stage's reward. So the curriculum has to promote past it
-    /// without training on it — a saturated objective is a maximum, and ARS
-    /// stepping away from one took a perfect 1.000 down to 0.236 in six
-    /// iterations when the stage was trained before being checked.
-    /// Sometimes slowing down is how you go faster overall — braking into a
-    /// trench lip to clear it, the way braking into a corner is how you leave
-    /// it quicker. A per-tick reward that is *concave* in speed cannot
-    /// represent that: by Jensen's inequality it strictly prefers one steady
-    /// pace to any varying one covering the same ground. The saturating curve
-    /// this replaced paid 1.245 for two ticks at 1.0 against 1.000 for the same
-    /// distance taken as 2.0 and a standstill — a 24.5% tax on braking.
-    ///
-    /// Linear is the only shape with no such opinion.
-    #[test]
-    fn where_the_speed_went_does_not_change_the_reward() {
-        let at = |speed: f64| {
-            reward(
-                Stage::WalkFlat,
-                &[0.0, 0.0, speed],
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-                3,
-                3.0,
-                6,
-                0.0,
-            )
-        };
-        // Equal ground, three different profiles.
-        let steady = at(1.0) + at(1.0) + at(1.0) + at(1.0);
-        let burst = at(4.0) + at(0.0) + at(0.0) + at(0.0);
-        let ramped = at(0.5) + at(1.5) + at(1.5) + at(0.5);
-        assert!(
-            (steady - burst).abs() < 1e-9,
-            "a burst scored {burst} against {steady} for the same distance"
-        );
-        assert!(
-            (steady - ramped).abs() < 1e-9,
-            "a ramp scored {ramped} against {steady} for the same distance"
-        );
-
-        // Which leaves covering more ground in the same time as the only way to
-        // score more. Note the comparison is at equal tick counts: `aim` and
-        // `gait` are paid per tick, so covering the same ground in fewer ticks
-        // banks less of them — which is exactly the hole [`FINISH_BONUS`]
-        // fills, since arriving is what ends an episode early.
-        let faster = at(2.0) + at(2.0) + at(2.0) + at(2.0);
-        assert!(faster > steady, "{faster} should beat {steady} over four ticks");
-    }
 
     /// Reaching the target used to cost the policy return. The per-tick shaping
     /// sums to 1.0 over a full episode, and arriving *terminates* the episode,
@@ -3396,61 +3308,6 @@ mod tests {
         assert!(env.promptness(16.0) < 0.1, "well over the bar should be near nothing");
     }
 
-    /// The task is to reach a point in space as soon as possible, so nothing in
-    /// the objective may prefer a slower machine. The old curve did: it fell
-    /// off above the commanded speed, and a run that saturated it spent 13M
-    /// transitions trading stride for planted feet because going faster was
-    /// worth nothing.
-    #[test]
-    fn going_faster_toward_the_target_is_never_worth_less() {
-        // Level, at ride height, three feet down, aimed straight at the
-        // waypoint: everything except speed held at its best.
-        let at = |speed: f64| {
-            reward(
-                Stage::WalkFlat,
-                &[0.0, 0.0, speed],
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-                3,
-                3.0,
-                6,
-                0.0,
-            )
-        };
-
-        let reference = REFERENCE_SPEED;
-        // The one scale the reward knows, and hitting it is exactly 1.0 so a
-        // stage score still reads as a fraction. No stage carries a speed of
-        // its own any more.
-        assert!(
-            (at(reference) - 1.0).abs() < 1e-9,
-            "reference speed should score 1.0, got {}",
-            at(reference)
-        );
-
-        // Strictly increasing all the way out, including well past the
-        // reference where the old curve was falling.
-        // Standing still keeps only the speed-independent floor: aimed the
-        // right way in a tripod pose. The episode-level progress gate is what
-        // makes that worth nothing over a whole rollout.
-        let mut previous = at(0.0);
-        assert!(previous > 0.0 && previous < 0.3, "standing floor was {previous}");
-        assert_eq!(at(-5.0), previous, "backwards is worth no more than still");
-        for step in 1..=40 {
-            let here = at(reference * step as f64 * 0.25);
-            assert!(
-                here > previous,
-                "reward fell going from {previous} to {here} at {}x reference",
-                step as f64 * 0.25
-            );
-            previous = here;
-        }
-        // Unbounded on purpose: no speed is the fastest worth having.
-        assert!(at(4.0 * reference) > at(2.0 * reference) * 1.5);
-
-    }
 
     /// Reaching the target was a flat bonus however long it took, so a
     /// controller that strolled to the finish scored exactly like one that ran.
@@ -3458,7 +3315,7 @@ mod tests {
     fn reaching_the_target_sooner_scores_higher() {
         let horizon = Stage::Gaps.horizon();
         let score = |secs: f64, completed: bool| {
-            episode_score(Stage::Gaps, 0.5, 10.0, 3.0, 6, 1.0, completed, secs)
+            episode_score(Stage::Gaps, 0.5, 1.0, completed, secs)
         };
         let prompt = score(0.1 * horizon, true);
         let slow = score(horizon, true);
