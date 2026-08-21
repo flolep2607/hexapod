@@ -164,6 +164,22 @@ pub struct Physics {
     /// exists because an unbounded motor lets the solver inject unbounded
     /// energy: uncapped, a tripod gait launches the machine kilometres.
     pub motor_max: f64,
+
+    /// Build the legs as one reduced-coordinate multibody instead of eighteen
+    /// maximal-coordinate impulse joints.
+    ///
+    /// A revolute joint has one degree of freedom. Solved in maximal
+    /// coordinates it is five constraint rows the solver has to converge, and
+    /// against `motor_stiff` it does not converge cheaply: `axis_probe` puts
+    /// the coxa 21.5 degrees off its own axis at `2/4/2`, which is why the
+    /// default is `4/8/4` and why a step costs 0.043 ms per joint. In reduced
+    /// coordinates the hinge *is* one number, so turning off-axis is not
+    /// merely unlikely but unrepresentable, and the passes buying that
+    /// convergence are not needed.
+    ///
+    /// Off by default: the impulse plant is the reference every checkpoint was
+    /// trained and evaluated against.
+    pub reduced: bool,
 }
 
 impl Default for Physics {
@@ -183,6 +199,7 @@ impl Default for Physics {
             pgs_iters: 4,
             foot_mu: 1.15,
             motor_max: 50.0,
+            reduced: false,
             mass_kg: 2.0,
             scale: 0.10,
             // Rubber foot on dry board. Loose ground scales this down.
@@ -203,6 +220,28 @@ impl Physics {
             mu: 40.0,
             actuator: Actuator::ideal(),
             leg: LegMass::WEIGHTLESS,
+            ..Physics::default()
+        }
+    }
+
+    /// The same machine, solved in reduced coordinates.
+    ///
+    /// [`Physics::reduced`] makes the hinge a coordinate rather than five
+    /// constraint rows, so the passes that were buying hinge convergence are
+    /// not needed: `axis_probe` reports `|cos| = 1.0000` here against 0.9305
+    /// for the impulse plant at the same `1/4/1`, and the whole suite passes.
+    /// Rapier's articulated solver costs about 5x per iteration — it
+    /// factorizes the mass matrix each substep — so this is only a win because
+    /// it needs a quarter of the substeps and an eighth of the PGS passes.
+    ///
+    /// Contacts still go through the ordinary solver, which is why
+    /// `solver_iters` stays at 4: feet on rubble need those, the hinges do not.
+    pub fn reduced() -> Physics {
+        Physics {
+            reduced: true,
+            substeps: 1,
+            solver_iters: 1,
+            pgs_iters: 1,
             ..Physics::default()
         }
     }

@@ -113,6 +113,10 @@ pub struct Faults {
 #[derive(Clone, Copy)]
 struct Hinge {
     joint: ImpulseJointHandle,
+    /// Set instead of `joint` when [`Physics::reduced`] moved this hinge into
+    /// the reduced-coordinate multibody. The impulse handle is left behind so
+    /// the build path stays one code path; only the read/write ends branch.
+    mb: Option<MultibodyJointHandle>,
     parent: RigidBodyHandle,
     child: RigidBodyHandle,
     q0: f32,
@@ -215,7 +219,7 @@ impl ArticulatedPlant {
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();
         let mut impulse_joints = ImpulseJointSet::new();
-        let multibody_joints = MultibodyJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
 
         let ground = terrain.height(0.0, 0.0);
         let pos = [0.0, ground + gait.body_h, 0.0];
@@ -507,6 +511,7 @@ impl ArticulatedPlant {
                 hinges: [
                     Hinge {
                         joint: h_coxa,
+                        mb: None,
                         parent: chassis,
                         child: coxa,
                         q0: q0[i][0] as f32,
@@ -514,6 +519,7 @@ impl ArticulatedPlant {
                     },
                     Hinge {
                         joint: h_femur,
+                        mb: None,
                         parent: coxa,
                         child: femur,
                         q0: q0[i][1] as f32,
@@ -521,6 +527,7 @@ impl ArticulatedPlant {
                     },
                     Hinge {
                         joint: h_tibia,
+                        mb: None,
                         parent: femur,
                         child: tibia,
                         q0: q0[i][2] as f32,
@@ -528,6 +535,27 @@ impl ArticulatedPlant {
                     },
                 ],
             });
+        }
+
+        // Reduced coordinates: hand the eighteen hinges to the multibody
+        // solver and leave the impulse set empty. Same joint data, same
+        // limits, same motors — only the formulation changes.
+        if phys.reduced {
+            for i in 0..n {
+                for j in 0..3 {
+                    let Some(h) = legs[i].as_ref().map(|l| l.hinges[j]) else {
+                        continue;
+                    };
+                    let Some(source) = impulse_joints.get(h.joint).map(|j| j.data) else {
+                        continue;
+                    };
+                    let handle = multibody_joints.insert(h.parent, h.child, source, true);
+                    if let Some(leg) = legs[i].as_mut() {
+                        leg.hinges[j].mb = handle;
+                    }
+                }
+            }
+            impulse_joints = ImpulseJointSet::new();
         }
 
         let integration = IntegrationParameters {
@@ -690,10 +718,24 @@ impl ArticulatedPlant {
                 if let Some(leg) = self.legs[i].as_mut() {
                     leg.hinges[j].set = target;
                 }
-                let Some(joint) = self.impulse_joints.get_mut(h.joint, true) else {
-                    continue;
+                let data = match h.mb {
+                    Some(handle) => {
+                        let Some((mb, link)) = self.multibody_joints.get_mut(handle) else {
+                            continue;
+                        };
+                        let Some(link) = mb.link_mut(link) else {
+                            continue;
+                        };
+                        &mut link.joint.data
+                    }
+                    None => {
+                        let Some(joint) = self.impulse_joints.get_mut(h.joint, true) else {
+                            continue;
+                        };
+                        &mut joint.data
+                    }
                 };
-                let Some(rev) = joint.data.as_revolute_mut() else {
+                let Some(rev) = data.as_revolute_mut() else {
                     continue;
                 };
                 rev.set_motor_position(target, ks, kd);
@@ -764,11 +806,22 @@ impl ArticulatedPlant {
         );
     }
 
+    /// The `GenericJoint` behind a hinge, from whichever set holds it.
+    fn joint_data(&self, h: Hinge) -> Option<GenericJoint> {
+        match h.mb {
+            Some(handle) => {
+                let (mb, link) = self.multibody_joints.get(handle)?;
+                Some(mb.link(link)?.joint().data)
+            }
+            None => Some(self.impulse_joints.get(h.joint)?.data),
+        }
+    }
+
     fn joint_angle(&self, h: Hinge) -> f32 {
-        let Some(joint) = self.impulse_joints.get(h.joint) else {
+        let Some(data) = self.joint_data(h) else {
             return h.q0;
         };
-        let Some(rev) = joint.data.as_revolute() else {
+        let Some(rev) = data.as_revolute() else {
             return h.q0;
         };
         let a = rev.angle(
@@ -794,11 +847,11 @@ impl ArticulatedPlant {
         let child = [l._coxa, l._femur, l.tibia];
         for j in 0..3 {
             let h = l.hinges[j];
-            let Some(jt) = self.impulse_joints.get(h.joint) else {
+            let Some(jt) = self.joint_data(h) else {
                 continue;
             };
-            let f1 = jt.data.local_frame1;
-            let f2 = jt.data.local_frame2;
+            let f1 = jt.local_frame1;
+            let f2 = jt.local_frame2;
             // Relative orientation the joint actually has, and the one it
             // would have at joint angle zero.
             let rel = self.bodies[h.parent].rotation().inverse() * *self.bodies[child[j]].rotation();
@@ -879,11 +932,11 @@ impl ArticulatedPlant {
     }
 
     fn hinge_world(&self, h: Hinge) -> Vector {
-        let Some(joint) = self.impulse_joints.get(h.joint) else {
+        let Some(joint) = self.joint_data(h) else {
             return self.bodies[h.parent].translation();
         };
         let parent = &self.bodies[h.parent];
-        parent.translation() + *parent.rotation() * joint.data.local_anchor1()
+        parent.translation() + *parent.rotation() * joint.local_anchor1()
     }
 
     fn to_sim(&self, p: Vector) -> V3 {
@@ -1096,6 +1149,86 @@ mod axis_probe {
     use crate::policy::{Policy, Preset};
     use crate::terrain::{Course, Terrain};
 
+    /// Worst `|cos|` between the axis a hinge was built with and the axis its
+    /// child actually turns about, over every leg and joint.
+    fn worst_axis(phys: &Physics) -> (f32, String) {
+        let frame = crate::robot::Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let q0 = standing_q(frame, &gait);
+        let mut worst = (0.0f32, String::new());
+        for j in 0..3 {
+            for leg in 0..6 {
+                let mut plant = ArticulatedPlant::standing(frame, &gait, &phys.clone(), &terrain);
+                let rel = |p: &ArticulatedPlant| {
+                    let l = p.legs[leg].as_ref().unwrap();
+                    let c = [l._coxa, l._femur, l.tibia][j];
+                    p.bodies[l.hinges[j].parent].rotation().inverse() * *p.bodies[c].rotation()
+                };
+                let built = {
+                    let h = plant.legs[leg].as_ref().unwrap().hinges[j];
+                    let f = plant.joint_data(h).map(|jt| jt.local_frame1).unwrap();
+                    (f.rotation * Vector::X).normalize()
+                };
+                let before = rel(&plant);
+                let mut cmd = q0;
+                cmd[leg][j] += 0.30;
+                hold(&mut plant, &cmd, phys, 3.0);
+                let (axis, ang) = (rel(&plant) * before.inverse()).to_axis_angle();
+                if ang.abs() < 1.0e-4 {
+                    continue;
+                }
+                let cos = (if ang < 0.0 { -axis } else { axis })
+                    .normalize()
+                    .dot(built)
+                    .abs();
+                if cos < worst.0 || worst.1.is_empty() {
+                    worst = (cos, format!("{} leg{leg} |cos|={cos:.4}", ["coxa", "femur", "tibia"][j]));
+                }
+            }
+        }
+        worst
+    }
+
+    /// Reduced coordinates make the hinge one number, so there is no axis to
+    /// drift off and no solver pass that has to converge for it. That is the
+    /// whole reason [`Physics::reduced`] can run at a quarter of the substeps:
+    /// the impulse plant scores 0.9305 at the same `1/4/1` — a coxa 21 degrees
+    /// off its own axis — and needs `4/8/4` merely to clear 0.99.
+    ///
+    /// Exact, not approximate. If this ever drops below 1.0 the multibody is
+    /// not being used and the cheap settings are no longer paid for.
+    #[test]
+    fn the_reduced_plant_holds_every_axis_exactly() {
+        let (cos, which) = worst_axis(&Physics::reduced());
+        assert!(cos > 0.9999, "reduced hinge left its axis: {which}");
+
+        // And it is the same machine standing: an exact hinge is no use if the
+        // legs end up somewhere else.
+        let frame = crate::robot::Frame::new(6);
+        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let terrain = Terrain::new(Course::Flat, 1);
+        let q0 = standing_q(frame, &gait);
+        let mut stand = |phys: &Physics| {
+            let mut p = ArticulatedPlant::standing(frame, &gait, phys, &terrain);
+            hold(&mut p, &q0, phys, 1.0);
+            let (pos, _, pitch, roll) = p.chassis_pose();
+            (pos[1], (pitch * pitch + roll * roll).sqrt())
+        };
+        let (ride_i, tilt_i) = stand(&Physics::default());
+        let (ride_r, tilt_r) = stand(&Physics::reduced());
+        assert!(
+            (ride_r - ride_i).abs() < 0.01,
+            "reduced plant stands at {ride_r:.4} m against the reference {ride_i:.4} m"
+        );
+        assert!(
+            tilt_r < tilt_i.max(0.02),
+            "reduced plant stands tilted {:.2} deg against {:.2} deg",
+            tilt_r.to_degrees(),
+            tilt_i.to_degrees()
+        );
+    }
+
     /// Drive one joint and measure the axis its child link actually turns
     /// about *relative to its parent* — the only frame in which a hinge's
     /// axis means anything. Measuring the child in world instead folds in
@@ -1122,11 +1255,7 @@ mod axis_probe {
                 let built = {
                     let l = plant.legs[leg].as_ref().unwrap();
                     let h = l.hinges[j];
-                    let f = plant
-                        .impulse_joints
-                        .get(h.joint)
-                        .map(|jt| jt.data.local_frame1)
-                        .unwrap();
+                    let f = plant.joint_data(h).map(|jt| jt.local_frame1).unwrap();
                     (f.rotation * Vector::X).normalize()
                 };
                 let before = rel(&plant);
