@@ -963,19 +963,25 @@ fn advance(rung: Rung, ceiling: usize, progress: f64, rng: &mut Rng) -> Rung {
 
 /// How long this environment's next episode should be.
 ///
-/// More time is only worth giving to an environment that ran out of it while
-/// doing well: one that fell, or went nowhere, spends the extra seconds doing
-/// more of the same. A short horizon early is cheap — many resets, fast
-/// turnover on the basic gait — and useless later, when the finish is out of
-/// reach however well the machine moves.
+/// The clock is extended when the clock is what stopped it. Falling is not a
+/// shortage of time and neither is standing still, so both give some back —
+/// short episodes are cheap, and a policy that is not moving learns faster from
+/// many resets than from long ones. Arriving extends nothing: an episode that
+/// completed had time to spare.
 ///
-/// Arriving does not extend anything. An episode that completed had time to
-/// spare, so the constraint was never the clock.
+/// This used to require `waypoint_fraction >= 0.5`, half the whole route, which
+/// could never be earned. Measured on the first curriculum run: the machine
+/// walked 4.1 m of a 40 m course, so route fraction sat near 0.1, every
+/// environment stayed pinned at the 8 s stage horizon, and the finish was
+/// unreachable by construction — which meant no episode ever arrived, the
+/// finish bar never existed, and the terminal reward was dead code. Gating on
+/// *whether the clock bound it* rather than on how much course was left lets
+/// the horizon bootstrap: more time reaches further, which earns more time.
 fn grow_horizon(current: f64, floor: f64, summary: &JointRollout) -> f64 {
-    let factor = if summary.fell {
-        1.0 / HORIZON_STEP
-    } else if summary.completed || summary.waypoint_fraction < 0.5 {
+    let factor = if summary.completed {
         1.0
+    } else if summary.fell || summary.distance <= 0.0 {
+        1.0 / HORIZON_STEP
     } else {
         HORIZON_STEP
     };
@@ -1131,34 +1137,41 @@ mod tests {
         assert!(seen.iter().all(|hit| *hit), "review never revisited some rung: {seen:?}");
     }
 
-    /// Time is given to an environment that ran out of it while doing well, and
-    /// to no other. The rule has four branches and each one matters, so it is
-    /// worth pinning: a faller that grew would spend longer falling, and a
-    /// finisher that grew was never short of time in the first place.
+    /// Time is extended when the clock is what stopped it, and not otherwise.
+    /// Each branch matters: a faller that grew would spend longer falling, a
+    /// finisher that grew was never short of time, and — the one that bit — a
+    /// machine walking well with most of the course still ahead of it has to be
+    /// able to buy time, or the finish stays unreachable forever and the whole
+    /// arrival reward is dead code.
     #[test]
-    fn only_running_out_of_time_while_doing_well_buys_more_of_it() {
+    fn the_clock_is_extended_when_the_clock_is_what_stopped_it() {
         let floor = 8.0;
-        let good = |fraction: f64| JointRollout {
-            waypoint_fraction: fraction,
+        let walked = |metres: f64| JointRollout { distance: metres, ..Default::default() };
+
+        // Still going forward when time ran out, with 90% of the course left:
+        // this is the case the old rule refused and the run was stuck on.
+        let barely_started = JointRollout {
+            distance: 4.1,
+            waypoint_fraction: 0.1,
             ..Default::default()
         };
+        assert!(grow_horizon(floor, floor, &barely_started) > floor);
 
-        // Ran out of the clock with most of the route behind it: more time.
-        assert!(grow_horizon(floor, floor, &good(0.8)) > floor);
-        // Barely moved: the clock was not the problem.
-        assert_eq!(grow_horizon(floor, floor, &good(0.1)), floor);
-        // Arrived: it had time to spare.
-        let finished = JointRollout { waypoint_fraction: 1.0, completed: true, ..Default::default() };
-        assert_eq!(grow_horizon(floor * 2.0, floor, &finished), floor * 2.0);
-        // Fell: give it back, but never below the stage's own horizon.
-        let fell = JointRollout { waypoint_fraction: 0.9, fell: true, ..Default::default() };
+        // Went nowhere, or backwards: give it back, short resets are cheaper.
+        assert!(grow_horizon(floor * 2.0, floor, &walked(0.0)) < floor * 2.0);
+        assert!(grow_horizon(floor * 2.0, floor, &walked(-1.0)) < floor * 2.0);
+        // Fell: same, and never below the stage's own horizon.
+        let fell = JointRollout { distance: 9.0, fell: true, ..Default::default() };
         assert!(grow_horizon(floor * 2.0, floor, &fell) < floor * 2.0);
         assert_eq!(grow_horizon(floor, floor, &fell), floor);
+        // Arrived: it had time to spare.
+        let finished = JointRollout { distance: 40.0, completed: true, ..Default::default() };
+        assert_eq!(grow_horizon(floor * 2.0, floor, &finished), floor * 2.0);
 
-        // Growth is bounded, however long it goes well.
+        // Growth is bounded, and reaches the cap from the floor.
         let mut horizon = floor;
         for _ in 0..500 {
-            horizon = grow_horizon(horizon, floor, &good(1.0));
+            horizon = grow_horizon(horizon, floor, &walked(5.0));
         }
         assert_eq!(horizon, floor * HORIZON_MAX);
     }

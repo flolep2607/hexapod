@@ -341,13 +341,21 @@ the reason this belongs on the terminal reward rather than the per-tick term.
 ### The episode grows into the policy
 
 Horizon is per environment now, not a stage constant, starting at the stage's own
-and reaching `HORIZON_MAX` times it. An episode that ran out of the clock with
-most of the route behind it buys more time; one that fell gives some back, never
-below the stage horizon; one that barely moved gets nothing, because the clock
-was not what stopped it; and one that arrived gets nothing, because it had time
-to spare. A short horizon early is cheap — many resets, fast turnover on the
-gait — and useless later, when the finish is out of reach however well the
-machine moves.
+and reaching `HORIZON_MAX` times it. The clock is extended when the clock is what
+stopped it: an episode still going forward when time ran out buys more, one that
+fell or went nowhere gives some back — never below the stage horizon — and one
+that arrived gets nothing, having had time to spare. A short horizon early is
+cheap, many resets and fast turnover on the gait, and useless later when the
+finish is out of reach however well the machine moves.
+
+The condition matters more than it looks. It first shipped requiring
+`waypoint_fraction >= 0.5`, half the whole route, which could never be earned:
+measured on the first curriculum run, the machine walked 4.1 m of a 40 m course,
+so route fraction sat near 0.1, every environment stayed pinned at its 8 s stage
+horizon, the finish was unreachable by construction — and therefore no episode
+ever arrived, the finish bar never came into existence, and the terminal arrival
+reward was dead code the whole time. Gating on whether the clock bound it lets
+the horizon bootstrap instead: more time reaches further, which earns more time.
 
 So the machine picks its own pace — fast on the flat, slow onto a trench lip —
 because what pays is getting there. `going_faster_toward_the_target_is_never_worth_less`
