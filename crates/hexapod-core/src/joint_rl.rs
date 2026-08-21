@@ -947,6 +947,10 @@ impl JointEnv {
         Ok(&self.observation)
     }
 
+    pub fn command(&self) -> f64 {
+        self.cmd
+    }
+
     /// Episode length in seconds, and the tick budget that follows from it.
     ///
     /// Call between episodes. A short horizon early is cheap — many resets,

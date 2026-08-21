@@ -515,28 +515,50 @@ fn epsilon_tensor(batch: usize, actions: usize, rng: &mut Rng, device: &Device) 
     Tensor::from_vec(epsilon, (batch, actions), device)
 }
 
+/// Per-column shift and scale, computed once per batch.
+///
+/// `normalized` recomputes a square root and a remainder for every single
+/// element, which on a 4096-row batch of 103 inputs is 844k redundant square
+/// roots blocking the GPU. The arithmetic below is the same expression with
+/// the same `f64` division, so the transform is bit-identical -- only the
+/// per-element setup is gone. `None` means the identity transform.
+fn column_scaling(width: usize, norm: &ObsNorm) -> Option<(Vec<f64>, Vec<f64>)> {
+    if norm.n < 2.0 {
+        return None;
+    }
+    let mut mean = vec![0.0; width];
+    let mut deviation = vec![1.0; width];
+    for index in 0..width.min(norm.mean.len()) {
+        mean[index] = norm.mean[index];
+        deviation[index] = (norm.m2[index] / norm.n).sqrt().max(1.0e-3);
+    }
+    Some((mean, deviation))
+}
+
 fn normalize_f64(values: &[f64], width: usize, norm: &ObsNorm) -> Vec<f32> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| normalized(*value, index % width, norm) as f32)
-        .collect()
+    let Some((mean, deviation)) = column_scaling(width, norm) else {
+        return values.iter().map(|value| *value as f32).collect();
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for row in values.chunks(width) {
+        for (index, value) in row.iter().enumerate() {
+            out.push(((*value - mean[index]) / deviation[index]).clamp(-8.0, 8.0) as f32);
+        }
+    }
+    out
 }
 
 fn normalize_f32(values: &[f32], width: usize, norm: &ObsNorm) -> Vec<f32> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| normalized(*value as f64, index % width, norm) as f32)
-        .collect()
-}
-
-fn normalized(value: f64, index: usize, norm: &ObsNorm) -> f64 {
-    if norm.n < 2.0 || index >= norm.mean.len() {
-        return value;
+    let Some((mean, deviation)) = column_scaling(width, norm) else {
+        return values.to_vec();
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for row in values.chunks(width) {
+        for (index, value) in row.iter().enumerate() {
+            out.push(((*value as f64 - mean[index]) / deviation[index]).clamp(-8.0, 8.0) as f32);
+        }
     }
-    let deviation = (norm.m2[index] / norm.n).sqrt().max(1.0e-3);
-    ((value - norm.mean[index]) / deviation).clamp(-8.0, 8.0)
+    out
 }
 
 fn deterministic_init(vars: &VarMap, seed: u64, device: &Device) -> Result<()> {

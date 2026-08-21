@@ -10,7 +10,7 @@ use hexapod_sac::{SacAgent, SacConfig, UpdateStats};
 use rayon::prelude::*;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
@@ -252,6 +252,10 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     }
 
     let started = Instant::now();
+    // Where the wall clock actually goes: command refresh, actor forward,
+    // physics collection, replay bookkeeping, gradient updates. Printed as a
+    // share of wall so a tuning change can be judged instead of guessed.
+    let mut spent = [Duration::ZERO; 5];
     let mut transitions = 0usize;
     let mut next_evaluation = config.eval_interval;
     let mut update_budget = 0.0f64;
@@ -315,6 +319,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             transitions,
         );
         let environment_count = environments.len();
+        let mark = Instant::now();
         for (index, (environment, state)) in environments.iter_mut().zip(&mut states).enumerate() {
             let training_command = match rungs.as_ref() {
                 // Each rung carries its own command, including the run-up the
@@ -328,12 +333,16 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                     environment_count,
                 ),
             };
-            let observation = environment.set_command(training_command)?;
-            state.copy_from_slice(observation);
+            if training_command != environment.command() {
+                let observation = environment.set_command(training_command)?;
+                state.copy_from_slice(observation);
+            }
         }
         for state in &states {
             normalizer.observe(state);
         }
+        spent[0] += mark.elapsed();
+        let mark = Instant::now();
         let take = (config.steps - transitions).min(environments.len());
         let unit_actions = if transitions < config.warmup_steps && config.init.is_none() {
             let hold = (take as f64 * config.warmup_hold_fraction).round() as usize;
@@ -357,6 +366,8 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 .collect::<Vec<_>>();
             agent.action(&flat, &normalizer, true, &mut rng)?
         };
+        spent[1] += mark.elapsed();
+        let mark = Instant::now();
         let physical_actions = unit_actions
             .chunks_exact(actions)
             .map(|action| {
@@ -366,11 +377,62 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let results = environments[..take]
-            .par_iter_mut()
-            .zip(&physical_actions)
-            .map(|(environment, action)| environment.step(action))
-            .collect::<Vec<_>>();
+        // Integrating the worlds needs the CPU and never the GPU; a gradient
+        // step needs the GPU and never the environments. Run them at the same
+        // time -- they borrow disjoint state, so the only cost is that these
+        // gradients see the replay buffer one iteration stale, which is `take`
+        // transitions out of a buffer holding millions.
+        let train = transitions >= config.warmup_steps && replay.len() >= config.batch_size;
+        if train {
+            update_budget += config.updates_per_step * take as f64;
+        }
+        let (results, trained) = std::thread::scope(|scope| {
+            let environments = &mut environments;
+            let physical_actions = &physical_actions;
+            let integrate = scope.spawn(move || {
+                environments[..take]
+                    .par_iter_mut()
+                    .zip(physical_actions)
+                    .map(|(environment, action)| environment.step(action))
+                    .collect::<Vec<_>>()
+            });
+            let gradient = Instant::now();
+            let mut trained: AppResult<()> = Ok(());
+            if train {
+                while update_budget >= 1.0 {
+                    let step = replay
+                        .sample(config.batch_size, &mut rng)
+                        .map_err(|error| -> Box<dyn Error> { error.into() })
+                        .and_then(|batch| {
+                            agent
+                                .update(
+                                    &batch,
+                                    &normalizer,
+                                    &mut rng,
+                                    updates >= config.policy_warmup_updates,
+                                )
+                                .map_err(|error| -> Box<dyn Error> { error.into() })
+                        });
+                    match step {
+                        Ok(stats) => last_stats = Some(stats),
+                        Err(error) => {
+                            trained = Err(error);
+                            break;
+                        }
+                    }
+                    updates += 1;
+                    update_budget -= 1.0;
+                }
+            }
+            spent[4] += gradient.elapsed();
+            (
+                integrate.join().expect("physics collection thread panicked"),
+                trained,
+            )
+        });
+        trained?;
+        spent[2] += mark.elapsed();
+        let mark = Instant::now();
 
         for index in 0..take {
             let step = results[index]
@@ -415,24 +477,11 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 step.observation.clone()
             };
         }
+        spent[3] += mark.elapsed();
         transitions += take;
 
-        if transitions >= config.warmup_steps && replay.len() >= config.batch_size {
-            update_budget += config.updates_per_step * take as f64;
-            while update_budget >= 1.0 {
-                let batch = replay.sample(config.batch_size, &mut rng)?;
-                last_stats = Some(agent.update(
-                    &batch,
-                    &normalizer,
-                    &mut rng,
-                    updates >= config.policy_warmup_updates,
-                )?);
-                updates += 1;
-                update_budget -= 1.0;
-            }
-        }
-
         if transitions >= next_evaluation || transitions == config.steps {
+            let wall_trained = started.elapsed().as_secs_f64().max(1e-9);
             evaluation_agent.copy_actor_from(&agent)?;
             let evaluation = evaluate(
                 &evaluation_agent,
@@ -465,6 +514,17 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 critic = stats.critic_loss,
                 actor = stats.actor_loss,
                 wall = started.elapsed().as_secs_f64(),
+            );
+            let wall = wall_trained;
+            println!(
+                "#   phases cmd {:.0}% act {:.0}% step {:.0}% keep {:.0}% grad {:.0}% idle {:.0}% · {:.0} steps/s",
+                100.0 * spent[0].as_secs_f64() / wall,
+                100.0 * spent[1].as_secs_f64() / wall,
+                100.0 * spent[2].as_secs_f64() / wall,
+                100.0 * spent[3].as_secs_f64() / wall,
+                100.0 * spent[4].as_secs_f64() / wall,
+                100.0 * (1.0 - spent.iter().map(|d| d.as_secs_f64()).sum::<f64>() / wall),
+                transitions as f64 / wall,
             );
             if let Some(rungs) = rungs.as_ref() {
                 let mut histogram = [0usize; LADDER.len()];
