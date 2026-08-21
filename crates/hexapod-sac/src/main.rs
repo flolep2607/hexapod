@@ -179,6 +179,8 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             .collect::<Vec<_>>()
     });
     let mut episode_seed = 0u64;
+    let mut bar = FinishBar::default();
+    let mut horizons = vec![stage.horizon(); config.environments];
     let mut environments = (0..config.environments)
         .map(|index| {
             JointEnv::new(
@@ -224,6 +226,10 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     }
     let mut evaluation_agent =
         SacAgent::new(observations, actions, &Device::Cpu, sac_config, config.seed)?;
+
+    for (environment, horizon) in environments.iter_mut().zip(&horizons) {
+        environment.set_horizon(*horizon);
+    }
 
     let started = Instant::now();
     let mut transitions = 0usize;
@@ -362,8 +368,15 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 step.truncated,
             )?;
             states[index] = if step.terminated || step.truncated {
+                let summary = environments[index].summary();
+                if summary.completed {
+                    bar.observe(summary.secs);
+                }
+                let floor = rungs
+                    .as_ref()
+                    .map_or(stage.horizon(), |rungs| rungs[index].stage().horizon());
+                horizons[index] = grow_horizon(horizons[index], floor, &summary);
                 if let Some(rungs) = rungs.as_mut() {
-                    let summary = environments[index].summary();
                     let progress = rungs[index].progress(&summary);
                     rungs[index] = advance(rungs[index], ladder_ceiling, progress, &mut rng);
                     episode_seed += 1;
@@ -374,6 +387,8 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                         config.seed ^ (0x9E37_79B9 * episode_seed),
                     );
                 }
+                environments[index].set_horizon(horizons[index]);
+                environments[index].set_finish_bar(bar.value());
                 environments[index].reset().to_vec()
             } else {
                 step.observation.clone()
@@ -441,6 +456,16 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 } else {
                     climbers.iter().map(|r| r.level as f64).sum::<f64>() / climbers.len() as f64
                 };
+                println!(
+                    "#   bar {} · horizon {:.1}-{:.1} s",
+                    if bar.value() > 0.0 {
+                        format!("{:.2} s", bar.value())
+                    } else {
+                        "none yet".into()
+                    },
+                    horizons.iter().copied().fold(f64::INFINITY, f64::min),
+                    horizons.iter().copied().fold(0.0, f64::max),
+                );
                 println!(
                     "#   rungs {} · climbing {:.2} · review {} · ceiling {}",
                     histogram
@@ -811,6 +836,53 @@ const LADDER: [Stage; 5] = [
 /// standing review set that keeps every cleared rung in the data distribution.
 const REVIEW_SHARE: f64 = 0.25;
 
+/// Episodes in the moving average behind the finish bar.
+const FINISH_WINDOW: f64 = 200.0;
+
+/// How much an episode moves its environment's horizon, up or down.
+const HORIZON_STEP: f64 = 1.15;
+
+/// Longest an episode may grow, as a multiple of its stage's own horizon.
+const HORIZON_MAX: f64 = 6.0;
+
+/// The finish time worth half the terminal bonus: the best the policy has
+/// managed, never the merely recent.
+///
+/// A bar that tracks a moving average alone can be ridden — get slower, let it
+/// follow you down, recover, and collect the improvement again. Taking the
+/// better of the recent average and the best ever makes it monotone, so a level
+/// already reached pays exactly what it paid before and there is nothing to
+/// farm. Lower is better here, so the ratchet is a minimum.
+#[derive(Clone, Copy, Default)]
+struct FinishBar {
+    best: f64,
+    recent: f64,
+}
+
+impl FinishBar {
+    /// Zero until an episode has actually arrived. No terminal bonus is paid
+    /// before that: there is nothing to be half as good as yet.
+    fn value(self) -> f64 {
+        self.best
+    }
+
+    fn observe(&mut self, secs: f64) {
+        if secs <= 0.0 {
+            return;
+        }
+        self.recent = if self.recent <= 0.0 {
+            secs
+        } else {
+            self.recent + (secs - self.recent) / FINISH_WINDOW
+        };
+        self.best = if self.best <= 0.0 {
+            self.recent
+        } else {
+            self.best.min(self.recent)
+        };
+    }
+}
+
 /// Highest rung `stage` allows.
 fn ceiling(stage: Stage) -> usize {
     match stage {
@@ -887,6 +959,27 @@ fn advance(rung: Rung, ceiling: usize, progress: f64, rng: &mut Rng) -> Rung {
         return Rung::sample(rung.level - 1, false, rng);
     }
     Rung::sample(rung.level, false, rng)
+}
+
+/// How long this environment's next episode should be.
+///
+/// More time is only worth giving to an environment that ran out of it while
+/// doing well: one that fell, or went nowhere, spends the extra seconds doing
+/// more of the same. A short horizon early is cheap — many resets, fast
+/// turnover on the basic gait — and useless later, when the finish is out of
+/// reach however well the machine moves.
+///
+/// Arriving does not extend anything. An episode that completed had time to
+/// spare, so the constraint was never the clock.
+fn grow_horizon(current: f64, floor: f64, summary: &JointRollout) -> f64 {
+    let factor = if summary.fell {
+        1.0 / HORIZON_STEP
+    } else if summary.completed || summary.waypoint_fraction < 0.5 {
+        1.0
+    } else {
+        HORIZON_STEP
+    };
+    (current * factor).clamp(floor, floor * HORIZON_MAX)
 }
 
 fn rung_env(rung: Rung, frame: Frame, physics: &Physics, seed: u64) -> JointEnv {
@@ -1036,6 +1129,70 @@ mod tests {
             seen[rung.level] = true;
         }
         assert!(seen.iter().all(|hit| *hit), "review never revisited some rung: {seen:?}");
+    }
+
+    /// Time is given to an environment that ran out of it while doing well, and
+    /// to no other. The rule has four branches and each one matters, so it is
+    /// worth pinning: a faller that grew would spend longer falling, and a
+    /// finisher that grew was never short of time in the first place.
+    #[test]
+    fn only_running_out_of_time_while_doing_well_buys_more_of_it() {
+        let floor = 8.0;
+        let good = |fraction: f64| JointRollout {
+            waypoint_fraction: fraction,
+            ..Default::default()
+        };
+
+        // Ran out of the clock with most of the route behind it: more time.
+        assert!(grow_horizon(floor, floor, &good(0.8)) > floor);
+        // Barely moved: the clock was not the problem.
+        assert_eq!(grow_horizon(floor, floor, &good(0.1)), floor);
+        // Arrived: it had time to spare.
+        let finished = JointRollout { waypoint_fraction: 1.0, completed: true, ..Default::default() };
+        assert_eq!(grow_horizon(floor * 2.0, floor, &finished), floor * 2.0);
+        // Fell: give it back, but never below the stage's own horizon.
+        let fell = JointRollout { waypoint_fraction: 0.9, fell: true, ..Default::default() };
+        assert!(grow_horizon(floor * 2.0, floor, &fell) < floor * 2.0);
+        assert_eq!(grow_horizon(floor, floor, &fell), floor);
+
+        // Growth is bounded, however long it goes well.
+        let mut horizon = floor;
+        for _ in 0..500 {
+            horizon = grow_horizon(horizon, floor, &good(1.0));
+        }
+        assert_eq!(horizon, floor * HORIZON_MAX);
+    }
+
+    /// The whole reason the bar is a ratchet. A bar that followed a moving
+    /// average could be ridden: get slower, let it drift down with you,
+    /// recover, and be paid for the same improvement twice. Taking the best
+    /// ever means a level already reached pays what it paid before.
+    #[test]
+    fn the_finish_bar_never_slips() {
+        let mut bar = FinishBar::default();
+        assert_eq!(bar.value(), 0.0, "no bar before anything has arrived");
+
+        // Improving pulls it down.
+        for _ in 0..2000 {
+            bar.observe(10.0);
+        }
+        let after_ten = bar.value();
+        assert!(after_ten > 0.0 && after_ten < 10.5);
+        for _ in 0..2000 {
+            bar.observe(7.0);
+        }
+        let after_seven = bar.value();
+        assert!(after_seven < after_ten, "a faster run must move the bar in");
+
+        // Getting slower again does not give it back, however long it goes on.
+        for _ in 0..20_000 {
+            bar.observe(12.0);
+            assert!(
+                bar.value() <= after_seven + 1e-12,
+                "bar slipped to {} from {after_seven}",
+                bar.value()
+            );
+        }
     }
 
     /// Every course has to be reachable by some rung. The ladder first shipped

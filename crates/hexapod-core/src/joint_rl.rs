@@ -71,6 +71,27 @@ pub const MAX_JOINT_RATE: f64 = 6.0;
 /// physical, the legs being 1.8 units of a 0.18 m reach.
 pub const REFERENCE_SPEED: f64 = 2.0;
 
+/// Weight on the terminal reward for reaching the target.
+///
+/// The per-tick shaping sums to 1.0 over a full episode at perfect quality, so
+/// reaching the target *cost* the policy return before this existed: finishing
+/// at half the horizon terminates the episode, which cuts the accumulation to
+/// 0.5, and `terminated` cuts the bootstrap too, so 0.5 was the whole return
+/// against 1.0 for never arriving. Dawdling beat arriving. Everything about
+/// the route lived in `episode_score`, which drives checkpoint selection and
+/// curriculum promotion and never reaches the gradient.
+///
+/// At 2.0 the bonus at the bar is 1.0, which is the largest accumulation any
+/// episode can lose by ending early, so arriving is never worse than not.
+pub const FINISH_BONUS: f64 = 2.0;
+
+/// Spread of the terminal reward around the bar, as a fraction of it.
+///
+/// Arriving 30% under the bar scores about 0.73 of the bonus and 30% over
+/// about 0.27. Being relative is what keeps this scale-free: there is no time
+/// or speed constant, because the bar is measured rather than chosen.
+pub const FINISH_SPREAD: f64 = 0.30;
+
 /// Weight on how much the command moved tick to tick. Joint-level policies
 /// need this or they buzz: a controller that shakes at the control rate can
 /// look like it is tracking a speed while being useless on a real machine.
@@ -830,6 +851,13 @@ pub struct JointEnv {
     clock: f64,
     route: RouteState,
     finish_time: f64,
+    /// Episode length in seconds. Starts at the stage's own horizon and is the
+    /// trainer's to raise once the policy can use the time.
+    horizon: f64,
+    /// Finish time that scores half the terminal bonus. Zero until the trainer
+    /// has seen an episode reach the target, and no bonus is paid before then:
+    /// there is nothing to be half as good as yet.
+    finish_bar: f64,
     duty: f64,
     max_ticks: usize,
     boundary: bool,
@@ -859,6 +887,8 @@ impl JointEnv {
             phys,
             cmd: stage.speed_for(terrain.course),
             max_ticks: (stage.horizon() / DT) as usize,
+            horizon: stage.horizon(),
+            finish_bar: 0.0,
             terrain,
             stage,
             initial,
@@ -902,7 +932,7 @@ impl JointEnv {
         self.fell = false;
         self.clock = 0.0;
         self.route = RouteState::default();
-        self.finish_time = self.stage.horizon();
+        self.finish_time = self.horizon;
         self.duty = self.frame.legs() as f64;
         self.boundary = false;
         self.refresh_observation();
@@ -923,6 +953,27 @@ impl JointEnv {
         let tick = self.sample();
         self.fill_observation(&tick);
         Ok(&self.observation)
+    }
+
+    /// Episode length in seconds, and the tick budget that follows from it.
+    ///
+    /// Call between episodes. A short horizon early is cheap — many resets,
+    /// fast turnover on the basic gait — and useless later, when the finish is
+    /// out of reach however well the machine moves. Extending it is only worth
+    /// anything once the time is being used, which is the trainer's call.
+    pub fn set_horizon(&mut self, secs: f64) {
+        self.horizon = secs.max(DT);
+        self.max_ticks = (self.horizon / DT).max(1.0) as usize;
+        self.finish_time = self.horizon;
+    }
+
+    pub fn horizon(&self) -> f64 {
+        self.horizon
+    }
+
+    /// The finish time worth half the terminal bonus. See [`FINISH_SPREAD`].
+    pub fn set_finish_bar(&mut self, secs: f64) {
+        self.finish_bar = secs.max(0.0);
     }
 
     pub fn is_done(&self) -> bool {
@@ -1064,7 +1115,14 @@ impl JointEnv {
         let n = self.frame.legs();
         let mut learning_reward = 0.0;
         for _ in 0..DECIMATION {
+            let was_finished = self.route.finished;
             let tick = self.refresh_observation();
+            // Reaching the target, paid once, on the tick it happens. Sooner is
+            // worth more, and it is paid here rather than after the `is_done`
+            // break because arriving is exactly what ends the episode.
+            if !was_finished && self.route.finished {
+                learning_reward += FINISH_BONUS * self.promptness(self.finish_time);
+            }
             if self.is_done() {
                 break;
             }
@@ -1114,7 +1172,7 @@ impl JointEnv {
             self.total += scored_tick;
             let local_support_cost = SUPPORT_DEFICIT_COST * (1.0 - support_gate(self.duty, n));
             learning_reward +=
-                (scored_tick - local_support_cost) * DT / self.stage.horizon().max(1e-6);
+                (scored_tick - local_support_cost) * DT / self.horizon.max(1e-6);
             self.steps += 1;
             self.clock += DT / 0.5;
             if self.steps >= self.max_ticks {
@@ -1132,6 +1190,17 @@ impl JointEnv {
         })
     }
 
+    /// Fraction of the terminal bonus an arrival at `secs` earns: 0.5 at the
+    /// bar, rising toward 1.0 for a faster one and falling toward 0 for a
+    /// slower. Nothing is paid until the bar exists.
+    fn promptness(&self, secs: f64) -> f64 {
+        if self.finish_bar <= 0.0 {
+            return 0.0;
+        }
+        let z = (self.finish_bar - secs) / (FINISH_SPREAD * self.finish_bar);
+        1.0 / (1.0 + (-z).exp())
+    }
+
     /// Episode metrics at the current state.
     pub fn summary(&self) -> JointRollout {
         let (end, _, _, _) = self.plant.chassis_pose();
@@ -1143,7 +1212,7 @@ impl JointEnv {
             self.route.reached as f64 / route_len as f64
         };
         let completed = self.route.finished && self.route.reached == route_len;
-        let base_score = self.total * DT / self.stage.horizon().max(1e-6);
+        let base_score = self.total * DT / self.horizon.max(1e-6);
         let mean_support = if self.steps == 0 {
             // The environment is constructed from a warmed standing plant.
             // Treating its pre-step support as zero made locomotion episodes
@@ -3150,6 +3219,46 @@ mod tests {
     /// without training on it — a saturated objective is a maximum, and ARS
     /// stepping away from one took a perfect 1.000 down to 0.236 in six
     /// iterations when the stage was trained before being checked.
+    /// Reaching the target used to cost the policy return. The per-tick shaping
+    /// sums to 1.0 over a full episode, and arriving *terminates* the episode,
+    /// so finishing halfway through the horizon banked 0.5 against 1.0 for
+    /// never arriving — and `terminated` cuts the bootstrap, so that was the
+    /// whole return. Dawdling beat arriving, and every route term lived in
+    /// `episode_score`, which the gradient never sees.
+    #[test]
+    fn arriving_beats_running_out_the_clock() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        // Course and stage are irrelevant here; only the arithmetic is.
+        let mut env = JointEnv::new(frame, &phys, Terrain::new(Course::Flat, 3), Stage::Gaps);
+        env.set_horizon(8.0);
+
+        // The most any episode can bank from per-tick shaping is one horizon's
+        // worth, which is exactly 1.0.
+        let dawdled_forever = 1.0;
+
+        // No bar yet means no bonus: there is nothing to be half as good as.
+        assert_eq!(env.promptness(4.0), 0.0);
+
+        env.set_finish_bar(8.0);
+        // Arriving at the bar is half the bonus, and FINISH_BONUS is set so
+        // that half of it covers the largest accumulation an early finish can
+        // give up.
+        let at_bar = FINISH_BONUS * env.promptness(8.0);
+        assert!((at_bar - 1.0).abs() < 1e-9, "bonus at the bar was {at_bar}");
+        assert!(at_bar >= dawdled_forever, "arriving must never be worse");
+
+        // Sooner is strictly better, all the way down.
+        let mut previous = f64::NEG_INFINITY;
+        for tenths in (1..=160).rev() {
+            let here = env.promptness(tenths as f64 * 0.1);
+            assert!(here > previous, "arriving sooner scored less: {here} <= {previous}");
+            previous = here;
+        }
+        assert!(env.promptness(1.0) > 0.9, "well under the bar should be near full");
+        assert!(env.promptness(16.0) < 0.1, "well over the bar should be near nothing");
+    }
+
     /// The task is to reach a point in space as soon as possible, so nothing in
     /// the objective may prefer a slower machine. The old curve did: it fell
     /// off above the commanded speed, and a run that saturated it spent 13M

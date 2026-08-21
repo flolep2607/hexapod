@@ -292,8 +292,50 @@ What replaced them:
   rather than a target: it sets where the curve is steep so the shaping stays
   readable as a fraction. `reward` and `episode_score` no longer take a
   commanded speed at all.
-- **Arriving sooner pays.** A completed route is worth `1 + (1 - secs/horizon)`:
-  2.0 for arriving immediately, the old 1.0 for arriving as the horizon expires.
+- **Arriving sooner pays, and the policy feels it.** Reaching the target used to
+  *cost* return. `learning_reward` is per-tick and sums to 1.0 over a full
+  episode; arriving terminates the episode, so finishing halfway through banked
+  0.5 against 1.0 for never arriving, and `terminated` cuts the bootstrap, so
+  that was the whole return. Dawdling beat arriving. Every route term —
+  `0.35 x waypoint_fraction`, the completion bonus — lived in `episode_score`,
+  which drives checkpoint selection and curriculum promotion and never reaches
+  the gradient. The telescoping test only covers `STAND`, where `episode_score`
+  returns early, so nothing failed. It never bit because `WALK-FLAT` has a 4 s
+  horizon on a 40 m course and the route is unreachable.
+
+  There is now a terminal reward of `FINISH_BONUS x promptness(arrival)` paid on
+  the tick the route completes. At 2.0 the bonus at the bar is 1.0, the largest
+  accumulation any early finish can give up, so arriving is never worse than not.
+
+### The bar is a ratchet
+
+`promptness` is `sigmoid((bar - secs) / (FINISH_SPREAD x bar))`: half the bonus
+at the bar, rising toward all of it for a faster arrival and toward none for a
+slower. Being relative to the bar is what keeps it scale-free — there is no time
+or speed constant, because the bar is measured.
+
+The bar is `min(best ever, moving average of the last 200 arrivals)`. A bar that
+followed the average alone could be ridden: get slower, let it drift down with
+you, recover, and be paid for the same improvement twice. Taking the best ever
+makes it monotone, so a level already reached pays exactly what it paid before
+and there is nothing to farm. Nothing is paid at all until an episode has
+arrived — there is no bar to be half as good as yet.
+
+One known limit: a terminal reward sits in the replay labelled against the bar
+as it was then, and the bar moves. It is one transition per episode, roughly
+0.1-0.25% of a 2M buffer, against a bar averaging 200 arrivals — bounded, and
+the reason this belongs on the terminal reward rather than the per-tick term.
+
+### The episode grows into the policy
+
+Horizon is per environment now, not a stage constant, starting at the stage's own
+and reaching `HORIZON_MAX` times it. An episode that ran out of the clock with
+most of the route behind it buys more time; one that fell gives some back, never
+below the stage horizon; one that barely moved gets nothing, because the clock
+was not what stopped it; and one that arrived gets nothing, because it had time
+to spare. A short horizon early is cheap — many resets, fast turnover on the
+gait — and useless later, when the finish is out of reach however well the
+machine moves.
 
 So the machine picks its own pace — fast on the flat, slow onto a trench lip —
 because what pays is getting there. `going_faster_toward_the_target_is_never_worth_less`
