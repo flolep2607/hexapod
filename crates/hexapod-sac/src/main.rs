@@ -308,7 +308,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     let mut best_score = f64::NEG_INFINITY;
 
     println!(
-        "# native SAC · {} · speed {:.2}->{:.2} over {} steps · {} envs · replay {} · batch {} · UTD {:.2} · train {:?} · eval Cpu",
+        "# native SAC · {} · speed {:.2}->{:.2} over {} steps · {} envs · replay {} · batch {} · UTD {:.3} · train {:?} · eval Cpu",
         stage.name(),
         config.start_speed,
         stage.speed(),
@@ -320,7 +320,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         device
     );
     println!(
-        " steps   replay updates  cmd≤  score   dist  feet    alpha entropy   q      losses (critic/actor)  wall"
+        " steps   replay updates  cmd≤  score   dist  feet boost    alpha entropy   q      losses (critic/actor)  wall"
     );
 
     if config.init.is_some() {
@@ -338,7 +338,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         best_score = evaluation.score;
         save_checkpoint(&agent, &normalizer, &config, &evaluation)?;
         println!(
-            "{transitions:>7} {replay_len:>8} {updates:>7} {command:>5.2} {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+            "{transitions:>7} {replay_len:>8} {updates:>7} {command:>5.2} {score:>6.3} {distance:>6.2} {support:>5.2} {boost:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
             transitions = 0,
             replay_len = 0,
             updates = 0,
@@ -346,6 +346,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             score = evaluation.score,
             distance = evaluation.distance,
             support = evaluation.support,
+            boost = evaluation.boost,
             alpha = agent.alpha()?,
             entropy = 0.0,
             q = 0.0,
@@ -559,12 +560,13 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 mean_entropy_per_action: 0.0,
             });
             println!(
-                "{transitions:>7} {replay_len:>8} {updates:>7} {command:>5.2} {score:>6.3} {distance:>6.2} {support:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
+                "{transitions:>7} {replay_len:>8} {updates:>7} {command:>5.2} {score:>6.3} {distance:>6.2} {support:>5.2} {boost:>5.2} {alpha:>8.6} {entropy:>7.3} {q:>6.2}  {critic:>8.4}/{actor:>8.4}  {wall:>5.0}s",
                 replay_len = replay.len(),
                 command = command_ceiling,
                 score = evaluation.score,
                 distance = evaluation.distance,
                 support = evaluation.support,
+            boost = evaluation.boost,
                 alpha = stats.alpha,
                 entropy = stats.mean_entropy_per_action,
                 q = stats.mean_q,

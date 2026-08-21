@@ -500,6 +500,12 @@ pub struct JointRollout {
     pub completion_rate: f64,
     /// Time to the finish, with a failure charged the full stage horizon.
     pub finish_time: f64,
+    /// Share of ticks spent at the boosted torque ceiling, `0..=1`.
+    ///
+    /// The budget allows a third at most — two seconds bought with four of
+    /// lockout — so anything approaching that means the policy is holding the
+    /// boost down as a matter of course rather than spending it where it helps.
+    pub boost: f64,
 }
 
 /// The standing joint pose: what an all-zero action commands.
@@ -907,6 +913,7 @@ pub struct JointEnv {
     /// reward that was identically zero.
     last_remaining: f64,
     boost: Boost,
+    boost_ticks: usize,
     max_ticks: usize,
     boundary: bool,
     observation: Vec<f64>,
@@ -939,6 +946,7 @@ impl JointEnv {
             finish_bar: 0.0,
             last_remaining: 0.0,
             boost: Boost::default(),
+            boost_ticks: 0,
             terrain,
             stage,
             initial,
@@ -989,6 +997,7 @@ impl JointEnv {
         // budget, so clearing it afterwards leaves the previous episode's
         // spending in the vector the caller is handed.
         self.boost = Boost::default();
+        self.boost_ticks = 0;
         self.refresh_observation();
         // After the route exists, so the first tick's progress is measured from
         // the real starting distance rather than from zero.
@@ -1217,6 +1226,9 @@ impl JointEnv {
             // bursts, so that is what it is given. A policy that wants the peak
             // has to ask for it, and pay twice the time it spends.
             let boosting = self.boost.tick(action[n * 3] > 0.0);
+            if boosting {
+                self.boost_ticks += 1;
+            }
             let mut driving = self.phys;
             if !boosting {
                 driving.motor_max = self.phys.motor_sustained;
@@ -1369,6 +1381,13 @@ impl JointEnv {
             waypoint_fraction,
             completion_rate: f64::from(u8::from(completed)),
             finish_time: self.finish_time,
+            boost: if self.steps == 0 {
+                0.0
+            } else {
+                // `steps` counts policy decisions and the budget is charged per
+                // control tick, so the denominator is ticks, not decisions.
+                self.boost_ticks as f64 / (self.steps * DECIMATION) as f64
+            },
         }
     }
 }
@@ -1688,6 +1707,9 @@ fn rollout_nexus_batch(
                 waypoint_fraction,
                 completion_rate: f64::from(u8::from(completed)),
                 finish_time: ep.finish_time,
+                // This path drives every episode at `motor_max` and has no
+                // boost to spend, so the ceiling is on the whole time.
+                boost: 1.0,
             },
             norm: ep.norm,
         });
