@@ -242,6 +242,17 @@ impl Terrain {
         t
     }
 
+    /// Whether this course's layout depends on the seed.
+    ///
+    /// `generate` builds `Flat` by doing nothing at all, so every `Flat`
+    /// terrain is identical whatever seed it is handed. A trainer resampling
+    /// terrain between episodes can skip the rebuild for those -- a whole
+    /// Rapier world and heightfield for a layout it already has -- without
+    /// changing a single thing the policy sees.
+    pub fn randomized(course: Course) -> bool {
+        !matches!(course, Course::Flat)
+    }
+
     /// Cumulative route distance from each waypoint to the last.
     fn rebuild_tail(&mut self) {
         let n = self.waypoints.len();
@@ -1259,6 +1270,31 @@ pub fn deepest_pit(terrain: &Terrain) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// `randomized` has to agree with what `generate` actually does, or the
+    /// trainer skips a rebuild it needed and quietly trains on one layout.
+    #[test]
+    fn randomized_says_which_courses_the_seed_moves() {
+        for course in COURSES {
+            let a = Terrain::new(course, 11);
+            let b = Terrain::new(course, 977);
+            let same = a.obstacles.len() == b.obstacles.len()
+                && a.obstacles.iter().zip(&b.obstacles).all(|(p, q)| {
+                    p.x0 == q.x0 && p.x1 == q.x1 && p.z0 == q.z0
+                        && p.z1 == q.z1 && p.top == q.top
+                })
+                && a.waypoints == b.waypoints;
+            assert_eq!(
+                Terrain::randomized(course),
+                !same,
+                "{course:?}: randomized() says {} but two seeds are {}",
+                Terrain::randomized(course),
+                if same { "identical" } else { "different" }
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

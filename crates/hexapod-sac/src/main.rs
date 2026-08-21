@@ -461,14 +461,27 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 horizons[index] = grow_horizon(horizons[index], floor, &summary, reach.value());
                 if let Some(rungs) = rungs.as_mut() {
                     let progress = rungs[index].progress(&summary);
+                    let previous = rungs[index];
                     rungs[index] = advance(rungs[index], ladder_ceiling, progress, &mut rng);
-                    episode_seed += 1;
-                    environments[index] = rung_env(
-                        rungs[index],
-                        frame,
-                        &physics,
-                        config.seed ^ (0x9E37_79B9 * episode_seed),
-                    );
+                    // Rebuilding is a whole new Rapier world, plant and
+                    // heightfield, on this serial path, and it is only worth
+                    // anything when the result would differ. It differs if the
+                    // rung moved -- a new course, or a new stage with its own
+                    // horizon and objective -- or if the course reads the seed
+                    // at all. `Flat` reads none of it, and the three stages
+                    // below `Rough` are Flat only, so most of the fleet keeps
+                    // the world it already has and only resets the robot in it.
+                    let moved = rungs[index].level != previous.level
+                        || rungs[index].course != previous.course;
+                    if moved || Terrain::randomized(rungs[index].course) {
+                        episode_seed += 1;
+                        environments[index] = rung_env(
+                            rungs[index],
+                            frame,
+                            &physics,
+                            config.seed ^ (0x9E37_79B9 * episode_seed),
+                        );
+                    }
                 }
                 environments[index].set_horizon(horizons[index]);
                 environments[index].set_finish_bar(bar.value());
