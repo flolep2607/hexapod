@@ -16,9 +16,9 @@ use std::sync::{Mutex, OnceLock};
 use crate::dynamics::Physics;
 use crate::math::V3;
 use crate::plant::ArticulatedPlant;
-use crate::policy::Gait;
+use crate::robot::Stance;
 use crate::robot::{Frame, MAX_LEGS};
-use crate::sim::DT;
+use crate::dynamics::DT;
 use crate::terrain::Terrain;
 
 /// Host snapshot with exactly the state consumed by `joint_rl`.
@@ -95,7 +95,7 @@ fn shared_backend(device: usize) -> Result<GpuBackend, String> {
 impl NexusPlantBatch {
     pub fn new(
         frame: Frame,
-        gait: &Gait,
+        stance: &Stance,
         phys: &Physics,
         terrains: &[Terrain],
         device: usize,
@@ -119,7 +119,7 @@ impl NexusPlantBatch {
                 debug_assert_eq!(added, env);
             }
             let scene =
-                ArticulatedPlant::standing(frame, gait, phys, terrain).into_nexus_scene()?;
+                ArticulatedPlant::standing(frame, stance, phys, terrain).into_nexus_scene()?;
             let mut params = RbdSimParams::tgs_soft();
             params.dt = DT as f32 / substeps as f32;
             params.num_solver_iterations = phys.solver_iters as u32;
@@ -384,17 +384,16 @@ impl NexusPlantBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Policy, Preset};
     use crate::terrain::Course;
 
     #[test]
     #[ignore = "requires a native GPU adapter"]
     fn two_environments_step_and_report_finite_state() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrains = vec![Terrain::new(Course::Flat, 7), Terrain::new(Course::Flat, 7)];
-        let mut batch = NexusPlantBatch::new(frame, &gait, &phys, &terrains, 0)
+        let mut batch = NexusPlantBatch::new(frame, &stance, &phys, &terrains, 0)
             .expect("initialize Nexus batch");
         let mut commands = (0..batch.len())
             .map(|env| batch.neutral(env))

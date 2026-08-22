@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/hexapod-core",
     "crates/hexapod-cli",
-    "crates/hexapod-wasm",
     "crates/hexapod-sac",
 ]
 

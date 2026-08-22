@@ -213,6 +213,48 @@ pub struct Solution {
 /// `target` is in the body frame. Returns joint angles for the knee-up
 /// configuration, plus the amount by which the request exceeded the leg's
 /// envelope (the target is clamped to the envelope in that case).
+/// Where the feet sit when the machine is simply standing.
+///
+/// This is all the plant ever needed from a gait: deck height above the feet
+/// and how far out they are planted. The hand-written gaits that used to supply
+/// it produced exactly these numbers for every leg count, so it is a constant,
+/// not a policy output.
+#[derive(Clone, Copy, Debug)]
+pub struct Stance {
+    /// Deck height above the foot contacts, simulator units.
+    pub body_h: f64,
+    /// Distance between opposing feet, simulator units.
+    pub stance_w: f64,
+}
+
+impl Stance {
+    /// Per-leg phase offsets for the alternating set: neighbouring pairs in
+    /// opposite half-sets, sides likewise, so the legs that are down always
+    /// form a spread-out set.
+    ///
+    /// A closed form in the pair index, which is why it can be geometry rather
+    /// than a gait parameter. The joint-level observation carries a clock per
+    /// leg and this is where the clocks start; a learned controller is free to
+    /// ignore them, and the phases are not a commanded gait.
+    pub fn phase_offsets(frame: Frame) -> [f64; MAX_LEGS] {
+        let mut out = [0.0; MAX_LEGS];
+        for leg in 0..frame.legs() {
+            let (pair, right) = frame.split(leg);
+            out[leg] = 0.5 * ((pair + usize::from(right)) % 2) as f64;
+        }
+        out
+    }
+}
+
+impl Default for Stance {
+    fn default() -> Self {
+        Stance {
+            body_h: 0.88,
+            stance_w: 2.84,
+        }
+    }
+}
+
 pub fn solve_ik(frame: Frame, leg: usize, target: V3) -> Solution {
     // Into the leg frame: translate to the hip, then undo the mount yaw so the
     // leg points along local +X.

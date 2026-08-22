@@ -42,6 +42,10 @@ use crate::robot::{Frame, MAX_LEGS};
 
 pub const G: f64 = 9.81;
 
+/// Control tick. 100 Hz keeps swing arcs smooth without making rollouts
+/// expensive, and matches the control rate of a real servo bus.
+pub const DT: f64 = 1.0 / 100.0;
+
 /// Newton-metres to kilogram-centimetres, the unit servos are sold in.
 pub const NM_TO_KGCM: f64 = 10.1972;
 
@@ -506,7 +510,7 @@ mod tests {
         // kp * dt must be 1: any more and the joint overshoots its command
         // every tick and the "ideal" control case rings instead of tracking.
         let a = Actuator::ideal();
-        assert!((a.kp * crate::sim::DT - 1.0).abs() < 1e-12);
+        assert!((a.kp * crate::dynamics::DT - 1.0).abs() < 1e-12);
     }
 
     #[test]

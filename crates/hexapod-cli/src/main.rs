@@ -37,129 +37,62 @@
 
 use std::time::Instant;
 
-use hexapod_core::ars::ArsConfig;
 use hexapod_core::hardware::{Build, PRICES_CHECKED, Provenance, SERVOS, TorqueMeter, shortlist};
-use hexapod_core::policy::Preset;
 use hexapod_core::power::{Kind, Sizing, TorqueTrace, parts_of, solve};
-use hexapod_core::sim::Sim;
-use hexapod_core::sim::{
-    CRUISE_MAX, CRUISE_MIN, Cmd, DT, JUMP_CRUISE_MAX, JUMP_CRUISE_MIN, JUMP_EVAL_SPEEDS, evaluate,
-    rollout,
-};
-use hexapod_core::{Course, Frame, Physics, Policy, Terrain, Trainer};
+use hexapod_core::robot::{MAX_LEGS, Stance};
+use hexapod_core::{Course, Frame, Physics, Terrain};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(|s| s.as_str()).unwrap_or("train");
+    let cmd = args.first().map(|s| s.as_str()).unwrap_or("help");
 
     let course = parse_course(flag(&args, "--course").unwrap_or_else(|| "mixed".into()));
-    let iters: usize = flag(&args, "--iters")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
-    let seed: u64 = flag(&args, "--seed")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
     let frame = Frame::new(
         flag(&args, "--legs")
             .and_then(|v| v.parse().ok())
             .unwrap_or(6),
     );
-    let preset = match flag(&args, "--preset") {
-        Some(v) => match v.as_str() {
-            "ripple" => Preset::Ripple,
-            "wave" => Preset::Wave,
-            "tripod" | "alternate" | "trot" => Preset::Tripod,
-            other => {
-                eprintln!("unknown preset {other:?}; try tripod, ripple or wave");
-                std::process::exit(2)
-            }
-        },
-        // Six legs and up start on the alternating gait; four have to crawl,
-        // because a trot is not statically stable and this simulator judges
-        // stability statically.
-        None => Preset::default_for(frame),
-    };
-
     let build = build_from(&args);
-    let servo = flag(&args, "--servo").and_then(|name| {
+    let mut phys = build.physics(flag(&args, "--servo").and_then(|name| {
         SERVOS
             .iter()
             .find(|s| s.part.eq_ignore_ascii_case(&name))
             .or_else(|| {
-                eprintln!("unknown servo {name:?}; known: {}", servo_names());
+                eprintln!(
+                    "unknown servo {name:?}; known: {}",
+                    SERVOS.iter().map(|s| s.part).collect::<Vec<_>>().join(", ")
+                );
                 std::process::exit(2)
             })
-    });
-    let mut phys = build.physics(servo);
-    // Per-leg swinging mass, grams. `0` makes the legs weightless, which is
-    // what the simulator assumed before there was a leg-inertia model at all.
-    if let Some(g) = flag(&args, "--leg-mass").and_then(|v| v.parse::<f64>().ok()) {
-        phys.leg = if g <= 0.0 {
-            hexapod_core::LegMass::WEIGHTLESS
-        } else {
-            let total = g / 1000.0;
-            hexapod_core::LegMass {
-                femur_kg: total * 0.556,
-                tibia_kg: total * 0.444,
-            }
-        };
-    }
-
-    let mut cfg = ArsConfig::default();
-    if let Some(v) = flag(&args, "--dirs").and_then(|v| v.parse().ok()) {
-        cfg.n_dirs = v;
-    }
-    if let Some(v) = flag(&args, "--top").and_then(|v| v.parse().ok()) {
-        cfg.n_top = v;
-    }
-    if let Some(v) = flag(&args, "--alpha").and_then(|v| v.parse().ok()) {
-        cfg.alpha = v;
-    }
-    if let Some(v) = flag(&args, "--sigma").and_then(|v| v.parse().ok()) {
-        cfg.sigma = v;
-    }
-    if let Some(v) = flag(&args, "--horizon").and_then(|v| v.parse().ok()) {
-        cfg.horizon = v;
-    }
-    if let Some(v) = flag(&args, "--workers").and_then(|v| v.parse().ok()) {
-        cfg.workers = v;
-    }
-    if let Some(v) = flag(&args, "--batch").and_then(|v| v.parse().ok()) {
-        cfg.scenarios_per_direction = v;
-    }
+    }));
+    motor_flags(&mut phys, &args);
 
     match cmd {
-        "bench" => bench(frame, course, seed, phys),
-        "bom" => bom(frame, course, seed, iters, cfg, phys, build),
-        "sweep" => sweep(frame, iters, cfg, phys, seed),
         "joint-train" => joint_train(frame, phys, &args),
         "joint-eval" => joint_eval(course, phys, &args),
-        "train-all" | "all-terrain" => all_terrain(frame, seed, iters, cfg, phys, &args),
-        "eval-all" => eval_all(seed, cfg, phys, &args),
-        "speed" => speed(frame, course, seed, iters, cfg, phys),
-        "jump" => jump(frame, seed, iters, cfg, phys),
-        "servo" => servo_shootout(
-            frame,
-            course,
-            seed,
-            iters,
-            cfg,
-            build,
-            flag(&args, "--seeds")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3usize)
-                .max(1),
-        ),
+        "bom" => bom(frame, course, phys, build, &args),
+        "system" => system(frame, course, phys, &args),
         "servos" => servos_json(),
         "parts" => parts_json(),
         "courses" => courses_json(),
-        "system" => system(frame, course, seed, iters, cfg, phys, &args),
-        _ => train(frame, course, seed, iters, preset, cfg, phys),
+        other => {
+            if other != "help" && other != "--help" {
+                eprintln!("unknown command {other:?}\n");
+            }
+            eprintln!(
+                "hexapod <command>\n\
+                 \n\
+                 \x20 joint-train   train the motor-level policy\n\
+                 \x20 joint-eval    evaluate a joint checkpoint\n\
+                 \x20 bom           joint torque against the servo catalogue\n\
+                 \x20 system        whole-machine sizing, mass/current fixed point\n\
+                 \x20 servos        servo catalogue as JSON\n\
+                 \x20 parts         parts catalogue as JSON\n\
+                 \x20 courses       course catalogue as JSON\n"
+            );
+            std::process::exit(2)
+        }
     }
-}
-
-fn servo_names() -> String {
-    SERVOS.iter().map(|s| s.part).collect::<Vec<_>>().join(", ")
 }
 
 fn build_from(args: &[String]) -> Build {
@@ -186,665 +119,107 @@ fn parse_course(s: String) -> Course {
         .unwrap_or(Course::Mixed)
 }
 
-fn train(
+/// Emit the servo catalogue as JSON. `build.sh` inlines this into the web
+/// bundle so the browser and the simulator share one source of truth.
+/// Torque over a joint-level rollout, folded into both sizing views.
+///
+/// The hand-written gaits used to supply the trajectory here. With them gone
+/// the trajectory comes from the articulated plant itself: a checkpoint if one
+/// is given, otherwise the standing pose held, which is the load case a servo
+/// has to carry regardless of how it walks.
+///
+/// Foot load is shared equally between the feet that are down. The plant
+/// reports contact, not normal force, so this is an assumption — and the honest
+/// direction of it, since a real machine loads its feet unevenly and the worst
+/// foot carries more than its share. `Build::dynamic_factor` is the allowance.
+fn joint_torque_trace(
     frame: Frame,
-    course: Course,
-    seed: u64,
-    iters: usize,
-    preset: Preset,
-    cfg: ArsConfig,
-    phys: Physics,
-) {
-    let terrain = Terrain::new(course, seed);
-    let mut t = Trainer::new(Policy::seeded(preset, frame), cfg, phys, seed ^ 0xA5A5);
-
-    println!(
-        "machine: {} on {} legs | {:.2} kg, scale {:.3}, servo {:.1} kg-cm at {:.0} rpm no-load, mu {:.2}",
-        frame.label(),
-        frame.legs(),
-        phys.mass_kg,
-        phys.scale,
-        phys.actuator.stall_nm * hexapod_core::hardware::NM_TO_KGCM,
-        phys.actuator.omega_max * 60.0 / std::f64::consts::TAU,
-        phys.mu
-    );
-    println!(
-        "legs: {:.0} g of swinging mass each, {:.0} g in total ({:.0}% of the machine)",
-        phys.leg.total() * 1000.0,
-        phys.swing_mass(frame) * 1000.0,
-        phys.swing_mass(frame) / phys.mass_kg * 100.0
-    );
-    if course.is_jump() {
-        let (lo, hi) = hexapod_core::sim::cruise_band(course);
-        let e = hexapod_core::sim::eval_speeds(course);
-        println!(
-            "commanded speeds sampled from {lo:.1} to {hi:.1} m/s; \
-             scored on the mean over {:.1} / {:.1} / {:.1} — a running jump, not a walk",
-            e[0], e[1], e[2]
-        );
-    } else {
-        println!(
-            "commanded speeds sampled from {CRUISE_MIN:.1} to {CRUISE_MAX:.1} m/s; \
-             scored on the mean over 2.0 / 4.0 / 5.5"
-        );
-    }
-    println!(
-        "course {} seed {}  |  ARS dirs={} top={} alpha={} sigma={} horizon={}s",
-        course.name(),
-        seed,
-        cfg.n_dirs,
-        cfg.n_top,
-        cfg.alpha,
-        cfg.sigma,
-        cfg.horizon
-    );
-    println!(
-        "obstacles: {}  |  route: {} waypoints, corridor +-{:.1} m between two walls",
-        terrain.obstacles.len(),
-        terrain.waypoints.len(),
-        terrain.wall_x()
-    );
-
-    let start = Instant::now();
-    t.record_baseline(&terrain);
-    println!(
-        "\nbaseline  reward {:8.2}   distance {:6.2} m   {}",
-        t.baseline_reward,
-        t.baseline_distance,
-        if t.last_eval.fell { "FELL" } else { "survived" }
-    );
-    println!(
-        "\n{:>5}  {:>9}  {:>9}  {:>8}  {:>8}  {:>7}  {:>6}  {:>7}",
-        "iter", "reward", "best", "v err", "slip m", "stub", "CoT", "fell"
-    );
-
-    for i in 1..=iters {
-        t.iterate(&terrain);
-        if i % (iters / 20).max(1) == 0 || i == iters {
-            let e = t.last_eval;
-            println!(
-                "{i:>5}  {:>9.2}  {:>9.2}  {:>8.2}  {:>8.2}  {:>7.2}  {:>6.2}  {:>7}",
-                e.reward,
-                t.best_reward,
-                e.speed_error,
-                e.slip,
-                e.stub_total,
-                e.cot,
-                if e.fell { "yes" } else { "" }
-            );
-        }
-    }
-
-    let secs = start.elapsed().as_secs_f64();
-    let best = t.best_policy();
-    let g = best.gait();
-
-    println!("\n--- learned gait ---");
-    println!("cycle time    {:6.3} s", g.cycle);
-    println!("stride        {:6.3} m", g.stride);
-    println!("step height   {:6.3} m", g.step_h);
-    println!("body height   {:6.3} m", g.body_h);
-    println!("stance width  {:6.3} m", g.stance_w);
-    println!("duty          {:6.3}", g.duty);
-    print!("phase offsets ");
-    for (i, o) in g.offsets.iter().enumerate() {
-        print!("{}={:.3} ", frame.name(i), o);
-    }
-    println!("\nfeedback norm {:6.3}", best.feedback_norm());
-
-    let gain = if t.baseline_reward.abs() > 1e-6 {
-        (t.best_reward - t.baseline_reward) / t.baseline_reward.abs() * 100.0
-    } else {
-        0.0
-    };
-    println!("\n--- result ---");
-    println!(
-        "reward   {:8.2}  ->  {:8.2}   ({gain:+.0}%)",
-        t.baseline_reward, t.best_reward
-    );
-    println!(
-        "distance {:8.2}  ->  {:8.2} m",
-        t.baseline_distance, t.best_distance
-    );
-    println!(
-        "{} rollouts in {:.1}s  ({:.0} rollouts/s)",
-        t.rollouts,
-        secs,
-        t.rollouts as f64 / secs
-    );
-    println!("\n{}", sparkline(&t.curve));
-
-    println!("\n--- speed tracking ---");
-    speed_table(
-        &terrain,
-        &Policy::seeded(preset, frame),
-        &best,
-        &phys,
-        cfg.horizon,
-    );
-}
-
-/// Commanded speed against achieved speed, for the baseline and the learned
-/// policy. This is the whole point of the reward: the hand-tuned gait has one
-/// speed it can walk at, and the learned one has a range.
-fn speed_table(terrain: &Terrain, base: &Policy, learned: &Policy, phys: &Physics, horizon: f64) {
-    println!(
-        "{:>10} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>7}",
-        "commanded", "base m/s", "base err", "got m/s", "err", "cycle", "stride", "duty"
-    );
-    let mut sum_b = 0.0;
-    let mut sum_l = 0.0;
-    let speeds = [2.0, 2.75, 3.5, 4.25, 5.0, 5.75];
-    for &v in speeds.iter() {
-        let a = rollout(terrain, base, phys, horizon, Cmd::at(v), None);
-        let b = rollout(terrain, learned, phys, horizon, Cmd::at(v), None);
-        let av = a.distance / (a.steps as f64 * DT);
-        let bv = b.distance / (b.steps as f64 * DT);
-        sum_b += a.speed_error;
-        sum_l += b.speed_error;
-        println!(
-            "{v:>9.2}  {av:>9.2} {:>9.2} {bv:>9.2} {:>9.2} {:>8.3} {:>8.3} {:>7.3}",
-            a.speed_error, b.speed_error, b.mean_cycle, b.mean_stride, b.mean_duty
-        );
-    }
-    let n = speeds.len() as f64;
-    println!("{:>10} {:>19.2} {:>19.2}", "mean err", sum_b / n, sum_l / n);
-    println!(
-        "\ncycle, stride and duty are the learned policy's *online* values,\n\
-         averaged over the rollout. A speed-conditioned policy moves them."
-    );
-}
-
-fn bench(frame: Frame, course: Course, seed: u64, phys: Physics) {
-    let terrain = Terrain::new(course, seed);
-    let p = Policy::seeded(Preset::default_for(frame), frame);
-
-    let n = 400;
-    let start = Instant::now();
-    let mut steps = 0usize;
-    for _ in 0..n {
-        steps += rollout(&terrain, &p, &phys, 8.0, Cmd::at(4.0), None).steps;
-    }
-    let secs = start.elapsed().as_secs_f64();
-
-    println!("course {}", course.name());
-    println!("{n} rollouts, {steps} steps in {secs:.2}s");
-    println!("{:.0} steps/s", steps as f64 / secs);
-    println!("{:.2} us/step", secs / steps as f64 * 1e6);
-    println!(
-        "{:.1} simulated seconds per wall second",
-        steps as f64 * DT / secs
-    );
-}
-
-/// Rapier plant, printed as numbers: pose, 3-axis velocity, heading, slip,
-/// range and bearing to the next waypoint.
-fn sweep(frame: Frame, iters: usize, cfg: ArsConfig, phys: Physics, seed: u64) {
-    let train_terrain = Terrain::new(Course::Mixed, seed);
-    let mut t = Trainer::new(
-        Policy::seeded(Preset::default_for(frame), frame),
-        cfg,
-        phys,
-        seed ^ 0xA5A5,
-    );
-    t.record_baseline(&train_terrain);
-    for _ in 0..iters {
-        t.iterate(&train_terrain);
-    }
-
-    let base = Policy::seeded(Preset::default_for(frame), frame);
-    let best = t.best_policy();
-
-    println!("trained {iters} iterations on MIXED seed {seed}\n");
-    println!(
-        "{:<10} {:>10} {:>10} {:>11} {:>11} {:>9} {:>7} {:>9}",
-        "course",
-        "base rwd",
-        "learn rwd",
-        "base dist",
-        "learn dist",
-        "waypoints",
-        "fell",
-        "verdict"
-    );
-
-    let mut plan: Vec<(Course, u64)> = hexapod_core::terrain::COURSES
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, c)| (c, seed + 100 * i as u64))
-        .collect();
-    // MIXED is what it trained on, so run it on the training seed as well.
-    plan.insert(4, (Course::Mixed, seed));
-    for (course, cseed) in plan {
-        let terr = Terrain::new(course, cseed);
-        let a = evaluate(&terr, &base, &phys, cfg.horizon);
-        let b = evaluate(&terr, &best, &phys, cfg.horizon);
-        println!(
-            "{:<10} {:>10.2} {:>10.2} {:>10.2}m {:>10.2}m {:>4} ->{:>4} {:>7} {:>9}",
-            format!("{}{}", course.name(), if cseed == seed { "" } else { "*" }),
-            a.reward,
-            b.reward,
-            a.distance,
-            b.distance,
-            a.reached,
-            b.reached,
-            match (a.fell, b.fell) {
-                (true, true) => "both",
-                (true, false) => "base",
-                (false, true) => "learned",
-                _ => "",
-            },
-            if b.reward > a.reward {
-                "better"
-            } else {
-                "worse"
-            }
-        );
-    }
-    println!("\n* = course seed the policy never trained on");
-    println!(
-        "\"fell\" marks which side went over in at least one of the three\n\
-         evaluation speeds. Reward is not distance: a policy can score better\n\
-         by taking fewer penalties over less ground."
-    );
-}
-
-/// Train one policy across every terrain family, then evaluate on held-out
-/// seeds. Long episodes are intentional: the finish is at 64 m, so an
-/// eight-second gait-tuning horizon cannot possibly supervise completion.
-fn all_terrain(
-    frame: Frame,
-    seed: u64,
-    iters: usize,
-    mut cfg: ArsConfig,
-    phys: Physics,
-    args: &[String],
-) {
-    if flag(args, "--horizon").is_none() {
-        cfg.horizon = 45.0;
-    }
-    if flag(args, "--batch").is_none() {
-        cfg.scenarios_per_direction = 3;
-    }
-    let train_seeds = flag(args, "--train-seeds")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1);
-    let eval_seeds = flag(args, "--eval-seeds")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2)
-        .max(1);
-    let unique_suite = terrain_suite(seed, train_seeds);
-    let hard_repeat = flag(args, "--hard-repeat")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(3);
-    if cfg.n_dirs < hexapod_core::terrain::COURSES.len() {
-        eprintln!(
-            "note: {} directions cover the {n} terrain families over multiple iterations; --dirs {n} or more covers every family per update",
-            cfg.n_dirs,
-            n = hexapod_core::terrain::COURSES.len()
-        );
-    }
-
-    let starting = if let Some(path) = flag(args, "--resume") {
-        let policy = load_policy(&path).unwrap_or_else(|error| {
-            eprintln!("could not load policy {path:?}: {error}");
-            std::process::exit(2);
+    phys: &Physics,
+    terrain: &Terrain,
+    build: &Build,
+    actor: Option<&str>,
+    secs: f64,
+) -> (TorqueMeter, TorqueTrace) {
+    use hexapod_core::joint_rl::{n_act, JointEnv, Stage};
+    let mut env = JointEnv::new(frame, phys, terrain.clone(), Stage::WalkFlat);
+    let policy = actor.map(|path| {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+            eprintln!("could not read {path}: {error}");
+            std::process::exit(1)
         });
-        println!("resuming checkpoint: {path}");
-        policy
-    } else {
-        Policy::seeded(Preset::default_for(frame), frame)
-    };
-    let frame = starting.frame;
-    let baseline = Policy::seeded(Preset::default_for(frame), frame);
-    let mut train_suite =
-        difficulty_weighted_suite(&unique_suite, &starting, &phys, cfg.horizon, hard_repeat);
-    if let Some(name) = flag(args, "--focus") {
-        let Some(course) = hexapod_core::terrain::COURSES
-            .iter()
-            .copied()
-            .find(|course| course.name().eq_ignore_ascii_case(&name))
-        else {
-            eprintln!("unknown focus course {name:?}");
-            std::process::exit(2);
-        };
-        let repeats = flag(args, "--focus-repeat")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(20);
-        let focused: Vec<Terrain> = unique_suite
-            .iter()
-            .filter(|terrain| terrain.course == course)
-            .cloned()
-            .collect();
-        for _ in 0..repeats {
-            train_suite.extend(focused.iter().cloned());
-        }
-        println!("focus: {} (+{repeats} copies per seed)", course.name());
-    }
-    let mut trainer = Trainer::new(starting, cfg, phys, seed ^ 0xA5A5);
-    println!(
-        "all-terrain curriculum: {} weighted scenarios from {} unique ({} courses x {train_seeds} seeds), {}s horizon",
-        train_suite.len(),
-        unique_suite.len(),
-        hexapod_core::terrain::COURSES.len(),
-        cfg.horizon
-    );
-    println!(
-        "ARS dirs={} top={} batch={} alpha={} sigma={} | final waypoint is terminal",
-        cfg.n_dirs, cfg.n_top, cfg.scenarios_per_direction, cfg.alpha, cfg.sigma
-    );
-
-    let wall = Instant::now();
-    trainer.record_suite_baseline(&unique_suite);
-    println!(
-        "start     reward {:8.2}  route {:6.1}%  completion {:6.1}%",
-        trainer.baseline_reward,
-        trainer.last_eval.waypoint_fraction * 100.0,
-        trainer.baseline_completion_rate * 100.0
-    );
-    println!(
-        "\n{:>5} {:>9} {:>9} {:>8} {:>9} {:>9} {:>8}",
-        "iter", "reward", "best", "route", "complete", "best cmp", "roll/s"
-    );
-    for i in 1..=iters {
-        trainer.iterate_suite_with_eval(&train_suite, &unique_suite);
-        if i % (iters / 20).max(1) == 0 || i == iters {
-            let elapsed = wall.elapsed().as_secs_f64().max(1e-9);
-            println!(
-                "{i:>5} {:>9.2} {:>9.2} {:>7.1}% {:>8.1}% {:>8.1}% {:>8.1}",
-                trainer.last_eval.reward,
-                trainer.best_reward,
-                trainer.last_eval.waypoint_fraction * 100.0,
-                trainer.last_eval.completion_rate * 100.0,
-                trainer.best_completion_rate * 100.0,
-                trainer.rollouts as f64 / elapsed
-            );
-        }
-    }
-
-    let learned = trainer.best_policy();
-    let heldout_seed = seed.wrapping_add(1_000_000);
-    let (mean_completion, worst_completion) = print_heldout_matrix(
-        &baseline,
-        &learned,
-        &phys,
-        cfg.horizon,
-        heldout_seed,
-        eval_seeds,
-    );
-    println!(
-        "\nheld-out completion: mean {:.1}%, worst course {:.1}% | {} exploratory rollouts in {:.1}s",
-        mean_completion * 100.0,
-        worst_completion * 100.0,
-        trainer.rollouts,
-        wall.elapsed().as_secs_f64()
-    );
-    println!(
-        "best policy: feedback norm {:.3}, route {:.1}%, completion {:.1}%",
-        learned.feedback_norm(),
-        trainer.best_waypoint_fraction * 100.0,
-        trainer.best_completion_rate * 100.0
-    );
-    if let Some(path) = flag(args, "--output") {
-        if let Err(error) = save_policy(&path, &learned) {
-            eprintln!("could not write policy {path:?}: {error}");
-            std::process::exit(1);
-        }
-        println!("checkpoint: {path}");
-    }
-}
-
-fn print_heldout_matrix(
-    baseline: &Policy,
-    learned: &Policy,
-    phys: &Physics,
-    horizon: f64,
-    seed: u64,
-    eval_seeds: usize,
-) -> (f64, f64) {
-    println!(
-        "\nheld-out evaluation: {eval_seeds} unseen seed(s) per course, 3 speed commands each"
-    );
-    println!(
-        "{:<10} {:>10} {:>10} {:>10} {:>10} {:>9}",
-        "course", "base cmp", "learn cmp", "base route", "learn route", "finish s"
-    );
-    let mut worst_completion = 1.0f64;
-    let mut mean_completion = 0.0;
-    for (course_i, course) in hexapod_core::terrain::COURSES.iter().copied().enumerate() {
-        let mut base_completion = 0.0;
-        let mut learned_completion = 0.0;
-        let mut base_route = 0.0;
-        let mut learned_route = 0.0;
-        let mut finish_time = 0.0;
-        for seed_i in 0..eval_seeds {
-            let scenario_seed = seed
-                .wrapping_add((course_i as u64).wrapping_mul(10_000))
-                .wrapping_add(seed_i as u64);
-            let terrain = Terrain::new(course, scenario_seed);
-            let a = evaluate(&terrain, baseline, phys, horizon);
-            let b = evaluate(&terrain, learned, phys, horizon);
-            base_completion += a.completion_rate;
-            learned_completion += b.completion_rate;
-            base_route += a.waypoint_fraction;
-            learned_route += b.waypoint_fraction;
-            finish_time += b.finish_time;
-        }
-        let n = eval_seeds as f64;
-        base_completion /= n;
-        learned_completion /= n;
-        base_route /= n;
-        learned_route /= n;
-        finish_time /= n;
-        worst_completion = worst_completion.min(learned_completion);
-        mean_completion += learned_completion / hexapod_core::terrain::COURSES.len() as f64;
-        println!(
-            "{:<10} {:>9.1}% {:>9.1}% {:>9.1}% {:>9.1}% {:>9.2}",
-            course.name(),
-            base_completion * 100.0,
-            learned_completion * 100.0,
-            base_route * 100.0,
-            learned_route * 100.0,
-            finish_time
-        );
-    }
-    (mean_completion, worst_completion)
-}
-
-fn terrain_suite(seed: u64, seeds_per_course: usize) -> Vec<Terrain> {
-    hexapod_core::terrain::COURSES
-        .iter()
-        .copied()
-        .enumerate()
-        .flat_map(|(course_i, course)| {
-            (0..seeds_per_course).map(move |seed_i| {
-                let scenario_seed = seed
-                    .wrapping_add((course_i as u64).wrapping_mul(10_000))
-                    .wrapping_add(seed_i as u64);
-                Terrain::new(course, scenario_seed)
-            })
+        hexapod_core::joint_rl::from_text(&text).unwrap_or_else(|error| {
+            eprintln!("{path} is not a joint policy: {error}");
+            std::process::exit(1)
         })
-        .collect()
-}
-
-/// Repeat scenarios in proportion to the seeded policy's failure rate. Every
-/// terrain remains present once; `hard_repeat` only spends more of the finite
-/// rollout budget where the current controller cannot yet finish.
-fn difficulty_weighted_suite(
-    terrains: &[Terrain],
-    baseline: &Policy,
-    phys: &Physics,
-    horizon: f64,
-    hard_repeat: usize,
-) -> Vec<Terrain> {
-    let copies = terrains
-        .iter()
-        .map(|terrain| {
-            let completion = evaluate(terrain, baseline, phys, horizon).completion_rate;
-            1 + ((1.0 - completion) * hard_repeat as f64).ceil() as usize
-        })
-        .collect::<Vec<_>>();
-    let mut weighted = Vec::new();
-    for round in 0..copies.iter().copied().max().unwrap_or(0) {
-        for (terrain, &n) in terrains.iter().zip(&copies) {
-            if round < n {
-                weighted.push(terrain.clone());
-            }
-        }
-    }
-    weighted
-}
-
-fn save_policy(path: &str, policy: &Policy) -> std::io::Result<()> {
-    std::fs::write(path, hexapod_core::checkpoint::to_text(policy))
-}
-
-fn load_policy(path: &str) -> Result<Policy, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    hexapod_core::checkpoint::from_text(&text)
-}
-
-fn eval_all(seed: u64, mut cfg: ArsConfig, phys: Physics, args: &[String]) {
-    if flag(args, "--horizon").is_none() {
-        cfg.horizon = 45.0;
-    }
-    let eval_seeds = flag(args, "--eval-seeds")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2)
-        .max(1);
-    let Some(path) = flag(args, "--policy") else {
-        eprintln!("eval-all requires --policy PATH");
-        std::process::exit(2);
-    };
-    let learned = load_policy(&path).unwrap_or_else(|error| {
-        eprintln!("could not load policy {path:?}: {error}");
-        std::process::exit(2);
     });
-    let baseline = Policy::seeded(Preset::default_for(learned.frame), learned.frame);
-    println!(
-        "policy {path} | {} legs | horizon {}s | seed {seed}",
-        learned.frame.legs(),
-        cfg.horizon
-    );
-    if let Some(name) = flag(args, "--course") {
-        let Some(course) = hexapod_core::terrain::COURSES
-            .iter()
-            .copied()
-            .find(|course| course.name().eq_ignore_ascii_case(&name))
-        else {
-            eprintln!("unknown course {name:?}");
-            std::process::exit(2);
-        };
-        print_course_detail(
-            course,
-            &baseline,
-            &learned,
-            &phys,
-            cfg.horizon,
-            seed,
-            eval_seeds,
-        );
-        return;
-    }
-    let (mean, worst) =
-        print_heldout_matrix(&baseline, &learned, &phys, cfg.horizon, seed, eval_seeds);
-    println!(
-        "\ncompletion: mean {:.1}%, worst course {:.1}%",
-        mean * 100.0,
-        worst * 100.0
-    );
-}
 
-fn print_course_detail(
-    course: Course,
-    baseline: &Policy,
-    learned: &Policy,
-    phys: &Physics,
-    horizon: f64,
-    seed: u64,
-    eval_seeds: usize,
-) {
-    let speeds: &[f64] = hexapod_core::sim::eval_speeds(course);
-    println!(
-        "\n{:<7} {:>5} {:>5} {:>9} {:>8} {:>10} {:>8} {:>7} {:>7} {:>9}",
-        "policy", "seed", "m/s", "reward", "z m", "waypoints", "time s", "x m", "jumps", "state"
-    );
-    for seed_i in 0..eval_seeds {
-        let scenario_seed = seed.wrapping_add(seed_i as u64);
-        let terrain = Terrain::new(course, scenario_seed);
-        for (label, policy) in [("base", baseline), ("learn", learned)] {
-            for &speed in speeds {
-                let result = rollout(&terrain, policy, phys, horizon, Cmd::at(speed), None);
-                let state = if result.completed {
-                    "FINISH"
-                } else if result.broken {
-                    "BROKE"
-                } else if result.fell {
-                    "FELL"
-                } else if result.finished {
-                    "SKIPPED"
-                } else {
-                    "TIMEOUT"
-                };
-                println!(
-                    "{label:<7} {scenario_seed:>5} {speed:>5.1} {:>9.2} {:>8.2} {:>4}/{:<5} {:>8.2} {:>7.2} {:>7} {:>9}",
-                    result.reward,
-                    result.distance,
-                    result.reached,
-                    terrain.waypoints.len(),
-                    result.elapsed,
-                    result.end_x,
-                    result.jumps,
-                    state
-                );
-            }
-        }
-    }
-}
-
-/// Size the servos for a build, comparing the hand-tuned gait against a
-/// trained one on the same machine.
-fn bom(
-    frame: Frame,
-    course: Course,
-    seed: u64,
-    iters: usize,
-    cfg: ArsConfig,
-    phys: Physics,
-    build: Build,
-) {
-    let terrain = Terrain::new(course, seed);
-    let base = Policy::seeded(Preset::default_for(frame), frame);
-
-    let mut t = Trainer::new(
-        Policy::seeded(Preset::default_for(frame), frame),
-        cfg,
-        phys,
-        seed ^ 0xA5A5,
-    );
-    t.record_baseline(&terrain);
-    for _ in 0..iters {
-        t.iterate(&terrain);
-    }
-    let learned = t.best_policy();
-
-    let measure = |p: &Policy| {
-        let g = p.gait();
-        let mut s = Sim::default();
-        s.reset(&terrain, &g, &phys);
-        let mut m = TorqueMeter::default();
-        for _ in 0..(cfg.horizon / hexapod_core::DT) as usize {
-            s.step(&terrain, p, &g, hexapod_core::DT, Cmd::at(4.0));
-            m.observe(&s, &build);
-            if s.fallen {
-                break;
-            }
-        }
-        m
+    let joints = frame.legs() * 3;
+    let mut meter = TorqueMeter::default();
+    let mut trace = TorqueTrace {
+        per_kg: Vec::new(),
+        ticks: 0,
+        joints,
+        frame,
+        stance: Stance::default(),
+        scale: phys.scale,
     };
 
+    let probe = Build {
+        mass_kg: 1.0,
+        ..*build
+    };
+    let ticks = (secs / hexapod_core::DT) as usize;
+    let zero = vec![0.0; n_act(frame)];
+    for _ in 0..ticks {
+        let mut action = zero.clone();
+        if let Some(p) = policy.as_ref() {
+            let observation = env.state().to_vec();
+            p.act(&observation, &mut action);
+        }
+        if env.step(&action).is_err() {
+            env.reset();
+            continue;
+        }
+        let q = env.joint_angles();
+        let down = env.foot_contacts();
+        let n_down = down.iter().take(frame.legs()).filter(|c| **c).count();
+        let mut share = [0.0; MAX_LEGS];
+        if n_down > 0 {
+            for leg in 0..frame.legs() {
+                if down[leg] {
+                    share[leg] = 1.0 / n_down as f64;
+                }
+            }
+        }
+        meter.observe(frame, &q, &down, &share, build);
+
+        // The same pose priced at one kilogram, which is what the sizing loop
+        // rescales for every candidate mass.
+        let mut per_kg = TorqueMeter::default();
+        per_kg.observe(frame, &q, &down, &share, &probe);
+        let peak = per_kg.peak;
+        let mut row = vec![0.0; joints];
+        for leg in 0..frame.legs() {
+            for c in 0..3 {
+                row[leg * 3 + c] = peak[c];
+            }
+        }
+        trace.observe(&row, joints);
+    }
+    (meter, trace)
+}
+
+fn bom(frame: Frame, course: Course, phys: Physics, build: Build, args: &[String]) {
+    let terrain = Terrain::new(course, 1);
+    let actor = flag(args, "--policy");
+    if actor.is_none() {
+        println!(
+            "note: no --policy given, so this is the standing load only. A walking\n\
+             \x20     machine asks for several times more; pass a joint checkpoint to\n\
+             \x20     size against one.\n"
+        );
+    }
+    let (meter, _) = joint_torque_trace(frame, &phys, &terrain, &build, actor.as_deref(), 8.0);
     let links = build.link_mm();
     println!(
         "build: {} ({} legs, {} joints), {:.1} kg, scale {:.3}",
@@ -867,31 +242,21 @@ fn bom(
 
     println!(
         "{:<12} {:>9} {:>9} {:>9} {:>12} {:>12}",
-        "gait", "coxa", "femur", "tibia", "peak foot N", "required"
+        "source", "coxa", "femur", "tibia", "peak foot N", "required"
     );
     let mut required = 0.0f64;
-    for (name, p) in [("hand-tuned", &base), ("learned", &learned)] {
-        let m = measure(p);
+    {
+        let name = if actor.is_some() { "learned" } else { "standing" };
+        let m = &meter;
         let k = m.peak_kgcm();
         let req = m.required_kgcm(&build);
-        if name == "learned" {
-            required = req;
-        }
+        required = req;
         println!(
             "{name:<12} {:>8.2} {:>8.2} {:>8.2} {:>11.1} {:>10.1} kg-cm",
             k[0], k[1], k[2], m.peak_foot_load, req
         );
     }
 
-    let gb = base.gait();
-    let gl = learned.gait();
-    println!(
-        "\nstance width {:.2} -> {:.2} sim units ({:.0} -> {:.0} mm)",
-        gb.stance_w,
-        gl.stance_w,
-        gb.stance_w * build.scale * 1000.0,
-        gl.stance_w * build.scale * 1000.0
-    );
 
     let joints = frame.legs() * 3;
     println!("\n--- servos clearing {required:.1} kg-cm, {joints} per robot ---");
@@ -936,230 +301,7 @@ fn bom(
     }
 }
 
-/// Train once, then report commanded speed against achieved speed.
-///
-/// This is the answer to the question the old reward could not ask. The
-/// earlier version rewarded raw distance, so the optimiser pinned cycle time
-/// and stride to their bounds and ran flat out; the version after that hard-
-/// coded a single 4 m/s cruise, which merely moved the specialisation. Here
-/// the command is an input, sampled per rollout and fed to the policy, so a
-/// gait that only works at one speed cannot score.
-fn speed(frame: Frame, course: Course, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
-    let terrain = Terrain::new(course, seed);
-    let base = Policy::seeded(Preset::default_for(frame), frame);
-    let mut t = Trainer::new(
-        Policy::seeded(Preset::default_for(frame), frame),
-        cfg,
-        phys,
-        seed ^ 0xA5A5,
-    );
-    t.record_baseline(&terrain);
-    for _ in 0..iters {
-        t.iterate(&terrain);
-    }
-    let learned = t.best_policy();
-
-    println!(
-        "{} seed {}, {iters} iterations, commanded speeds sampled from {CRUISE_MIN:.1} to {CRUISE_MAX:.1} m/s\n",
-        course.name(),
-        seed
-    );
-    speed_table(&terrain, &base, &learned, &phys, cfg.horizon);
-
-    let gb = base.gait();
-    let gl = learned.gait();
-    println!(
-        "\nnominal gait speed (stride / duty / cycle): {:.2} -> {:.2} m/s",
-        gb.nominal_speed(),
-        gl.nominal_speed()
-    );
-    println!(
-        "the learned policy also modulates cycle and stride online, which is\n\
-         what lets one gait cover the range instead of one speed."
-    );
-}
-
-/// Train on JUMP, then print distance, waypoints and jumps. The analogue of
-/// `hexapod speed`, for a course you cannot walk.
-fn jump(frame: Frame, seed: u64, iters: usize, cfg: ArsConfig, phys: Physics) {
-    let terrain = Terrain::new(Course::Jump, seed);
-    let base = Policy::seeded(Preset::default_for(frame), frame);
-    let mut t = Trainer::new(
-        Policy::seeded(Preset::default_for(frame), frame),
-        cfg,
-        phys,
-        seed ^ 0xA5A5,
-    );
-    t.record_baseline(&terrain);
-    for _ in 0..iters {
-        t.iterate(&terrain);
-    }
-    let learned = t.best_policy();
-
-    println!(
-        "JUMP seed {}, {iters} iterations, commanded speeds sampled from {JUMP_CRUISE_MIN:.1} to {JUMP_CRUISE_MAX:.1} m/s\n",
-        seed
-    );
-    println!(
-        "{:>10} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7} {:>7}",
-        "commanded", "base m", "base wp", "got m", "got wp", "jumps", "g", "broke"
-    );
-    for &v in JUMP_EVAL_SPEEDS.iter() {
-        let a = rollout(&terrain, &base, &phys, cfg.horizon, Cmd::at(v), None);
-        let b = rollout(&terrain, &learned, &phys, cfg.horizon, Cmd::at(v), None);
-        println!(
-            "{v:>9.2}  {:>9.2} {:>9} {:>9.2} {:>9} {:>7} {:>7.1} {:>7}",
-            a.distance,
-            a.reached,
-            b.distance,
-            b.reached,
-            b.jumps,
-            b.impact_g,
-            if b.broken { "BROKE" } else { "ok" }
-        );
-    }
-    println!(
-        "\nbaseline reward {:7.2}  learned {:7.2}  ({:+.0}%)",
-        t.baseline_reward,
-        t.best_reward,
-        100.0 * (t.best_reward - t.baseline_reward) / t.baseline_reward.abs().max(1e-6)
-    );
-    println!(
-        "baseline distance {:6.2} m  learned {:6.2} m",
-        t.baseline_distance, t.best_distance
-    );
-}
-
-/// The same course and the same learner, once per servo.
-///
-/// The servo is not a post-hoc sizing decision any more: its torque-speed line
-/// drives the joints, so it changes what the optimiser converges to.
-/// Train the same course once per servo, over several seeds.
-///
-/// Several, not one, because one is not a measurement. On a single seed the
-/// spread between servos here is about nine points of reward and the spread
-/// between seeds for the *same* servo is twenty-five, so a one-seed table
-/// invites a conclusion its own noise cannot support -- it once read as the
-/// strongest servo in the catalogue being the worst to walk on. The columns
-/// that survive averaging are the ones worth reading: peak load against
-/// rating, and cost of transport.
-fn servo_shootout(
-    frame: Frame,
-    course: Course,
-    seed: u64,
-    iters: usize,
-    cfg: ArsConfig,
-    build: Build,
-    seeds: usize,
-) {
-    println!(
-        "{} seeds {}-{}, {iters} iterations per servo, {:.2} kg at scale {:.3}\n",
-        course.name(),
-        seed,
-        seed + seeds as u64 - 1,
-        build.mass_kg,
-        build.scale
-    );
-    println!(
-        "{:<11} {:>7} {:>6} {:>9} {:>9} {:>7} {:>11} {:>7} {:>6}",
-        "servo", "kg-cm", "rpm", "base rwd", "best rwd", "range", "peak/stall", "worst", "CoT"
-    );
-
-    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
-    let range = |v: &[f64]| {
-        v.iter().copied().fold(f64::MIN, f64::max) - v.iter().copied().fold(f64::MAX, f64::min)
-    };
-
-    for servo in SERVOS.iter() {
-        let phys = build.physics(Some(servo));
-        let (mut base, mut best, mut load, mut cot) = (vec![], vec![], vec![], vec![]);
-        for k in 0..seeds as u64 {
-            let terrain = Terrain::new(course, seed + k);
-            let mut t = Trainer::new(
-                Policy::seeded(Preset::default_for(frame), frame),
-                cfg,
-                phys,
-                (seed + k) ^ 0xA5A5,
-            );
-            t.record_baseline(&terrain);
-            for _ in 0..iters {
-                t.iterate(&terrain);
-            }
-            let e = evaluate(&terrain, &t.best_policy(), &phys, cfg.horizon);
-            base.push(t.baseline_reward);
-            best.push(t.best_reward);
-            load.push(e.peak_servo_load);
-            cot.push(e.cot);
-        }
-        println!(
-            "{:<11} {:>7.1} {:>6.0} {:>9.2} {:>9.2} {:>6.1} {:>10.2}x {:>6.2}x {:>6.2}",
-            servo.part,
-            servo.stall_kgcm,
-            phys.actuator.omega_max * 60.0 / std::f64::consts::TAU,
-            mean(&base),
-            mean(&best),
-            range(&best),
-            mean(&load),
-            load.iter().copied().fold(f64::MIN, f64::max),
-            mean(&cot)
-        );
-    }
-    println!(
-        "\npeak/stall above 1.00 means the servo was driven past its rating and the\n\
-         leg gave way under load. `worst` is the highest of the {seeds} seeds, which is\n\
-         the number that sizes a build; `range` is the spread of `best rwd` across\n\
-         them, and any reward gap smaller than it is not a result."
-    );
-}
-
-/// Emit the servo catalogue as JSON. `build.sh` inlines this into the web
-/// bundle so the browser and the simulator share one source of truth.
-fn servos_json() {
-    println!("{{");
-    println!("  \"checked\": \"{}\",", PRICES_CHECKED);
-    println!("  \"servos\": [");
-    for (i, s) in SERVOS.iter().enumerate() {
-        let comma = if i + 1 == SERVOS.len() { "" } else { "," };
-        println!(
-            "    {{\"part\":{:?},\"maker\":{:?},\"stall\":{},\"volts\":{},\"mass\":{},\
-             \"speed\":{},\"bus\":{:?},\"metal\":{},\"feedback\":{},\"low\":{},\"high\":{},\
-             \"vendor\":{},\"vendorName\":{:?},\"source\":{:?},\"checked\":{},\"note\":{:?}}}{}",
-            s.part,
-            s.maker,
-            s.stall_kgcm,
-            s.at_volts,
-            s.mass_g,
-            s.speed_s60,
-            s.bus.name(),
-            s.metal_gear,
-            s.feedback,
-            s.market_usd.0,
-            s.market_usd.1,
-            match s.vendor_usd {
-                Some(v) => format!("{v}"),
-                None => "null".into(),
-            },
-            s.vendor_name,
-            s.source,
-            s.provenance == Provenance::Vendor,
-            s.note,
-            comma
-        );
-    }
-    println!("  ]");
-    println!("}}");
-}
-
-/// Whole-machine sizing: current, battery, regulator, controller, sensors.
-fn system(
-    frame: Frame,
-    course: Course,
-    seed: u64,
-    iters: usize,
-    cfg: ArsConfig,
-    phys: Physics,
-    args: &[String],
-) {
+fn system(frame: Frame, course: Course, phys: Physics, args: &[String]) {
     let scale = phys.scale;
     let mut sizing = Sizing::default();
     if let Some(v) = flag(args, "--chassis").and_then(|v| v.parse().ok()) {
@@ -1169,27 +311,18 @@ fn system(
         sizing.runtime_min = v;
     }
 
-    let terrain = Terrain::new(course, seed);
-    let mut policy = Policy::seeded(Preset::default_for(frame), frame);
-    let mut label = "hand-tuned";
-    if iters > 0 {
-        let mut t = Trainer::new(
-            Policy::seeded(Preset::default_for(frame), frame),
-            cfg,
-            phys,
-            seed ^ 0xA5A5,
+    let terrain = Terrain::new(course, 1);
+    let actor = flag(args, "--policy");
+    let label = if actor.is_some() { "learned" } else { "standing" };
+    if actor.is_none() {
+        println!(
+            "note: no --policy given, so this sizes the standing load only.\n"
         );
-        t.record_baseline(&terrain);
-        for _ in 0..iters {
-            t.iterate(&terrain);
-        }
-        policy = t.best_policy();
-        label = "learned";
     }
-
-    let trace = TorqueTrace::record(&terrain, &policy, &phys, 8.0);
+    let (_, trace) =
+        joint_torque_trace(frame, &phys, &terrain, &Build::default(), actor.as_deref(), 8.0);
     println!(
-        "gait: {label} on {} | chassis {:.2} kg | femur {:.0} mm | target runtime {:.0} min\n",
+        "torque: {label} on {} | chassis {:.2} kg | femur {:.0} mm | target runtime {:.0} min\n",
         course.name(),
         sizing.chassis_kg,
         0.8 * scale * 1000.0,
@@ -1332,6 +465,42 @@ fn system(
             "needs 6 contact switches or FSRs"
         }
     );
+}
+
+fn servos_json() {
+    println!("{{");
+    println!("  \"checked\": \"{}\",", PRICES_CHECKED);
+    println!("  \"servos\": [");
+    for (i, s) in SERVOS.iter().enumerate() {
+        let comma = if i + 1 == SERVOS.len() { "" } else { "," };
+        println!(
+            "    {{\"part\":{:?},\"maker\":{:?},\"stall\":{},\"volts\":{},\"mass\":{},\
+             \"speed\":{},\"bus\":{:?},\"metal\":{},\"feedback\":{},\"low\":{},\"high\":{},\
+             \"vendor\":{},\"vendorName\":{:?},\"source\":{:?},\"checked\":{},\"note\":{:?}}}{}",
+            s.part,
+            s.maker,
+            s.stall_kgcm,
+            s.at_volts,
+            s.mass_g,
+            s.speed_s60,
+            s.bus.name(),
+            s.metal_gear,
+            s.feedback,
+            s.market_usd.0,
+            s.market_usd.1,
+            match s.vendor_usd {
+                Some(v) => format!("{v}"),
+                None => "null".into(),
+            },
+            s.vendor_name,
+            s.source,
+            s.provenance == Provenance::Vendor,
+            s.note,
+            comma
+        );
+    }
+    println!("  ]");
+    println!("}}");
 }
 
 /// The course list, so the dashboard's buttons come from the same enum the
@@ -1734,59 +903,5 @@ fn motor_flags(phys: &mut Physics, args: &[String]) {
     }
     if let Some(v) = flag(args, "--footmu").and_then(|v| v.parse().ok()) {
         phys.foot_mu = v;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn terrain_suite_contains_every_course_and_seed() {
-        let suite = terrain_suite(11, 2);
-        assert_eq!(suite.len(), hexapod_core::terrain::COURSES.len() * 2);
-        for course in hexapod_core::terrain::COURSES {
-            assert_eq!(suite.iter().filter(|t| t.course == course).count(), 2);
-        }
-    }
-
-    #[test]
-    fn difficulty_weighting_keeps_easy_scenarios_and_repeats_failures() {
-        let suite = terrain_suite(3, 1);
-        let frame = Frame::default();
-        let baseline = Policy::seeded(Preset::default_for(frame), frame);
-        let uniform = difficulty_weighted_suite(&suite, &baseline, &Physics::default(), 0.0, 0);
-        let weighted = difficulty_weighted_suite(&suite, &baseline, &Physics::default(), 0.0, 3);
-        assert_eq!(uniform.len(), suite.len());
-        assert_eq!(weighted.len(), suite.len() * 4);
-        for course in hexapod_core::terrain::COURSES {
-            assert!(weighted.iter().any(|t| t.course == course));
-        }
-    }
-
-    #[test]
-    fn policy_checkpoint_round_trips_exactly() {
-        let frame = Frame::default();
-        let mut policy = Policy::seeded(Preset::default_for(frame), frame);
-        policy.theta[7] = 0.123456789;
-        policy.norm.n = 42.0;
-        policy.norm.mean[3] = -0.75;
-        policy.norm.m2[5] = 9.25;
-        let path = std::env::temp_dir().join(format!(
-            "hexapod-policy-{}-{}.txt",
-            std::process::id(),
-            0x5eed_u64
-        ));
-        save_policy(path.to_str().unwrap(), &policy).unwrap();
-        let loaded = load_policy(path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(loaded.frame, policy.frame);
-        assert_eq!(loaded.theta, policy.theta);
-        assert_eq!(loaded.base_offsets, policy.base_offsets);
-        assert_eq!(loaded.feedback, policy.feedback);
-        assert_eq!(loaded.norm.n, policy.norm.n);
-        assert_eq!(loaded.norm.mean, policy.norm.mean);
-        assert_eq!(loaded.norm.m2, policy.norm.m2);
-        assert!(loaded.norm.frozen);
     }
 }

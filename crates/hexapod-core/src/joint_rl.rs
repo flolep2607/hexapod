@@ -31,9 +31,9 @@ use crate::math::{Rng, clamp, hypot2, inv_rot_y, rot_y};
 #[cfg(feature = "nexus-gpu")]
 use crate::nexus_plant::NexusPlantBatch;
 use crate::plant::ArticulatedPlant;
-use crate::policy::{Policy, Preset};
+use crate::robot::Stance;
 use crate::robot::{Frame, MAX_LEGS, Q_LIMIT};
-use crate::sim::DT;
+use crate::dynamics::DT;
 use crate::terrain::{COURSES, Course, Terrain, WAYPOINT_R};
 
 /// Widest joint travel, radians, the policy may ask for in one direction away
@@ -554,8 +554,8 @@ pub struct JointRollout {
 pub fn stand_pose(frame: Frame, phys: &Physics, terrain: &Terrain) -> [[f64; 3]; MAX_LEGS] {
     // The plant already computes this when it spawns a machine standing, so
     // taking it from there keeps the two definitions from drifting apart.
-    let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
-    let plant = ArticulatedPlant::standing(frame, &gait, phys, terrain);
+    let stance = Stance::default();
+    let plant = ArticulatedPlant::standing(frame, &stance, phys, terrain);
     plant.leg_q_all()
 }
 
@@ -667,8 +667,8 @@ struct RapierEnv {
 
 impl RapierEnv {
     fn new(frame: Frame, phys: &Physics, terrain: &Terrain) -> Self {
-        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
-        let mut plant = ArticulatedPlant::standing(frame, &gait, phys, terrain);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, phys, terrain);
         let neutral = plant.leg_q_all();
         // Build the broad-phase once. Every reset cloned from this point has
         // the same initialized contact state as the scalar reference rollout.
@@ -975,7 +975,7 @@ impl JointEnv {
         stage: Stage,
         initial: RapierEnv,
     ) -> Self {
-        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+        let stance = Stance::default();
         let plant = initial.plant.clone();
         let neutral = initial.neutral;
         let start = initial.start;
@@ -1000,7 +1000,7 @@ impl JointEnv {
             neutral,
             start,
             stand_y,
-            phase_off: gait.offsets,
+            phase_off: Stance::phase_offsets(frame),
             q_cmd: neutral,
             total: 0.0,
             support_sum: 0.0,
@@ -1048,6 +1048,16 @@ impl JointEnv {
         // the real starting distance rather than from zero.
         self.last_remaining = self.remaining();
         &self.observation
+    }
+
+    /// Joint angles this tick, as the sizing tools need them.
+    pub fn joint_angles(&self) -> [[f64; 3]; MAX_LEGS] {
+        self.plant.leg_q_all()
+    }
+
+    /// Which feet are on the ground this tick.
+    pub fn foot_contacts(&self) -> [bool; MAX_LEGS] {
+        self.plant.foot_contacts()
     }
 
     pub fn state(&self) -> &[f64] {
@@ -1548,9 +1558,9 @@ fn rollout_nexus_batch(
     let n = frame.legs();
     let no = n_obs(frame);
     let na = n_act(frame);
-    let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
-    let phase_off = gait.offsets;
-    let mut plant = NexusPlantBatch::new(frame, &gait, phys, terrains, device)?;
+    let stance = Stance::default();
+    let phase_off = Stance::phase_offsets(frame);
+    let mut plant = NexusPlantBatch::new(frame, &stance, phys, terrains, device)?;
     debug_assert_eq!(plant.len(), policies.len());
 
     // Match the scalar plant's broad-phase warm-up step.
@@ -4016,17 +4026,6 @@ mod tests {
         );
     }
 
-    /// A gait-level checkpoint must not load as a joint-level one. They drive
-    /// different things and the failure would be silent.
-    #[test]
-    fn a_gait_checkpoint_is_refused() {
-        let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::default_for(frame), frame);
-        let text = crate::checkpoint::to_text(&gait);
-        let err = from_text(&text).expect_err("a gait policy loaded as a joint policy");
-        assert!(err.contains("joint-level"), "unhelpful error: {err}");
-    }
-
     /// Where the wall-clock actually goes. Not an assertion — a measurement,
     /// printed so a tuning decision is made on numbers.
     #[test]
@@ -4035,13 +4034,13 @@ mod tests {
         let frame = Frame::new(6);
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
+        let stance = Stance::default();
 
         // Cost of building one Rapier world.
         let t0 = std::time::Instant::now();
         let reps = 40;
         for _ in 0..reps {
-            let p = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            let p = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
             std::hint::black_box(p.substeps);
         }
         let setup = t0.elapsed().as_secs_f64() / reps as f64;

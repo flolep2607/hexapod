@@ -26,9 +26,8 @@
 //! [`SensingNeed`] derives them from the gait rather than guessing.
 
 use crate::hardware::{Build, Servo, NM_TO_KGCM};
-use crate::policy::{Gait, Policy};
 use crate::robot::MAX_LEGS;
-use crate::sim::{Cmd, Sim, DT};
+use crate::dynamics::DT;
 use crate::terrain::Terrain;
 
 /// Joints on the robot.
@@ -63,55 +62,26 @@ pub struct TorqueTrace {
     pub ticks: usize,
     /// Joints on this machine: three per leg.
     pub joints: usize,
-    pub gait: Gait,
+    pub frame: crate::robot::Frame,
+    /// Standing geometry, which is what the sensing requirement needs.
+    pub stance: crate::robot::Stance,
     /// Metres of real length per simulator unit.
     pub scale: f64,
 }
 
 impl TorqueTrace {
-    pub fn record(
-        terrain: &Terrain,
-        policy: &Policy,
-        phys: &crate::dynamics::Physics,
-        secs: f64,
-    ) -> TorqueTrace {
-        let scale = phys.scale;
-        let gait = policy.gait();
-        let probe = Build {
-            scale,
-            mass_kg: 1.0,
-            ..Build::default()
-        };
-
-        let joints = gait.frame.legs() * 3;
-        let mut sim = Sim::default();
-        sim.reset(terrain, &gait, phys);
-
-        let n = (secs / DT) as usize;
-        let mut per_kg = Vec::with_capacity(n * joints);
-        let mut ticks = 0;
-
-        for _ in 0..n {
-            sim.step(terrain, policy, &gait, DT, Cmd::at(gait.nominal_speed()));
-            let mut row = [0.0f64; MAX_JOINTS];
-            joint_torques(&sim, &probe, &mut row);
-            per_kg.extend_from_slice(&row[..joints]);
-            ticks += 1;
-            if sim.fallen {
-                break;
-            }
-        }
-
-        TorqueTrace {
-            per_kg,
-            ticks,
-            joints,
-            gait,
-            scale,
-        }
+    /// Fold one control tick into the trace.
+    ///
+    /// Torques come in per kilogram of all-up mass so the sizing loop can price
+    /// any candidate mass without re-simulating. Whatever drives the joints
+    /// supplies them — there is no built-in recorder any more, because there is
+    /// no built-in gait to drive.
+    pub fn observe(&mut self, per_kg: &[f64], joints: usize) {
+        debug_assert_eq!(joints, self.joints);
+        self.per_kg.extend_from_slice(&per_kg[..joints]);
+        self.ticks += 1;
     }
 
-    /// Peak torque at any joint, kg-cm, for a given all-up mass.
     pub fn peak_kgcm(&self, mass_kg: f64) -> f64 {
         self.per_kg
             .iter()
@@ -168,25 +138,6 @@ pub struct Draw {
 
 /// Static torque about each joint, newton-metres, for the current pose.
 /// Mirrors [`crate::hardware::TorqueMeter`] but keeps the joints separate.
-fn joint_torques(sim: &Sim, build: &Build, out: &mut [f64; MAX_JOINTS]) {
-    const G: f64 = crate::dynamics::G;
-    let weight = build.mass_kg * G;
-    out.fill(0.0);
-
-    for leg in 0..sim.frame.legs() {
-        if !sim.feet[leg].stance {
-            continue;
-        }
-        let f_v = weight * sim.feet[leg].load * build.dynamic_factor;
-        let f_h = f_v * build.traction_ratio;
-
-        let j = crate::robot::fk_body(sim.frame, leg, sim.q[leg]);
-        let t = crate::dynamics::joint_torques(&j, f_v, f_h, build.scale);
-        out[leg * 3] = t[0];
-        out[leg * 3 + 1] = t[1];
-        out[leg * 3 + 2] = t[2];
-    }
-}
 
 /* ------------------------------------------------------------- the catalogue */
 
@@ -582,11 +533,16 @@ impl SensingNeed {
 }
 
 impl SensingNeed {
-    pub fn derive(gait: &Gait, scale: f64, servo: &Servo) -> SensingNeed {
+    pub fn derive(
+        frame: crate::robot::Frame,
+        stance: &crate::robot::Stance,
+        scale: f64,
+        servo: &Servo,
+    ) -> SensingNeed {
         // The probe sits half a stance sweep ahead of the neutral foot.
-        let horizontal = (gait.stance_w * 0.5 + gait.stride * 0.5) * scale;
-        let ride = gait.body_h * scale;
-        let swing_s = (1.0 - gait.duty) * gait.cycle;
+        let horizontal = (stance.stance_w * 0.5 + NOMINAL_STRIDE * 0.5) * scale;
+        let ride = stance.body_h * scale;
+        let swing_s = NOMINAL_SWING_S;
 
         SensingNeed {
             lookahead_m: (horizontal * horizontal + ride * ride).sqrt(),
@@ -595,7 +551,7 @@ impl SensingNeed {
             // The smallest obstacle the courses generate is 10 sim-cm tall;
             // resolve a quarter of that.
             resolution_mm: 0.10 * scale * 1000.0 * 0.25,
-            rangers: gait.frame.legs(),
+            rangers: frame.legs(),
             needs_imu: true,
             needs_contact: true,
             contact_from_bus: servo.feedback,
@@ -604,6 +560,17 @@ impl SensingNeed {
 }
 
 /* -------------------------------------------------------------- the solution */
+
+/// Stride the sensing requirement is stated against, simulator units.
+///
+/// A learned controller has no fixed stride or duty factor, so the lookahead a
+/// terrain sensor needs cannot be read off a gait any more. These are the
+/// figures the hand-written gaits produced, kept as the reference the
+/// requirement is quoted against rather than silently dropped.
+pub const NOMINAL_STRIDE: f64 = 1.08;
+
+/// Swing duration the sampling rate is stated against, seconds.
+pub const NOMINAL_SWING_S: f64 = 0.235;
 
 /// Inputs that are not derived from the gait.
 #[derive(Clone, Copy, Debug)]
@@ -780,7 +747,7 @@ pub fn solve(trace: &TorqueTrace, servo: &Servo, sizing: &Sizing) -> Solution {
     };
 
     let compute = parts_of(Kind::Compute).find(|c| c.name == "Teensy 4.1");
-    let sensing = SensingNeed::derive(&trace.gait, trace.scale, servo);
+    let sensing = SensingNeed::derive(trace.frame, &trace.stance, trace.scale, servo);
 
     let mut cost = servo.unit_low() * trace.joints as f64;
     let cost_servos = cost;
@@ -854,13 +821,27 @@ pub fn solve(trace: &TorqueTrace, servo: &Servo, sizing: &Sizing) -> Solution {
 mod tests {
     use super::*;
     use crate::hardware::SERVOS;
-    use crate::policy::Preset;
-    use crate::terrain::Course;
-
+    /// A trace with a known shape. The sizing loop only ever reads per-kilogram
+    /// torques out of this, so a synthetic one exercises the same arithmetic as
+    /// a simulated one and pins the numbers exactly.
     fn trace() -> TorqueTrace {
-        let terrain = Terrain::new(Course::Flat, 1);
-        let p = Policy::seeded(Preset::Tripod, crate::robot::Frame::default());
-        TorqueTrace::record(&terrain, &p, &crate::dynamics::Physics::default(), 6.0)
+        let frame = crate::robot::Frame::default();
+        let joints = frame.legs() * 3;
+        let mut t = TorqueTrace {
+            per_kg: Vec::new(),
+            ticks: 0,
+            joints,
+            frame,
+            stance: crate::robot::Stance::default(),
+            scale: 0.10,
+        };
+        // A rising ramp across the joints, so the peak is unambiguous, held for
+        // enough ticks that a mean is meaningful.
+        let tick: Vec<f64> = (0..joints).map(|j| 0.02 + 0.002 * j as f64).collect();
+        for _ in 0..600 {
+            t.observe(&tick, joints);
+        }
+        t
     }
 
     fn servo(part: &str) -> &'static Servo {

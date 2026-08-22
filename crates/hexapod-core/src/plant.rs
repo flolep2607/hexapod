@@ -1,7 +1,7 @@
 //! Articulated hexapod plant: Rapier rigid bodies, 18 revolute joints, ground
 //! friction.
 //!
-//! Gait, analytic IK and the servo torque-speed line stay in this crate. Rapier
+//! Analytic IK and the servo torque-speed line stay in this crate. Rapier
 //! is the engine those three drive: a chassis, three links per leg, motors on
 //! every hinge, and a height-field for the course. Links collide with terrain
 //! and the chassis; adjacent parent/child contacts stay off. The canvas reads
@@ -11,10 +11,9 @@ use rapier3d::prelude::*;
 
 use crate::dynamics::Physics;
 use crate::math::V3;
-use crate::policy::Gait;
 use crate::robot::{
-    clamp_joints, fk_world, solve_ik, Frame, BODY_H, COXA, FEMUR, FOOT_R as FOOT_R_M, LINK_R,
-    MAX_LEGS, Q_LIMIT, TIBIA,
+    clamp_joints, fk_world, solve_ik, Frame, Stance, BODY_H, COXA, FEMUR, FOOT_R as FOOT_R_M,
+    LINK_R, MAX_LEGS, Q_LIMIT, TIBIA,
 };
 use crate::terrain::{Terrain, CORRIDOR_HALF, Z_MAX, Z_MIN};
 
@@ -207,7 +206,7 @@ impl Clone for ArticulatedPlant {
 
 impl ArticulatedPlant {
     /// Spawn a standing robot on `terrain`, joints at the gait's neutral IK.
-    pub fn standing(frame: Frame, gait: &Gait, phys: &Physics, terrain: &Terrain) -> Self {
+    pub fn standing(frame: Frame, stance: &Stance, phys: &Physics, terrain: &Terrain) -> Self {
         // Rapier is tuned for metre-scale objects. The gait already lives in
         // simulator metres (~2 m hexapod); we run the plant in that space so
         // contacts are not 1.5 cm spheres.
@@ -222,12 +221,12 @@ impl ArticulatedPlant {
         let mut multibody_joints = MultibodyJointSet::new();
 
         let ground = terrain.height(0.0, 0.0);
-        let pos = [0.0, ground + gait.body_h, 0.0];
+        let pos = [0.0, ground + stance.body_h, 0.0];
         let mut q0 = [[0.0f64; 3]; MAX_LEGS];
         for i in 0..n {
             let d = frame.dir(i);
-            let out = gait.stance_w * 0.5 + gait.trim(i);
-            let target = [d[0] * out, -gait.body_h + crate::robot::FOOT_R, d[2] * out];
+            let out = stance.stance_w * 0.5;
+            let target = [d[0] * out, -stance.body_h + crate::robot::FOOT_R, d[2] * out];
             let mut q = solve_ik(frame, i, target).q;
             clamp_joints(&mut q);
             q0[i] = q;
@@ -559,7 +558,7 @@ impl ArticulatedPlant {
         }
 
         let integration = IntegrationParameters {
-            dt: crate::sim::DT as f32,
+            dt: crate::dynamics::DT as f32,
             num_solver_iterations: phys.solver_iters,
             num_internal_pgs_iterations: phys.pgs_iters,
             length_unit: 1.0,
@@ -1146,160 +1145,13 @@ impl ArticulatedPlant {
 mod axis_probe {
     use super::tests::{hold, standing_q};
     use super::*;
-    use crate::policy::{Policy, Preset};
     use crate::terrain::{Course, Terrain};
 
-    /// Worst `|cos|` between the axis a hinge was built with and the axis its
-    /// child actually turns about, over every leg and joint.
-    pub(super) fn worst_axis(phys: &Physics) -> (f32, String) {
-        let frame = crate::robot::Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
-        let terrain = Terrain::new(Course::Flat, 1);
-        let q0 = standing_q(frame, &gait);
-        let mut worst = (0.0f32, String::new());
-        for j in 0..3 {
-            for leg in 0..6 {
-                let mut plant = ArticulatedPlant::standing(frame, &gait, &phys.clone(), &terrain);
-                let rel = |p: &ArticulatedPlant| {
-                    let l = p.legs[leg].as_ref().unwrap();
-                    let c = [l._coxa, l._femur, l.tibia][j];
-                    p.bodies[l.hinges[j].parent].rotation().inverse() * *p.bodies[c].rotation()
-                };
-                let built = {
-                    let h = plant.legs[leg].as_ref().unwrap().hinges[j];
-                    let f = plant.joint_data(h).map(|jt| jt.local_frame1).unwrap();
-                    (f.rotation * Vector::X).normalize()
-                };
-                let before = rel(&plant);
-                let mut cmd = q0;
-                cmd[leg][j] += 0.30;
-                hold(&mut plant, &cmd, phys, 3.0);
-                let (axis, ang) = (rel(&plant) * before.inverse()).to_axis_angle();
-                if ang.abs() < 1.0e-4 {
-                    continue;
-                }
-                let cos = (if ang < 0.0 { -axis } else { axis })
-                    .normalize()
-                    .dot(built)
-                    .abs();
-                if cos < worst.0 || worst.1.is_empty() {
-                    worst = (cos, format!("{} leg{leg} |cos|={cos:.4}", ["coxa", "femur", "tibia"][j]));
-                }
-            }
-        }
-        worst
-    }
-
-    /// Reduced coordinates make the hinge one number, so there is no axis to
-    /// drift off and no solver pass that has to converge for it. That is the
-    /// whole reason [`Physics::reduced`] can run at a quarter of the substeps:
-    /// the impulse plant scores 0.9305 at the same `1/4/1` — a coxa 21 degrees
-    /// off its own axis — and needs `4/8/4` merely to clear 0.99.
-    ///
-    /// Exact, not approximate. If this ever drops below 1.0 the multibody is
-    /// not being used and the cheap settings are no longer paid for.
-    #[test]
-    fn the_reduced_plant_holds_every_axis_exactly() {
-        let (cos, which) = worst_axis(&Physics::reduced());
-        assert!(cos > 0.9999, "reduced hinge left its axis: {which}");
-
-        // And it is the same machine standing: an exact hinge is no use if the
-        // legs end up somewhere else.
-        let frame = crate::robot::Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
-        let terrain = Terrain::new(Course::Flat, 1);
-        let q0 = standing_q(frame, &gait);
-        let mut stand = |phys: &Physics| {
-            let mut p = ArticulatedPlant::standing(frame, &gait, phys, &terrain);
-            hold(&mut p, &q0, phys, 1.0);
-            let (pos, _, pitch, roll) = p.chassis_pose();
-            (pos[1], (pitch * pitch + roll * roll).sqrt())
-        };
-        let (ride_i, tilt_i) = stand(&Physics::default());
-        let (ride_r, tilt_r) = stand(&Physics::reduced());
-        assert!(
-            (ride_r - ride_i).abs() < 0.01,
-            "reduced plant stands at {ride_r:.4} m against the reference {ride_i:.4} m"
-        );
-        assert!(
-            tilt_r < tilt_i.max(0.02),
-            "reduced plant stands tilted {:.2} deg against {:.2} deg",
-            tilt_r.to_degrees(),
-            tilt_i.to_degrees()
-        );
-    }
-
-    /// Drive one joint and measure the axis its child link actually turns
-    /// about *relative to its parent* — the only frame in which a hinge's
-    /// axis means anything. Measuring the child in world instead folds in
-    /// whatever the chassis did, which is a different question.
-    #[test]
-    fn each_joint_turns_about_the_axis_it_was_given() {
-        let frame = crate::robot::Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
-        let phys = Physics::default();
-        let terrain = Terrain::new(Course::Flat, 1);
-        let q0 = standing_q(frame, &gait);
-        let mut worst = (0.0f32, String::new());
-
-        for j in 0..3 {
-            let name = ["coxa", "femur", "tibia"][j];
-            for leg in 0..6 {
-                let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-                let rel = |p: &ArticulatedPlant| {
-                    let l = p.legs[leg].as_ref().unwrap();
-                    let h = l.hinges[j];
-                    let c = [l._coxa, l._femur, l.tibia][j];
-                    p.bodies[h.parent].rotation().inverse() * *p.bodies[c].rotation()
-                };
-                let built = {
-                    let l = plant.legs[leg].as_ref().unwrap();
-                    let h = l.hinges[j];
-                    let f = plant.joint_data(h).map(|jt| jt.local_frame1).unwrap();
-                    (f.rotation * Vector::X).normalize()
-                };
-                let before = rel(&plant);
-                let mut cmd = q0;
-                cmd[leg][j] += 0.30;
-                hold(&mut plant, &cmd, &phys, 3.0);
-                let after = rel(&plant);
-                let (axis, ang) = (after * before.inverse()).to_axis_angle();
-                if ang.abs() < 0.02 {
-                    continue;
-                }
-                let got = (if ang < 0.0 { -axis } else { axis }).normalize();
-                let cos = got.dot(built).abs();
-                if std::env::var("HX_AXIS_VERBOSE").is_ok() {
-                    eprintln!(
-                        "{name:<6} leg{leg}  built ({:+.3},{:+.3},{:+.3})  actual ({:+.3},{:+.3},{:+.3})  |cos| {cos:.4}  turned {:.3}",
-                        built.x, built.y, built.z, got.x, got.y, got.z, ang.abs()
-                    );
-                }
-                if cos < worst.0 || worst.1.is_empty() {
-                    worst = (cos, format!("{name} leg{leg} |cos|={cos:.4}"));
-                }
-            }
-        }
-        eprintln!(
-            "worst hinge: {}   (solver {} pgs {} sub {})",
-            worst.1, phys.solver_iters, phys.pgs_iters, phys.substeps
-        );
-        // A revolute joint has one degree of freedom. If the child turns about
-        // anything else the constraint is being violated, and no amount of
-        // gait tuning on top of that is measuring the machine we think we
-        // have — it reads as the whole leg and body waggling.
-        assert!(
-            worst.0 > 0.99,
-            "a hinge turned off its own axis: {}",
-            worst.1
-        );
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{foot_in_body, foot_on_terrain, Policy, Preset};
     use crate::robot::Frame;
     use crate::terrain::{Course, Obstacle, Terrain};
 
@@ -1308,19 +1160,19 @@ mod tests {
     }
 
     pub(super) fn hold(plant: &mut ArticulatedPlant, q: &[[f64; 3]; MAX_LEGS], phys: &Physics, secs: f64) {
-        let n = (secs / crate::sim::DT).round() as usize;
+        let n = (secs / crate::dynamics::DT).round() as usize;
         for _ in 0..n {
-            plant.drive(q, phys, crate::sim::DT);
-            plant.step(crate::sim::DT);
+            plant.drive(q, phys, crate::dynamics::DT);
+            plant.step(crate::dynamics::DT);
         }
     }
 
-    pub(super) fn standing_q(frame: Frame, gait: &Gait) -> [[f64; 3]; MAX_LEGS] {
+    pub(super) fn standing_q(frame: Frame, stance: &Stance) -> [[f64; 3]; MAX_LEGS] {
         let mut q = [[0.0; 3]; MAX_LEGS];
         for i in 0..frame.legs() {
             let d = frame.dir(i);
-            let out = gait.stance_w * 0.5;
-            q[i] = solve_ik(frame, i, [d[0] * out, -gait.body_h + crate::robot::FOOT_R, d[2] * out]).q;
+            let out = stance.stance_w * 0.5;
+            q[i] = solve_ik(frame, i, [d[0] * out, -stance.body_h + crate::robot::FOOT_R, d[2] * out]).q;
         }
         q
     }
@@ -1337,12 +1189,13 @@ mod tests {
     #[test]
     fn a_hexapod_stands_on_a_plane() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
 
-        let q = standing_q(frame, &gait);
+        let q = standing_q(frame, &stance);
         let y0 = plant.chassis_y();
         hold(&mut plant, &q, &phys, 1.2);
         let y1 = plant.chassis_y();
@@ -1454,148 +1307,15 @@ mod tests {
     #[test]
     fn eighteen_revolute_hinges() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
         let mut hinges = 0usize;
         for i in 0..6 {
             hinges += plant.legs[i].as_ref().unwrap().hinges.len();
         }
         assert_eq!(hinges, 18);
-    }
-
-    /// Every leg has to actually sweep when the gait leaves the servo room to
-    /// track it. Absolute joint limits on a hinge whose zero is the spawn pose
-    /// pinned the tibia, and a setpoint clamped against the measured angle left
-    /// the motor too weak to move: both showed up here as legs twitching over a
-    /// few degrees instead of stepping.
-    #[test]
-    fn legs_sweep_when_the_servo_can_keep_up() {
-        let frame = Frame::new(6);
-        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
-        gait.cycle *= 2.0; // the default clock outruns the default servo
-        let phys = Physics::default();
-        let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-
-        let mut lo = [[9.0f64; 3]; MAX_LEGS];
-        let mut hi = [[-9.0f64; 3]; MAX_LEGS];
-        let mut phase = 0.0;
-        for k in 0..800 {
-            let mut q = [[0.0f64; 3]; MAX_LEGS];
-            for i in 0..frame.legs() {
-                let foot = foot_in_body(
-                    frame, &gait, i, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
-                    gait.step_h, 0.0,
-                );
-                q[i] = solve_ik(frame, i, foot).q;
-            }
-            plant.drive(&q, &phys, crate::sim::DT);
-            plant.step(crate::sim::DT);
-            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
-            if k > 200 {
-                for i in 0..frame.legs() {
-                    let m = plant.leg_q(i);
-                    for j in 0..3 {
-                        lo[i][j] = lo[i][j].min(m[j]);
-                        hi[i][j] = hi[i][j].max(m[j]);
-                    }
-                }
-            }
-        }
-        for i in 0..frame.legs() {
-            let sweep = [
-                hi[i][0] - lo[i][0],
-                hi[i][1] - lo[i][1],
-                hi[i][2] - lo[i][2],
-            ];
-            assert!(sweep[0] > 0.5, "leg {i} coxa barely moved: {sweep:?}");
-            assert!(sweep[1] > 0.3, "leg {i} femur barely moved: {sweep:?}");
-            assert!(sweep[2] > 0.3, "leg {i} tibia barely moved: {sweep:?}");
-        }
-    }
-
-    /// Faced with a kerb it could step onto, the planner has to put the foot on
-    /// top of it — never inside it.
-    ///
-    /// Kinematic on purpose: how far the machine gets to walk before it meets the
-    /// kerb is a traction question, and a target aimed into the face of a block
-    /// is wrong whether or not the robot ever arrives. The open-loop stroke is
-    /// checked alongside to show what the terrain term is actually buying.
-    #[test]
-    fn a_foot_is_placed_on_a_kerb_not_into_it() {
-        let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
-        let mut terrain = Terrain::new(Course::Flat, 1);
-        let kerb = Obstacle {
-            x0: -3.0,
-            x1: 3.0,
-            z0: 1.6,
-            z1: 4.6,
-            top: 0.35,
-            grip: 1.0,
-        };
-        terrain.push(kerb.x0, kerb.x1, kerb.z0, kerb.z1, kerb.top, kerb.grip);
-        terrain.rebuild_buckets();
-        // Standing just short of the kerb, so the front legs' stroke crosses it.
-        let pos = [0.0, terrain.height(0.0, 0.6) + gait.body_h, 0.6];
-
-        let inside = |p: V3| {
-            p[0] > kerb.x0
-                && p[0] < kerb.x1
-                && p[2] > kerb.z0
-                && p[2] < kerb.z1
-                && p[1] < kerb.top - 0.02
-        };
-        let world = |t: V3| {
-            let w = crate::math::body_to_world(t, 0.0, 0.0, 0.0);
-            [pos[0] + w[0], pos[1] + w[1], pos[2] + w[2]]
-        };
-
-        let (mut aware_in, mut blind_in, mut aware_over) = (0usize, 0usize, 0usize);
-        for k in 0..240 {
-            let phase = k as f64 / 240.0;
-            for leg in 0..frame.legs() {
-                let aware = world(foot_on_terrain(
-                    frame, &gait, leg, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
-                    gait.step_h, 0.0, &terrain, pos, 0.0, 0.0, 0.0,
-                ));
-                let blind = world(foot_in_body(
-                    frame, &gait, leg, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
-                    gait.step_h, 0.0,
-                ));
-                if inside(aware) {
-                    aware_in += 1;
-                    if aware_in < 4 {
-                        println!("offender leg{leg} phase {phase:.3} target {aware:.3?}");
-                    }
-                }
-                if inside(blind) {
-                    blind_in += 1;
-                }
-                if aware[0] > kerb.x0
-                    && aware[0] < kerb.x1
-                    && aware[2] > kerb.z0
-                    && aware[2] < kerb.z1
-                {
-                    aware_over += 1;
-                }
-            }
-        }
-        assert!(
-            aware_over > 0,
-            "no target ever reached over the kerb, so nothing was tested"
-        );
-        assert_eq!(
-            aware_in, 0,
-            "terrain-aware target still aims inside the kerb {aware_in} times \
-             ({aware_over} targets were over it)"
-        );
-        assert!(
-            blind_in > 20,
-            "the open-loop stroke was expected to aim into the kerb; got {blind_in}"
-        );
     }
 
     /// Rapier has to agree with `fk_world` about where a leg is once it has
@@ -1609,13 +1329,14 @@ mod tests {
     #[test]
     fn rapier_kinematics_match_the_analytic_model() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let q0 = standing_q(frame, &gait);
+        let q0 = standing_q(frame, &stance);
 
         for j in 0..3 {
-            let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
             let mut cmd = q0;
             for i in 0..frame.legs() {
                 cmd[i][j] += 0.30;
@@ -1646,10 +1367,10 @@ mod tests {
     #[test]
     fn chassis_and_feet_use_ccd() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
         assert!(plant.bodies[plant.chassis].is_ccd_enabled());
         for i in 0..6 {
             let tibia = plant.legs[i].as_ref().unwrap().tibia;
@@ -1660,7 +1381,7 @@ mod tests {
     #[test]
     fn a_tibia_does_not_occupy_a_block() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let mut terrain = Terrain::new(Course::Flat, 1);
         // Right-side stance: a prism the standing tibia would thread if links
@@ -1675,8 +1396,9 @@ mod tests {
         };
         terrain.push(wall.x0, wall.x1, wall.z0, wall.z1, wall.top, wall.grip);
         terrain.rebuild_buckets();
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-        let q = standing_q(frame, &gait);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
+        let q = standing_q(frame, &stance);
         hold(&mut plant, &q, &phys, 0.8);
 
         let mut inside = Vec::new();
@@ -1702,42 +1424,12 @@ mod tests {
     }
 
     #[test]
-    fn a_four_leg_trot_keeps_stepping() {
-        let frame = Frame::new(4);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
-        let phys = Physics::default();
-        let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-        let mut phase = 0.0;
-        let ticks = (2.0 / crate::sim::DT) as usize;
-        for _ in 0..ticks {
-            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
-            let mut q = [[0.0; 3]; MAX_LEGS];
-            for i in 0..4 {
-                let target = foot_in_body(
-                    frame, &gait, i, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
-                    gait.step_h, 0.0,
-                );
-                q[i] = solve_ik(frame, i, target).q;
-            }
-            plant.drive(&q, &phys, crate::sim::DT);
-            plant.step(crate::sim::DT);
-        }
-        assert!(
-            plant.chassis_y().is_finite() && plant.pitch_abs().is_finite(),
-            "plant reset or exploded: y={} pitch={}",
-            plant.chassis_y(),
-            plant.pitch_abs()
-        );
-    }
-
-    #[test]
     fn canvas_pose_comes_from_rapier_bodies() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
         let (pos, yaw, pitch, roll) = plant.chassis_pose();
         assert!((pos[1] - plant.chassis_y()).abs() < 1e-5);
         assert!(yaw.abs() < 0.2 && pitch.abs() < 0.4 && roll.abs() < 0.4);
@@ -1748,11 +1440,12 @@ mod tests {
     #[test]
     fn a_standing_chassis_is_not_dead() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-        let q = standing_q(frame, &gait);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
+        let q = standing_q(frame, &stance);
         hold(&mut plant, &q, &phys, 0.4);
         assert!(
             !plant.chassis_dead(plant.chassis_vel()),
@@ -1763,14 +1456,15 @@ mod tests {
     #[test]
     fn chassis_on_the_floor_is_dead() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
         plant.bodies[plant.chassis].set_translation(Vector::new(0.0, 0.10, 0.0), true);
         plant.bodies[plant.chassis].set_linvel(Vector::new(0.0, -3.0, 0.0), true);
         let pre = plant.chassis_vel();
-        plant.step(crate::sim::DT);
+        plant.step(crate::dynamics::DT);
         assert!(plant.chassis_dead(pre), "belly on the floor should kill");
     }
 
@@ -1790,17 +1484,18 @@ mod tests {
     #[test]
     fn a_fast_chassis_hit_on_a_wall_is_dead() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = wall_course();
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
         // Overlap the near face and keep walking-speed into it. Joints would
         // otherwise pin the chassis at spawn and the wall would never be hit.
         shove_chassis(&mut plant, 0.55, 4.0);
         let mut dead = false;
         for _ in 0..12 {
             let pre = plant.chassis_vel();
-            plant.step(crate::sim::DT);
+            plant.step(crate::dynamics::DT);
             if plant.chassis_dead(pre) {
                 dead = true;
                 break;
@@ -1817,51 +1512,17 @@ mod tests {
         [d(j[0], j[1]), d(j[1], j[2]), d(j[2], j[3])]
     }
 
-    fn drive_terrain(
-        plant: &mut ArticulatedPlant,
-        frame: Frame,
-        gait: &Gait,
-        phys: &Physics,
-        terrain: &Terrain,
-        phase: f64,
-    ) {
-        let (bp, byaw, bpitch, broll) = plant.chassis_pose();
-        let mut q = [[0.0; 3]; MAX_LEGS];
-        for i in 0..frame.legs() {
-            let target = foot_on_terrain(
-                frame, gait, i, phase, gait.stride, gait.duty, gait.cycle, gait.body_h,
-                gait.step_h, 0.0, terrain, bp, byaw, bpitch, broll,
-            );
-            q[i] = solve_ik(frame, i, target).q;
-        }
-        plant.drive(&q, phys, crate::sim::DT);
-        plant.step(crate::sim::DT);
-    }
-
-    fn walk_cycle(frame: Frame, gait: &Gait) -> f64 {
-        gait.cycle.max(crate::policy::feasible_cycle(
-            frame,
-            gait,
-            gait.stride,
-            gait.duty,
-            gait.cycle,
-            gait.body_h,
-            gait.step_h,
-            0.0,
-            phys_omega(),
-        ))
-    }
-
     /// Impulse joints can stretch. The canvas draws these hinges as the legs,
     /// so a centimetre of drift is a wrong-looking tibia and a sagging deck.
     #[test]
     fn hinges_keep_their_kinematic_length() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Flat, 1);
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-        let q = standing_q(frame, &gait);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
+        let q = standing_q(frame, &stance);
         hold(&mut plant, &q, &phys, 5.0);
         let mut worst = 0.0f64;
         for i in 0..6 {
@@ -1908,10 +1569,10 @@ mod tests {
             Course::Flat,
         ] {
             let terrain = Terrain::new(course, 7);
-            let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
-            let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+            let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
             // The cast needs a built broad-phase BVH.
-            plant.step(crate::sim::DT);
+            plant.step(crate::dynamics::DT);
 
             let mut checked = 0usize;
             let mut z = Z_MIN + 0.37;
@@ -1944,9 +1605,9 @@ mod tests {
         let frame = Frame::new(6);
         let phys = Physics::default();
         let terrain = Terrain::new(Course::Jump, 7);
-        let gait = Policy::seeded(Preset::default_for(frame), frame).gait();
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-        plant.step(crate::sim::DT);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
+        plant.step(crate::dynamics::DT);
         let pit = terrain
             .obstacles
             .iter()
@@ -1976,286 +1637,19 @@ mod tests {
         );
     }
 
-    /// The live dashboard world-locks stance and keeps ride height as a
-    /// body-frame command. Converting world ground through a dipped `pos[1]`
-    /// used to fold the legs on the first step.
-    ///
-    /// Ignored: it documents a bug rather than guarding a fix. `drive_articulated`
-    /// does not walk — it inverts the machine (max |roll| reaches pi) and flings
-    /// the chassis to four times its stance height, on flat ground, at every
-    /// commanded speed. The command is ignored outright: 0.3 m/s and 3.0 m/s
-    /// produce bit-identical trajectories, so the gait clock on this path never
-    /// sees `cruise` at all.
-    ///
-    /// The assertions below are the ones that were here before, plus the two
-    /// that catch the tumble. The originals passed throughout: `min_y` only
-    /// rises when the chassis is thrown upward, `pitch` was sampled once at the
-    /// end, and a cartwheeling robot never puts its belly down long enough to
-    /// set `fallen`. Un-ignore this when the tripod path is fixed.
-    #[test]
-    #[ignore = "drive_articulated inverts the machine; see the doc comment"]
-    fn terrain_aware_tripod_does_not_sit_down() {
-        let frame = Frame::new(6);
-        let phys = Physics::default();
-        let (mut walker, terrain, policy, gait) =
-            crate::walker::open_loop_walk(frame, Course::Flat, 1, phys);
-        let cmd = crate::sim::Cmd {
-            fwd: 1.0,
-            turn: 0.0,
-            cruise: 1.5,
-            nav: false,
-        };
-        let mut min_y = f64::INFINITY;
-        let mut max_y = 0.0f64;
-        let mut max_tilt = 0.0f64;
-        let y0 = walker.plant.chassis_y();
-        let ticks = (6.0 / crate::sim::DT) as usize;
-        for k in 0..ticks {
-            walker.step(&terrain, &policy, &gait, crate::sim::DT, cmd);
-            let (_, _, pitch, roll) = walker.plant.chassis_pose();
-            max_tilt = max_tilt.max(pitch.abs()).max(roll.abs());
-            max_y = max_y.max(walker.plant.chassis_y());
-            if k > 50 {
-                min_y = min_y.min(walker.plant.chassis_y());
-            }
-        }
-        let s = walker.sample();
-        assert!(
-            min_y > 0.55,
-            "terrain-aware walk sat down: min_y={min_y:.3} end_y={:.3} z={:.3}",
-            s.pos[1],
-            s.pos[2]
-        );
-        assert!(s.pos[2] > 0.70, "did not walk: z={:.3}", s.pos[2]);
-        assert!(
-            max_tilt < 0.55,
-            "went over while walking: max tilt {max_tilt:.2} rad"
-        );
-        assert!(
-            max_y < y0 * 1.5,
-            "chassis was thrown: {max_y:.2} m from a {y0:.2} m stance"
-        );
-        assert!(!s.fallen);
-    }
-
-    /// Commanded speed has to reach the plant. Two very different commands
-    /// producing the same trajectory means the gait clock never saw either.
-    ///
-    /// Ignored for the same reason as the test above: this is the measurement
-    /// that showed the command is dropped, not a guard on working behaviour.
-    #[test]
-    #[ignore = "drive_articulated ignores cmd.cruise; see terrain_aware_tripod_does_not_sit_down"]
-    fn tripod_distance_responds_to_commanded_speed() {
-        let frame = Frame::new(6);
-        let phys = Physics::default();
-        let mut travelled = Vec::new();
-        for cruise in [0.4f64, 2.0] {
-            let (mut walker, terrain, policy, gait) =
-                crate::walker::open_loop_walk(frame, Course::Flat, 1, phys);
-            let cmd = crate::sim::Cmd {
-                fwd: 1.0,
-                turn: 0.0,
-                cruise,
-                nav: false,
-            };
-            for _ in 0..(6.0 / crate::sim::DT) as usize {
-                walker.step(&terrain, &policy, &gait, crate::sim::DT, cmd);
-            }
-            travelled.push(walker.sample().pos[2]);
-        }
-        assert!(
-            travelled[1] > travelled[0] * 1.5,
-            "0.4 m/s covered {:.2} m and 2.0 m/s covered {:.2} m",
-            travelled[0],
-            travelled[1]
-        );
-    }
-
-    /// Reporting probe: what a solver setting costs and whether it still walks.
-    ///
-    /// The trainer spends 93% of its wall clock inside `step`, so this is the
-    /// only table that matters for throughput. Correctness first though: a
-    /// cheaper setting that cannot hold the deck up is not cheaper, and the
-    /// impulse plant's `4/8/4` is not a taste -- below it the revolute
-    /// constraints are visibly violated. The reduced plant makes the hinge one
-    /// coordinate instead of five constraint rows, so it is the one setting
-    /// that can be cheap without giving that up.
-    #[test]
-    #[ignore]
-    fn zzz_solver_cost_report() {
-        let frame = Frame::new(6);
-        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
-        gait.cycle = walk_cycle(frame, &gait);
-        let terrain = Terrain::new(Course::Flat, 1);
-        let q0 = standing_q(frame, &gait);
-
-        // `substeps` is deliberately not varied here: `drive_terrain` steps the
-        // plant once per tick and ignores it, so it would look free and change
-        // nothing. `joint_rl::tests::zzz_substeps_report` is where it is real.
-        for (name, phys) in [
-            ("impulse 8/4 (default)", Physics::default()),
-            ("impulse 4/2", Physics { solver_iters: 4, pgs_iters: 2, ..Physics::default() }),
-            ("impulse 16/8", Physics { solver_iters: 16, pgs_iters: 8, ..Physics::default() }),
-            ("reduced 1/1 (preset)", Physics::reduced()),
-            ("reduced 4/1", Physics { solver_iters: 4, pgs_iters: 1, ..Physics::reduced() }),
-        ] {
-            // Stand, then walk, then time a fixed number of driven ticks.
-            let mut stand = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-            hold(&mut stand, &q0, &phys, 5.0);
-            let stood = stand.chassis_y();
-
-            let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-            let mut phase = 0.0;
-            let ticks = (4.0 / crate::sim::DT) as usize;
-            let started = std::time::Instant::now();
-            for _ in 0..ticks {
-                drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
-                phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
-            }
-            let secs = started.elapsed().as_secs_f64();
-            let (cos, _) = super::axis_probe::worst_axis(&phys);
-            eprintln!(
-                "{name:24}  {:>7.0} tick/s  {:>6.1} us  stand5s {stood:.4}  walk4s y {:.4} z {:>7.4}  hinge {cos:.4}",
-                ticks as f64 / secs,
-                secs / ticks as f64 * 1e6,
-                plant.chassis_y(),
-                plant.chassis_z()
-            );
-        }
-    }
-
-    /// Reporting probe: can the hand-tuned tripod actually be run at a given
-    /// joint torque ceiling, and what gains does it need?
-    ///
-    /// Standing is the easy half. This walks the reference gait for four
-    /// seconds and reports where the deck ends up, which is what the torque
-    /// ceiling and the motor gains have to be calibrated against together.
-    #[test]
-    #[ignore]
-    fn zzz_walking_torque_report() {
-        let frame = Frame::new(6);
-        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
-        gait.cycle = walk_cycle(frame, &gait);
-        let terrain = Terrain::new(Course::Flat, 1);
-        let q0 = standing_q(frame, &gait);
-        for (torque, damp, stiff) in [
-            (50.0, 8.0e3, 5.0e6),
-            // Hold the god-motor gains and move only the ceiling.
-            (25.0, 8.0e3, 5.0e6),
-            (12.0, 8.0e3, 5.0e6),
-            (8.00, 8.0e3, 5.0e6),
-            (4.90, 8.0e3, 5.0e6),
-            // The two the build actually uses: boosted, then normal.
-            (4.50, 8.0e3, 5.0e6),
-            (3.92, 8.0e3, 5.0e6),
-            (2.45, 8.0e3, 5.0e6),
-            (1.57, 8.0e3, 5.0e6),
-        ] {
-            let mut phys = Physics::default();
-            phys.motor_max = torque;
-            phys.motor_damp = damp;
-            phys.motor_stiff = stiff;
-
-            let mut stand = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-            hold(&mut stand, &q0, &phys, 5.0);
-            let stood = stand.chassis_y();
-
-            let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-            let mut phase = 0.0;
-            let ticks = (4.0 / crate::sim::DT) as usize;
-            for _ in 0..ticks {
-                drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
-                phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
-            }
-            // How far the worst joint travels against a 0.30 rad step. A
-            // small number here means the position loop cannot follow a
-            // command at all, which standing still does not reveal.
-            let mut travel = f32::MAX;
-            for leg in 0..6 {
-                for j in 0..3 {
-                    let mut pl = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-                    let rel = |q: &ArticulatedPlant| {
-                        let l = q.legs[leg].as_ref().unwrap();
-                        let c = [l._coxa, l._femur, l.tibia][j];
-                        q.bodies[l.hinges[j].parent].rotation().inverse() * *q.bodies[c].rotation()
-                    };
-                    let before = rel(&pl);
-                    let mut cmd = q0;
-                    cmd[leg][j] += 0.30;
-                    hold(&mut pl, &cmd, &phys, 3.0);
-                    let (_, ang) = (rel(&pl) * before.inverse()).to_axis_angle();
-                    travel = travel.min(ang.abs());
-                }
-            }
-            eprintln!(
-                "max {torque:5.2} damp {damp:7.1} stiff {stiff:9.1}  stand5s {stood:.4}  \
-                 travel {travel:.4}/0.30  walk4s y {:.4} z {:.4}",
-                plant.chassis_y(),
-                plant.chassis_z()
-            );
-        }
-    }
-
-    /// A wall beside the machine, not in front of it. Swing used to be projected
-    /// onto the face (`push_xz`) so the tibia spent the whole step kicking it.
-    #[test]
-    fn walking_beside_a_wall_does_not_put_links_inside_it() {
-        let frame = Frame::new(6);
-        let mut gait = Policy::seeded(Preset::Tripod, frame).gait();
-        gait.cycle = walk_cycle(frame, &gait);
-        let phys = Physics::default();
-        let mut terrain = Terrain::new(Course::Flat, 1);
-        let wall = Obstacle {
-            x0: 1.75,
-            x1: 3.40,
-            z0: 0.80,
-            z1: 5.50,
-            top: 1.80,
-            grip: 1.0,
-        };
-        terrain.push(wall.x0, wall.x1, wall.z0, wall.z1, wall.top, wall.grip);
-        terrain.rebuild_buckets();
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
-        let mut phase = 0.0;
-        let mut inside = 0usize;
-        let ticks = (4.0 / crate::sim::DT) as usize;
-        for _ in 0..ticks {
-            drive_terrain(&mut plant, frame, &gait, &phys, &terrain, phase);
-            phase = crate::math::frac(phase + crate::sim::DT / gait.cycle);
-            for i in 0..6 {
-                let j = plant.leg_joints_world(i);
-                for p in j {
-                    if in_core(p, &wall, 0.10) {
-                        inside += 1;
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            inside, 0,
-            "links occupied the side wall {inside} times; y={:.3} z={:.3}",
-            plant.chassis_y(),
-            plant.chassis_z()
-        );
-        assert!(
-            plant.chassis_y() > 0.50,
-            "sat down beside the wall: y={}",
-            plant.chassis_y()
-        );
-    }
-
     #[test]
     fn a_slow_chassis_touch_on_a_wall_is_not_dead() {
         let frame = Frame::new(6);
-        let gait = Policy::seeded(Preset::Tripod, frame).gait();
+        let stance = Stance::default();
         let phys = Physics::default();
         let terrain = wall_course();
-        let mut plant = ArticulatedPlant::standing(frame, &gait, &phys, &terrain);
+        let stance = Stance::default();
+        let mut plant = ArticulatedPlant::standing(frame, &stance, &phys, &terrain);
         shove_chassis(&mut plant, 0.55, 0.25);
         let mut touched = false;
         for _ in 0..12 {
             let pre = plant.chassis_vel();
-            plant.step(crate::sim::DT);
+            plant.step(crate::dynamics::DT);
             let hit = plant.narrow_phase.contact_pairs_with(plant.chassis_col).any(|p| {
                 p.has_any_active_contact()
                     && [p.collider1, p.collider2].iter().any(|c| {

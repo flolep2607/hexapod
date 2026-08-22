@@ -24,7 +24,6 @@
 
 use crate::dynamics::{joint_torques, Actuator, LegMass, Physics};
 use crate::robot::{fk_body, MAX_LEGS};
-use crate::sim::Sim;
 
 pub use crate::dynamics::NM_TO_KGCM;
 use crate::dynamics::G;
@@ -116,18 +115,30 @@ pub struct TorqueMeter {
 }
 
 impl TorqueMeter {
-    /// Fold one simulator step into the running peaks.
-    pub fn observe(&mut self, sim: &Sim, build: &Build) {
+    /// Fold one control tick into the running peaks.
+    ///
+    /// Takes the tick's joint angles, which feet are loaded and how much of the
+    /// weight each carries, rather than a simulator. Anything that can report
+    /// those can size a servo, which after the hand-written gaits were removed
+    /// means the articulated plant driven by a learned policy.
+    pub fn observe(
+        &mut self,
+        frame: crate::robot::Frame,
+        q: &[[f64; 3]; MAX_LEGS],
+        down: &[bool; MAX_LEGS],
+        share: &[f64; MAX_LEGS],
+        build: &Build,
+    ) {
         let weight = build.mass_kg * G;
         self.samples += 1.0;
 
-        for leg in 0..sim.frame.legs() {
-            if !sim.feet[leg].stance {
+        for leg in 0..frame.legs() {
+            if !down[leg] {
                 continue;
             }
 
             // Vertical load on this foot, with the transient allowance.
-            let f_v = weight * sim.feet[leg].load * build.dynamic_factor;
+            let f_v = weight * share[leg] * build.dynamic_factor;
             let f_h = f_v * build.traction_ratio;
             if f_v > self.peak_foot_load {
                 self.peak_foot_load = f_v;
@@ -135,7 +146,7 @@ impl TorqueMeter {
 
             // Lever arms come from the pose, in simulator units, then scale.
             // Same formula the simulator drives the servos with.
-            let j = fk_body(sim.frame, leg, sim.q[leg]);
+            let j = fk_body(frame, leg, q[leg]);
             let t = joint_torques(&j, f_v, f_h, build.scale);
 
             for k in 0..3 {
@@ -520,23 +531,30 @@ pub fn shortlist(required_kgcm: f64) -> Vec<&'static Servo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Policy, Preset};
-    use crate::sim::{Cmd, DT};
-    use crate::terrain::{Course, Terrain};
+    use crate::robot::{solve_ik, Stance, FOOT_R, MAX_LEGS};
 
+    /// The standing pose, held. No trajectory and no simulator: the only thing
+    /// varying between cases is the sizing arithmetic, which is what these
+    /// tests are about, and a static pose is the case a servo has to hold
+    /// anyway.
     fn measure(build: Build) -> TorqueMeter {
-        let terrain = Terrain::new(Course::Flat, 1);
-        let p = Policy::seeded(Preset::Tripod, crate::robot::Frame::default());
-        let g = p.gait();
-        // Ideal joints, so the trajectory is identical for every build and
-        // the only thing varying between cases is the sizing arithmetic.
-        let phys = crate::dynamics::Physics::ideal();
-        let mut s = Sim::default();
-        s.reset(&terrain, &g, &phys);
+        let frame = crate::robot::Frame::default();
+        let stance = Stance::default();
+        let mut q = [[0.0; 3]; MAX_LEGS];
+        for leg in 0..frame.legs() {
+            let d = frame.dir(leg);
+            let out = stance.stance_w * 0.5;
+            q[leg] = solve_ik(frame, leg, [d[0] * out, -stance.body_h + FOOT_R, d[2] * out]).q;
+        }
+        // Every foot down, sharing the weight equally.
+        let down = [true; MAX_LEGS];
+        let mut share = [0.0; MAX_LEGS];
+        for leg in 0..frame.legs() {
+            share[leg] = 1.0 / frame.legs() as f64;
+        }
         let mut m = TorqueMeter::default();
         for _ in 0..600 {
-            s.step(&terrain, &p, &g, DT, Cmd::at(g.nominal_speed()));
-            m.observe(&s, &build);
+            m.observe(frame, &q, &down, &share, &build);
         }
         m
     }
