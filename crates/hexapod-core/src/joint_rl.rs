@@ -156,6 +156,34 @@ pub const BOOST_COOLDOWN: f64 = 2.0;
 /// Longest cooldown, and so the scale the observation is normalised on.
 pub const BOOST_MAX_COOLDOWN: f64 = BOOST_SECS * BOOST_COOLDOWN;
 
+/// Charge per second spent asking for a boost that cannot be delivered.
+///
+/// Holding the request down past the cap is free otherwise: the protection
+/// cuts the torque and the policy never learns to let go. On the real part it
+/// is not free at all — a servo sitting at its overload threshold with the
+/// current still commanded is exactly how one gets cooked, and the trip is what
+/// saves it, not what makes it harmless.
+///
+/// Small on purpose, and measured: a policy that holds the request down for a
+/// whole episode cycles two seconds of boost against four of lockout, so half
+/// its ticks are refused, which charges `0.5 * 8 * 0.05 = 0.20` against an
+/// episode total around 4.96 — about 4%. Enough to be worth releasing the
+/// button for, not enough to make asking the wrong move.
+/// `zzz_boost_abuse_cost_report` measures it.
+pub const BOOST_ABUSE_COST: f64 = 0.05;
+
+/// What a tick's boost request actually got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoostState {
+    /// Not asked for.
+    Off,
+    /// Asked for and delivered, at [`Physics::motor_max`].
+    Boosting,
+    /// Asked for and refused, because the burst is spent or the lockout is
+    /// still running. This is the one that costs.
+    Denied,
+}
+
 /// The boost budget: seconds spent in the current burst, seconds locked out.
 ///
 /// A real servo does not have a boost button; it has protection circuits that
@@ -169,22 +197,34 @@ pub struct Boost {
 }
 
 impl Boost {
-    /// Advance one control tick. Returns whether the boosted ceiling applies.
-    fn tick(&mut self, requested: bool) -> bool {
+    /// Advance one control tick and report what the request got.
+    fn tick(&mut self, requested: bool) -> BoostState {
         if self.cooldown > 0.0 {
             self.cooldown = (self.cooldown - DT).max(0.0);
-            return false;
+            return if requested {
+                BoostState::Denied
+            } else {
+                BoostState::Off
+            };
         }
         if requested && self.used < BOOST_SECS {
             self.used += DT;
-            return true;
+            return BoostState::Boosting;
         }
         // The burst ended, either released or run to the cap. Pay for it.
-        if self.used > 0.0 {
+        let spent = self.used > 0.0;
+        if spent {
             self.cooldown = BOOST_COOLDOWN * self.used;
             self.used = 0.0;
         }
-        false
+        // Still holding the button on the tick the cap is reached, or on any
+        // tick of the lockout that follows: asked for, not delivered.
+        if requested {
+            BoostState::Denied
+        } else {
+            let _ = spent;
+            BoostState::Off
+        }
     }
 
     /// What the policy is told: burst remaining, then lockout remaining, both
@@ -500,6 +540,8 @@ pub struct JointRollout {
     pub completion_rate: f64,
     /// Time to the finish, with a failure charged the full stage horizon.
     pub finish_time: f64,
+    /// Share of ticks spent asking for a boost that could not be delivered.
+    pub boost_denied: f64,
     /// Share of ticks spent at the boosted torque ceiling, `0..=1`.
     ///
     /// The budget allows a third at most — two seconds bought with four of
@@ -914,6 +956,7 @@ pub struct JointEnv {
     last_remaining: f64,
     boost: Boost,
     boost_ticks: usize,
+    boost_denied_ticks: usize,
     max_ticks: usize,
     boundary: bool,
     observation: Vec<f64>,
@@ -947,6 +990,7 @@ impl JointEnv {
             last_remaining: 0.0,
             boost: Boost::default(),
             boost_ticks: 0,
+            boost_denied_ticks: 0,
             terrain,
             stage,
             initial,
@@ -998,6 +1042,7 @@ impl JointEnv {
         // spending in the vector the caller is handed.
         self.boost = Boost::default();
         self.boost_ticks = 0;
+        self.boost_denied_ticks = 0;
         self.refresh_observation();
         // After the route exists, so the first tick's progress is measured from
         // the real starting distance rather than from zero.
@@ -1225,9 +1270,13 @@ impl JointEnv {
             // The servo holds `motor_sustained` all day and `motor_max` only in
             // bursts, so that is what it is given. A policy that wants the peak
             // has to ask for it, and pay twice the time it spends.
-            let boosting = self.boost.tick(action[n * 3] > 0.0);
+            let asked = self.boost.tick(action[n * 3] > 0.0);
+            let boosting = asked == BoostState::Boosting;
             if boosting {
                 self.boost_ticks += 1;
+            }
+            if asked == BoostState::Denied {
+                self.boost_denied_ticks += 1;
             }
             let mut driving = self.phys;
             if !boosting {
@@ -1270,7 +1319,7 @@ impl JointEnv {
                 );
                 (shaped - SMOOTH_COST * churn).max(0.0)
             } else {
-                moved - SMOOTH_COST * churn * DT
+                moved - SMOOTH_COST * churn * DT - self.wasted_boost(asked) * DT
             };
             self.total += scored_tick;
             // Per-step and O(1) on purpose. Dividing this by the horizon (as
@@ -1310,6 +1359,15 @@ impl JointEnv {
     /// slack. It is bounded by the route, it telescopes, so oscillating pays
     /// exactly zero, and with no speed term left there is nothing to buy a
     /// gate back with.
+    /// Charge for a boost request that could not be honoured, per second.
+    fn wasted_boost(&self, asked: BoostState) -> f64 {
+        if asked == BoostState::Denied {
+            BOOST_ABUSE_COST
+        } else {
+            0.0
+        }
+    }
+
     fn remaining(&self) -> f64 {
         if self.route.finished {
             return 0.0;
@@ -1381,12 +1439,19 @@ impl JointEnv {
             waypoint_fraction,
             completion_rate: f64::from(u8::from(completed)),
             finish_time: self.finish_time,
+            // `steps` is incremented inside the decimation loop, so it is
+            // already a tick count and matches how the budget is charged. It is
+            // also what `secs` is derived from, so these shares and the clock
+            // agree.
+            boost_denied: if self.steps == 0 {
+                0.0
+            } else {
+                self.boost_denied_ticks as f64 / self.steps as f64
+            },
             boost: if self.steps == 0 {
                 0.0
             } else {
-                // `steps` counts policy decisions and the budget is charged per
-                // control tick, so the denominator is ticks, not decisions.
-                self.boost_ticks as f64 / (self.steps * DECIMATION) as f64
+                self.boost_ticks as f64 / self.steps as f64
             },
         }
     }
@@ -1708,8 +1773,10 @@ fn rollout_nexus_batch(
                 completion_rate: f64::from(u8::from(completed)),
                 finish_time: ep.finish_time,
                 // This path drives every episode at `motor_max` and has no
-                // boost to spend, so the ceiling is on the whole time.
+                // boost to spend, so the ceiling is on the whole time and
+                // nothing is ever refused.
                 boost: 1.0,
+                boost_denied: 0.0,
             },
             norm: ep.norm,
         });
@@ -3287,6 +3354,51 @@ mod tests {
     /// The boost is a duty cycle, not a button, and the arithmetic is the
     /// servo's: two seconds at the peak, then twice what was spent at the
     /// sustained ceiling before it can be asked for again.
+    /// Reporting probe: how hard the wasted-boost charge actually bites.
+    ///
+    /// "Punish a bit" needs a number. This runs one episode holding the boost
+    /// down permanently and one never touching it, on the same action script,
+    /// and reports the score either way.
+    #[test]
+    #[ignore]
+    fn zzz_boost_abuse_cost_report() {
+        let frame = Frame::new(6);
+        let phys = Physics::default();
+        let mut rng = Rng::new(0xB0057);
+        let script = (0..400)
+            .map(|_| {
+                (0..18)
+                    .map(|_| clamp(rng.normal() * 0.4, -1.0, 1.0) * ACT_RANGE)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for (name, request) in [("never asks", -1.0), ("holds it down", 1.0)] {
+            let mut env =
+                JointEnv::new(frame, &phys, Terrain::new(Course::Flat, 7), Stage::WalkFlat);
+            let _ = env.set_command(1.5);
+            for joints in &script {
+                let mut action = joints.clone();
+                action.push(request);
+                if env.step(&action).is_err() {
+                    break;
+                }
+            }
+            let s = env.summary();
+            eprintln!(
+                "{name:14}  score {:.5}  dist {:6.3}  boost {:.3}  denied {:.3}  charge {:.4} ({:.1}% of a {:.2} episode)",
+                s.score,
+                s.distance,
+                s.boost,
+                s.boost_denied,
+                s.boost_denied * s.secs * BOOST_ABUSE_COST,
+                100.0 * s.boost_denied * s.secs * BOOST_ABUSE_COST
+                    / (s.score * 62.0).abs().max(1e-9),
+                s.score * 62.0
+            );
+        }
+    }
+
     #[test]
     fn the_boost_costs_twice_the_time_it_buys() {
         let ticks = |secs: f64| (secs / DT).round() as usize;
@@ -3295,12 +3407,16 @@ mod tests {
         let mut boost = Boost::default();
         let mut boosted = 0usize;
         for _ in 0..ticks(2.0) {
-            if boost.tick(true) {
+            if boost.tick(true) == BoostState::Boosting {
                 boosted += 1;
             }
         }
         assert_eq!(boosted, ticks(2.0), "the full burst was not available");
-        assert!(!boost.tick(true), "boosting continued past the cap");
+        assert_eq!(
+            boost.tick(true),
+            BoostState::Denied,
+            "holding past the cap was not reported as refused"
+        );
         // Read the lockout it just charged rather than counting ticks up to it,
         // which is off by the tick that ends the burst and the one that ends
         // the lockout.
@@ -3315,7 +3431,7 @@ mod tests {
         // exactly.
         let full = ticks(BOOST_SECS * BOOST_COOLDOWN);
         let mut waited = 0usize;
-        while !boost.tick(true) {
+        while boost.tick(true) != BoostState::Boosting {
             waited += 1;
             assert!(waited <= full + 4, "the boost never came back");
         }
@@ -3328,9 +3444,14 @@ mod tests {
         // spent, so short bursts stay affordable.
         let mut boost = Boost::default();
         for _ in 0..ticks(0.5) {
-            assert!(boost.tick(true), "half a second was not available");
+            assert_eq!(
+                boost.tick(true),
+                BoostState::Boosting,
+                "half a second was not available"
+            );
         }
-        assert!(!boost.tick(false), "releasing still boosted");
+        // Letting go is free; holding on is not.
+        assert_eq!(boost.tick(false), BoostState::Off, "releasing still boosted");
         let charged = boost.observation()[1] * BOOST_MAX_COOLDOWN;
         assert!(
             (charged - 0.5 * BOOST_COOLDOWN).abs() < 2.0 * DT,
@@ -3347,7 +3468,7 @@ mod tests {
         let [left, cooling] = boost.observation();
         assert!((left - 0.5).abs() < 2.0 * DT, "half spent read as {left}");
         assert_eq!(cooling, 0.0, "cooling down while still boosting");
-        boost.tick(false);
+        assert_eq!(boost.tick(false), BoostState::Off);
         let [_, cooling] = boost.observation();
         assert!((cooling - 0.5).abs() < 0.02, "a one-second burst read {cooling}");
     }
