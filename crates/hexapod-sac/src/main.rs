@@ -281,6 +281,10 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         initial_alpha: config.initial_alpha,
         target_entropy_per_action: config.target_entropy_per_action,
         action_prior_cost: config.action_prior_cost,
+        // The environment's last action is the boost request, and zero is its
+        // "off", not a neutral. Regularising it toward zero was a standing vote
+        // against ever spending the torque budget.
+        prior_free_tail: 1,
         ..SacConfig::default()
     };
     let mut agent = SacAgent::new(observations, actions, &device, sac_config, config.seed)?;
@@ -300,6 +304,10 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
     // physics collection, replay bookkeeping, gradient updates. Printed as a
     // share of wall so a tuning change can be judged instead of guessed.
     let mut spent = [Duration::ZERO; 5];
+    // How often collection asks for the boost. The eval line reports what the
+    // deterministic policy does with it; this reports whether it is being tried
+    // at all, which is the difference between "not worth it" and "never found".
+    let (mut boost_asks, mut boost_seen) = (0usize, 0usize);
     let mut transitions = 0usize;
     let mut next_evaluation = config.eval_interval;
     let mut update_budget = 0.0f64;
@@ -413,6 +421,12 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
         };
         spent[1] += mark.elapsed();
         let mark = Instant::now();
+        for action in unit_actions.chunks_exact(actions) {
+            if action[actions - 1] > 0.0 {
+                boost_asks += 1;
+            }
+            boost_seen += 1;
+        }
         let physical_actions = unit_actions
             .chunks_exact(actions)
             .map(|action| {
@@ -576,7 +590,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
             );
             let wall = wall_trained;
             println!(
-                "#   phases cmd {:.0}% act {:.0}% step {:.0}% keep {:.0}% grad {:.0}% idle {:.0}% · {:.0} steps/s",
+                "#   phases cmd {:.0}% act {:.0}% step {:.0}% keep {:.0}% grad {:.0}% idle {:.0}% · {:.0} steps/s · boost asked {:.0}%",
                 100.0 * spent[0].as_secs_f64() / wall,
                 100.0 * spent[1].as_secs_f64() / wall,
                 100.0 * spent[2].as_secs_f64() / wall,
@@ -584,6 +598,7 @@ fn train(config: TrainConfig, device: Device) -> AppResult<()> {
                 100.0 * spent[4].as_secs_f64() / wall,
                 100.0 * (1.0 - spent.iter().map(|d| d.as_secs_f64()).sum::<f64>() / wall),
                 transitions as f64 / wall,
+                100.0 * boost_asks as f64 / boost_seen.max(1) as f64,
             );
             if let Some(rungs) = rungs.as_ref() {
                 let mut histogram = [0usize; LADDER.len()];

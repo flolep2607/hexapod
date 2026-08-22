@@ -133,6 +133,17 @@ pub struct SacConfig {
     /// Quadratic actor prior in normalized action space. This prevents the
     /// policy from exploiting critic estimates far outside replay support.
     pub action_prior_cost: f64,
+
+    /// Trailing action dimensions the prior does not apply to.
+    ///
+    /// Pulling an action toward zero is only a sensible default when zero means
+    /// "do nothing". For a joint offset it does — zero is the neutral pose. For
+    /// a switch it does not: the environment's boost engages above zero, so
+    /// regularising that dimension is a standing vote against ever using it,
+    /// and with the prior at 1.0 it won an eight-million-transition argument
+    /// against whatever the critic had to say. The boost is the last action, so
+    /// this excludes a tail. It must match the environment's action layout.
+    pub prior_free_tail: usize,
 }
 
 impl Default for SacConfig {
@@ -148,6 +159,7 @@ impl Default for SacConfig {
             initial_alpha: 0.001,
             target_entropy_per_action: -2.5,
             action_prior_cost: 1.0,
+            prior_free_tail: 0,
         }
     }
 }
@@ -345,12 +357,18 @@ impl SacAgent {
                 self.actor.sample(&observations, &actor_epsilon)?;
             let (policy_q1, policy_q2) = self.critic.forward(&observations, &policy_actions)?;
             let policy_q = policy_q1.minimum(&policy_q2)?;
+            // The prior applies to the joints, not to the switches after them.
+            let regularized = self.actions.saturating_sub(self.config.prior_free_tail).max(1);
             let prior_loss = if let Some(prior) = &self.actor_prior {
                 let policy_mean = self.actor.deterministic(&observations)?;
                 let prior_mean = prior.deterministic(&observations)?.detach();
-                policy_mean.sub(&prior_mean)?.sqr()?.mean_all()?
+                policy_mean
+                    .narrow(1, 0, regularized)?
+                    .sub(&prior_mean.narrow(1, 0, regularized)?)?
+                    .sqr()?
+                    .mean_all()?
             } else {
-                policy_actions.sqr()?.mean_all()?
+                policy_actions.narrow(1, 0, regularized)?.sqr()?.mean_all()?
             };
             let actor_loss = log_probability
                 .broadcast_mul(&alpha.detach())?
@@ -648,6 +666,53 @@ fn copy_parameters(source: &VarMap, target: &VarMap, tau: f64) -> Result<()> {
 mod tests {
     use super::*;
     use hexapod_core::joint_rl::JointReplay;
+
+    /// The prior has to actually stop at the tail. Narrowing a tensor is the
+    /// kind of change that silently does nothing if the arithmetic is off by
+    /// one, and the symptom would be another eight million transitions of the
+    /// boost never being used.
+    #[test]
+    fn the_prior_leaves_the_trailing_actions_alone() {
+        let width = 4usize;
+        let batch = |actions: Vec<f32>| JointReplayBatch {
+            observations: vec![0.5f32; 2 * 3],
+            actions,
+            rewards: vec![1.0, 1.0],
+            next_observations: vec![0.5f32; 2 * 3],
+            terminated: vec![false, false],
+            truncated: vec![false, false],
+            observation_width: 3,
+            action_width: width,
+        };
+        // Same batch, and the only difference is whether the last action is
+        // regularised. If the narrow is a no-op the two losses are identical.
+        let loss = |tail: usize| {
+            let config = SacConfig {
+                prior_free_tail: tail,
+                ..SacConfig::default()
+            };
+            let mut agent =
+                SacAgent::new(3, width, &Device::Cpu, config, 77).expect("agent");
+            let mut rng = Rng::new(9);
+            let norm = ObsNorm::new(3);
+            // A large trailing action is what the prior would object to.
+            let actions: Vec<f32> = vec![0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.9];
+            agent
+                .update(&batch(actions), &norm, &mut rng, true)
+                .expect("update")
+                .actor_loss
+        };
+        let all = loss(0);
+        let spared = loss(1);
+        assert!(all.is_finite() && spared.is_finite(), "{all} / {spared}");
+        assert!(
+            (all - spared).abs() > 1.0e-6,
+            "excluding the tail changed nothing: {all} vs {spared}"
+        );
+        // And asking for more tail than there are actions keeps at least one
+        // dimension regularised rather than panicking on a zero-width narrow.
+        assert!(loss(width + 3).is_finite(), "an oversized tail broke the narrow");
+    }
 
     #[test]
     fn same_seed_initializes_the_same_actor_exactly() {
