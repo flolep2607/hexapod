@@ -20,6 +20,7 @@
 //! # }
 //! ```
 
+pub mod aba;
 pub mod dynamics;
 pub mod hardware;
 pub mod math;
